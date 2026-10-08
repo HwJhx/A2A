@@ -220,7 +220,8 @@ a2a/
     └── topology.yaml
 ```
 
-底层先用 `subprocess` 调 herdr CLI;长时间等待与事件订阅留到后期再用 socket。
+底层先用 `subprocess` 调 herdr CLI;长时间等待与事件订阅留到后期再用 socket(已决定,见 D12)。
+规模化时的动机:broker 每个目标一个 worker、各自用 `agent wait` 阻塞,每次 wait 是一个子进程,150 个目标就是 150 个进程;socket 的 `events.subscribe` 可以用一条长连接收所有状态变化。socket API 目前只读过文档,没有实测。
 
 ### 2.3 智能体的识别与启动(v4 新增:实测结论,替代此前"用 `agent start` 启动"的假设)
 
@@ -721,6 +722,7 @@ herdr 文档里 pane 是真实终端,有最小尺寸。可选思路(都需实测
 | D9 | `done` | **当作可投递**(归入 READY),已实测证实必要 | §4.4 |
 | D10 | 业务 ID | **不带项目前缀**:`agent_id` = `{角色码}_{ip}` | §2.1 |
 | D11 | 接收方校验 | **先不验证消息来源**;去重只放在 broker,不在固定句式后附加标记 | §4.7 |
+| D12 | herdr 调用方式 | **CLI 先行**(subprocess 调 herdr CLI);**socket API 留到规模化阶段**(事件订阅、大量并发等待),压测证明需要时再做。`HerdrClient` 公开方法不绑定传输方式,日后只需重写内部 `_call` / `_call_text` | §2.2、§4.1 |
 
 ### 10.2 仍待确认
 

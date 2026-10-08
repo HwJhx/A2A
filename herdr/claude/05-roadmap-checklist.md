@@ -87,17 +87,33 @@
 - [ ] 另外三个智能体(Spec / 架构 / RTL)的启动脚本验证
 - [ ] `blocked` 状态与模型侧 bash 批准弹窗验证
 
-## 阶段 2:`HerdrClient`
+## 阶段 2:`HerdrClient`(已完成,代码在 `herdr/a2a/`)
 
-> **状态:暂缓。** 用户先把当前文档提交到 git,代码等用户确认后再写。
+只封装 herdr CLI,暂不做业务路由。用 `subprocess`,解析 JSON,**不依赖 `jq`**。依赖仅标准库,兼容 Python 3.9(Mac)和 3.10(虚拟机)。
 
-只封装 herdr CLI,暂不做业务路由。用 `subprocess`,解析 JSON,**不依赖 `jq`**。
+- [x] 创建 / 删除 / 重命名:workspace、tab、pane、agent(`agent rename`,启动后调用,重启后需重设)✅
+- [x] 创建时返回 `Created(workspace_id, tab_id, pane_id)`,不事后猜 ID ✅
+- [x] `agent start` 之外的启动方式:`launcher.build_launch_command`(覆盖 `exec`)+ `preflight_launcher` 预检 ✅
+- [x] `agent get / list / read / wait / prompt / send-keys / focus / explain` ✅
+- [x] `pane run / send-text / send-keys / read / wait-output / process-info` ✅
+- [x] `wait_for_agent_detected`(识别之后才能改名)、`find_agent` ✅
+- [x] session 辅助:`session_list / session_stop / session_delete` ✅
+- [x] 统一错误处理:按 herdr 的 `error.code` 映射成异常类;退出码 2 = 用法错误;子进程超时;找不到 herdr ✅
+- [x] 单元测试(假 runner,73 个)✅
+- [x] 在虚拟机里的集成测试(自建一次性命名会话,结束自动清理):布局、环境变量注入、改名与按名字寻址、重名与非法名、超时、`argv[0]` 识别等 ✅
+- [x] 真实 `fnx_dv` / `fnx_sw` 启动测试(预检、覆盖 `exec` 启动、被识别为 `pi`、身份变量、改名),不向模型发提示词 ✅
 
-- [ ] 创建 / 删除 / 重命名:workspace、tab、pane、agent(`agent rename`,启动后调用,重启后需重设)
-- [ ] `agent start`、`agent get`、`agent list`
-- [ ] `agent read`、`agent wait`、`agent prompt`
-- [ ] 统一错误处理(退出码 1 = 服务端错误,2 = 语法错误)
-- [ ] 单元测试 + 在命名 session 里的集成测试
+测试中发现的新事实(已写进 `herdr/a2a/README.md`):
+
+- tab / pane 编号不一定是数字(例如 `w1:tC`)
+- 刚被识别的一瞬间状态可能是 `unknown`,"识别到了"不等于"可以投递"
+- `pane send-text` 再 `send-keys enter` 不是原子操作,TUI 需要约 0.5 秒间隔;发消息用 `agent prompt`
+- 虚拟机与 Mac 共享目录,刚改完文件立刻在虚拟机里运行,偶尔读到同步中的残缺文件
+
+仍未验证:
+
+- [ ] `blocked` 状态下 `agent prompt` 的真实行为(代码按文档映射,未实测)
+- [ ] 文本以 `-` 开头的 `agent prompt` 是否被 herdr 当成选项
 
 ## 阶段 3:拓扑、身份、注册表
 
@@ -155,7 +171,7 @@
 - [ ] registry 自动恢复
 - [ ] 多 IP 并发
 - [ ] 150 个 agent 的资源压测
-- [ ] 视情况引入 socket 事件订阅
+- [ ] 视情况引入 socket 事件订阅(已决定:CLI 先行,socket 留到规模化;动机是 150 个目标各用一个 `agent wait` 子进程过重;socket 尚未实测)
 - [ ] 全局 Monitor 与 GUI(drawio 中的后续阶段)
 
 ---

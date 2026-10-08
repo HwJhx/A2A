@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a2a-herdr-codex"
+version = "0.1.0"
+description = "Herdr CLI Python client for the A2A project"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+a2a-herdr = "a2a_codex.cli:main"
+
