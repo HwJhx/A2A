@@ -547,7 +547,7 @@ QUEUED ──目标 READY──▶ DISPATCHING ──herdr 接受 prompt──�
 | `TARGET_MISSING` | 目标节点不存在或已删除 | 否 |
 | `WAITING_TARGET` | 目标 BUSY,正在等 | (等待中) |
 | `TIMEOUT` | 等待 READY 超时,或目标状态查询持续失败 | 否(终态;暂停该目标队列,等操作员"重试"或"放弃并继续") |
-| `RETRYING` | **已证明 prompt 未提交**的错误(08 §5;验证前实际只有"请求发出前的客户端失败") | 是,退避 |
+| `RETRYING` | **已证明 prompt 未提交**的错误(08 §5;herdr 0.9.3 实测:`agent_not_ready`、`server_not_running`,以及请求发出前的客户端失败) | 是,退避 |
 | `FAILED` | 操作员放弃,或确定不可恢复的错误;从 `DELIVERY_UNCERTAIN` 只能由操作员放弃进入 | 否 |
 | `DELIVERY_UNCERTAIN` | 调用 herdr 后结果不明(超时、`agent_prompt_stalled`、无法证明未提交的错误、Broker 崩溃窗口、观察窗口内没看到目标开始处理) | **否**:默认不自动重发;只有操作员明确裁定,或经真实 herdr 验证的机制确认后,才转 `DELIVERED` / `RETRYING`;超时只告警 |
 

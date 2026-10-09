@@ -171,6 +171,11 @@ class DocumentStatesRules(unittest.TestCase):
     def test_only_errors_that_prove_non_submission_may_be_retried(self):
         self.assertIn("只有能证明 prompt 未提交的错误才能安全重试", self.text)
         self.assertIn("不能只按错误名分类", self.text)
+        # 规则 7 必须与 §5 的实测结果一致,不能再说这些错误码"确认之前按不确定处理"
+        rule = next(line for line in self.text.splitlines() if line.startswith("7. **只有能证明 prompt 未提交"))
+        self.assertNotIn("确认之前", rule)
+        self.assertIn("herdr 0.9.3", rule)
+        self.assertIn("agent_prompt_failed", rule)
 
     def test_state_change_seq_is_only_a_candidate_pending_verification(self):
         mentions = self.lines_with("`state_change_seq`")
@@ -194,11 +199,22 @@ class DocumentStatesRules(unittest.TestCase):
         for code in sorted(codes):
             self.assertIn(f"`{code}`", section, f"§5 的错误分类表没有 herdr 错误码 {code}")
 
-    def test_unproven_error_semantics_are_marked_pending_verification(self):
+    def test_error_semantics_are_backed_by_real_herdr_measurements(self):
+        # 2026-10-09 在 herdr 0.9.3 上实测(09 号文档 §7):四个错误码都没有写入
         section = self.text.split("## 5.")[1].split("## 6.")[0]
-        for code in ("agent_blocked", "agent_not_ready", "server_not_running", "agent_not_found"):
+        expected = {"agent_blocked": "TARGET_BLOCKED", "agent_not_ready": "RETRYING",
+                    "server_not_running": "RETRYING", "agent_not_found": "TARGET_MISSING"}
+        for code, disposition in expected.items():
             row = next(line for line in section.splitlines() if line.startswith("| `" + code))
-            self.assertIn("待验证", row, f"{code} 的未提交语义尚未实测,不应标成已证明")
+            self.assertIn("**是(实测)**", row, code)
+            self.assertEqual(row.rstrip(" |").split("|")[-1].strip().split("(")[0].strip("` "), disposition, code)
+        # 实测"返回错误但已写入"的错误码必须走 DELIVERY_UNCERTAIN
+        row = next(line for line in section.splitlines() if line.startswith("| `agent_prompt_failed`"))
+        self.assertIn("**否(实测:已写入)**", row)
+        self.assertTrue(row.rstrip().endswith("`DELIVERY_UNCERTAIN` |"))
+        # 结论绑定 herdr 版本,升级后必须重测
+        self.assertIn("只对 **herdr 0.9.3** 成立", section)
+        self.assertIn("probe_herdr_errors.py", section)
 
     def test_missing_target_is_provable_only_when_checked_before_the_call(self):
         section = self.text.split("## 5.")[1].split("## 6.")[0]

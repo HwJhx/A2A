@@ -87,8 +87,8 @@ QUEUED ─▶ WAITING_TARGET ─▶ [复核通过] ─▶ DISPATCHING ─▶ DEL
 | `DISPATCHING → DELIVERED` | herdr **接受**了 prompt,**并且**在观察窗口内观察到目标开始处理 |
 | `DISPATCHING → DELIVERY_UNCERTAIN` | 调用结果不明:超时、`agent_prompt_stalled`、任何**无法证明未提交**的错误、herdr 接受了但观察窗口内没看到目标开始处理 |
 | `DISPATCHING → RETRYING` | **只有**能证明 prompt 未提交的错误(§5) |
-| `DISPATCHING → TARGET_BLOCKED` | herdr 返回 `agent_blocked`,**且该错误的"未提交"语义已被实测证实**(§5);证实之前走 `DELIVERY_UNCERTAIN` |
-| `DISPATCHING → TARGET_MISSING` | herdr 返回 `agent_not_found`,**且该错误"发生在提交之前"的语义已被实测证实**(§5);证实之前走 `DELIVERY_UNCERTAIN`。目标在**调用前**的独立复核中就不存在的,不经过 `DISPATCHING`,见上面的 `QUEUED / WAITING_TARGET / RETRYING → TARGET_MISSING` |
+| `DISPATCHING → TARGET_BLOCKED` | herdr 返回 `agent_blocked`。已实测证实它在写入前拒绝(§5,`09` 号文档) |
+| `DISPATCHING → TARGET_MISSING` | herdr 返回 `agent_not_found`。已实测证实它在写入前查找目标、找不到即返回(§5,`09` 号文档)。目标在**调用前**的独立复核中就不存在的,不经过 `DISPATCHING`,见上面的 `QUEUED / WAITING_TARGET / RETRYING → TARGET_MISSING` |
 | `RETRYING → DISPATCHING` | 退避结束,**复核通过**(目标 READY) |
 | `RETRYING → WAITING_TARGET` | 退避结束后复核发现目标忙 |
 | `RETRYING → TARGET_BLOCKED` | 复核发现目标 `blocked`:`RETRYING` 表示"确定没发出",所以按 D8 立即失败 |
@@ -109,10 +109,10 @@ QUEUED ─▶ WAITING_TARGET ─▶ [复核通过] ─▶ DISPATCHING ─▶ DEL
 5. **`blocked` 的处置按状态区分(D8):**
    - `QUEUED`、`WAITING_TARGET`、`RETRYING` 期间发现 `blocked` → 立即转 `TARGET_BLOCKED`。
    - `RETRYING` 期间发现目标不存在 → 立即转 `TARGET_MISSING`。
-   - `DISPATCHING` 期间收到 `agent_blocked`:语义经实测证实后转 `TARGET_BLOCKED`,证实之前转 `DELIVERY_UNCERTAIN`(见 §5)。
+   - `DISPATCHING` 期间收到 `agent_blocked`:已实测证实是写入前拒绝,转 `TARGET_BLOCKED`(见 §5)。
    - **`DELIVERY_UNCERTAIN` 期间发现 `blocked`:只记入 `detail` 和审计,不改变状态。** 因为目标此刻 `blocked` 也可能正是消息已送达的结果(收到 prompt 后开始干活,然后停在审批界面);把它标成"确定被 blocked 而未送达"是错的。
 6. **目标状态复核放在进入 `DISPATCHING` 之前。** `DISPATCHING` 是写前标记,所以没有 `DISPATCHING → WAITING_TARGET`:复核发现目标不再 READY,就留在(或回到)`WAITING_TARGET`,根本不进入 `DISPATCHING`。**调用 herdr 之后结果不明,一律进入 `DELIVERY_UNCERTAIN`。**
-7. **只有能证明 prompt 未提交的错误才能安全重试。** 不能只按错误名分类;`agent_not_ready` 等错误需要先确认 herdr 的实际语义,确认之前按"不确定"处理(§5)。
+7. **只有能证明 prompt 未提交的错误才能安全重试。** 不能只按错误名分类:每个错误码的语义都要在真实 herdr 上实测确认,未确认的(含未知错误码)按"不确定"处理。当前状态见 §5:`agent_blocked`、`agent_not_ready`、`agent_not_found`、`server_not_running` 已在 herdr 0.9.3 上实测为"未写入"并已定类;`agent_prompt_failed` 实测为"已写入";升级 herdr 后须重测,结果不一致就退回"不确定"。
 8. **`unknown` 不是 READY。** 只能等待,等到超时 → `TIMEOUT`。
 9. **`idle` 和 `done` 都是 READY(D9)。** 实测:`done` 不会自己变回 `idle`,只等 `idle` 会永远等不到。
 10. **同一目标按 `msg_id` 顺序串行投递(FIFO)。** 实测:同时发给忙碌的 agent 的多条 prompt 都会被接受,但处理顺序不确定,所以顺序必须由 Broker 保证。
@@ -128,16 +128,19 @@ QUEUED ─▶ WAITING_TARGET ─▶ [复核通过] ─▶ DISPATCHING ─▶ DEL
 | --- | --- | --- | --- |
 | 客户端在**发出请求之前**就失败(找不到 herdr 可执行文件、无法启动子进程) | **是** | 请求从未发出,逻辑上成立 | `RETRYING`(命令行用法错误属于配置缺陷,转 `FAILED`) |
 | Broker 在**调用 herdr 之前**的独立复核(`agent get` / `agent list`)发现目标不存在 | **是** | prompt 尚未发出,根本没有进入 `DISPATCHING` | `TARGET_MISSING` |
-| `agent_not_found`(调用 `agent prompt` 之后才收到) | **待验证** | 无法排除"请求已提交、目标随后才消失"(例如 pane 被关闭);"按效果判断"不足以证明未提交。需确认 herdr 是否在提交前查找目标 | 证实前:`DELIVERY_UNCERTAIN`;证实后:`TARGET_MISSING` |
-| `agent_blocked` | **待验证** | herdr 文档声明"拒绝时不发送任何输入";**未在真实环境触发验证** | 证实前:`DELIVERY_UNCERTAIN`;证实后:`TARGET_BLOCKED` |
-| `agent_not_ready`(例如"不再是 pane 的前台进程") | **待验证** | 实测过一次(前台进程名不匹配时,消息没有出现在屏幕上),**不足以推广**;其实际语义未确认 | 证实前:`DELIVERY_UNCERTAIN`;证实后再决定 |
-| `server_not_running` | **待验证** | 观察到过(连接命名会话的 socket 失败)。是否可能出现在写入之后未确认 | 证实前:`DELIVERY_UNCERTAIN` |
+| `agent_not_found`(调用 `agent prompt` 之后才收到) | **是(实测)** | 静态目标、agent 退出后、以及"连续发送时关闭 pane"的竞态 20 次,共 22 次,**全部没有写入**;竞态中写到一半被打断的情况返回的是另一个错误码 `agent_prompt_failed`(见下)。说明 herdr 先查找目标、找不到即返回 | `TARGET_MISSING` |
+| `agent_blocked` | **是(实测)** | 两种构造(识别为 pi 的 agent / 前台不是 pi 但声明为 pi),均在 `blocked` 时返回,**没有写入**,耗时 2~6 毫秒;与 herdr 文档"拒绝时不发送任何输入"一致 | `TARGET_BLOCKED` |
+| `agent_not_ready`("agent … is no longer the pane foreground process") | **是(实测)** | 前台进程不是该 agent 时返回,**没有写入**,耗时 6 毫秒。注意:agent 进程退出后 herdr 会立即注销它,此时返回的是 `agent_not_found` 而不是本错误 | `RETRYING`(退避后复核目标:agent 回到前台就投递,不存在就 `TARGET_MISSING`) |
+| `server_not_running` | **是(实测)** | 连不上会话的 socket 时返回,请求根本没有发出,**没有写入**。**未测**:服务在处理请求中途退出(那种情况若出现其他错误码,按"未知"处理) | `RETRYING`(退避后复核) |
+| `agent_prompt_failed`("PTY actor closed during input submission") | **否(实测:已写入)** | 写入过程中 pane 被关闭时返回;实测 17 次**全部已经写入了文字**。这是"返回错误但消息已送达"的直接证据 | `DELIVERY_UNCERTAIN` |
 | `agent_prompt_stalled` | **否** | herdr 文档:不代表没有发出 | `DELIVERY_UNCERTAIN` |
 | `timeout` / `client_timeout`(等待 herdr 返回超时) | **否** | 超时可能发生在提交之后 | `DELIVERY_UNCERTAIN` |
 | `agent_name_taken` / `invalid_agent_name` | 不适用 | 这是 `agent rename` 的错误,不属于 prompt 路径 | 不会在投递中出现;出现即视为实现缺陷 → `FAILED` |
 | 其他未知错误码、无法解析的输出 | **否** | 语义未知 | `DELIVERY_UNCERTAIN` |
 
-"待验证"项(`agent_blocked`、`agent_not_ready`、`server_not_running`、调用后的 `agent_not_found`)的验证办法(**Broker 实现前要做**):在真实 herdr 上构造该错误,然后检查目标终端是否出现了该 prompt 的文字、目标状态是否发生了变化。验证结论要写回本表,把"待验证"改为"是"或"否"。**这张表在验证完成前是保守的:RETRYING 在实践中只由客户端发请求前的失败触发;`TARGET_MISSING` 只由调用前的独立复核触发。**
+**验证记录(2026-10-09,herdr 0.9.3):** 上表"是(实测)/否(实测)"各行的依据见 `herdr/claude/09-herdr-error-probe-plan.md` §7。方法:用一个把收到的每个字节写进日志的假 agent 当目标(不调用模型),错误返回后查日志里有没有这条 prompt 的文字。
+**适用范围:** 结论只对 **herdr 0.9.3** 成立。升级 herdr 后必须重跑 `review-probes/probe_herdr_errors.py`,结果不同就回到保守处理(`DELIVERY_UNCERTAIN`)。实测样本有限(每种 2~22 次),说明"观察到的行为",不是对 herdr 源码的证明。
+**实现提醒:** `agent_prompt_failed` 目前不在 `HerdrClient` 的错误码映射里,会被当作未知错误码,按本表的通用规则也会进入 `DELIVERY_UNCERTAIN`,结果正确;Broker 阶段应把它显式列入。
 
 ## 6. `DELIVERY_UNCERTAIN` 的处置
 
@@ -319,7 +322,7 @@ herdr 接受了但观察窗口内没看到目标开始处理 → **不记 `DELIV
 | 2a | 确定失败终态默认暂停并告警,等操作员"重试"或"放弃并继续"(§7.1、§7.3) | **已确认(用户)** |
 | 2b | 取消后续消息(`CANCELLED`)、`continue_on_failure`、`workflow_id` 依赖分组 | v1 不做,列为将来扩展(§7.5) |
 | 3 | 告警策略:1 小时提醒、24 小时升级;重复间隔 | 暂定,可配置;只告警,不是状态迁移 |
-| 4 | §5 中 `agent_blocked`、`agent_not_ready`、`server_not_running`、调用后 `agent_not_found` 的"未提交"语义 | 待在真实 herdr 上验证(Broker 实现前) |
+| 4 | §5 中 `agent_blocked`、`agent_not_ready`、`server_not_running`、调用后 `agent_not_found` 的"未提交"语义 | **已实测(2026-10-09,herdr 0.9.3)**:四者均未写入;另发现 `agent_prompt_failed` 会在已写入后返回。升级 herdr 后需重测 |
 | 5 | `state_change_seq` 作为核实依据的可靠性 | 待在真实 herdr 上验证;验证前不得自动使用 |
 | 6 | 观察窗口长度 | 暂定 30 秒,可配置,待 Broker 实测 |
 | 7 | 状态查询的退避与上限(1 秒起、每次加倍、单次 ≤ 30 秒;连续 5 次;总等待 300 秒) | 暂定,可配置,待 Broker 实测 |
@@ -365,6 +368,7 @@ herdr 接受了但观察窗口内没看到目标开始处理 → **不记 `DELIV
   - 依据 Codex 对补充决议三的复审(无阻断,3 条应修):终态重试经 Router 的重试入队路径创建,操作员不直接写状态(§1、§7.3 规则 3);裁定副作用都以 `ruling_id` 幂等,`RULING_APPLIED` 只在全部效果持久化后写入,裁定记录不可读时 fail-closed(§7.3 规则 6、7);测试改为逐项断言每个 `ruling` 的语义。
   - 依据 Codex 的再次复审(2 条应修):新增解除 fail-closed 的人工流程——作废旧裁定(`RULING_VOIDED`,只停止补做、不撤销已生效效果;作废后以已持久化的实际状态重新确定队列头,不"回到"任何状态,按实际状态分 5 种情况处理)与恢复全局投递(`DISPATCH_RESUMED`)(§7.3 规则 8);裁定触发的 `QUEUE_PAUSED` / `QUEUE_RELEASED` 必须带 `ruling_id`;"Router 的重试入队路径"改为"受信任的重试入队路径",模块归属留到 Broker 阶段。
 - **定稿(2026-10-09)**:Codex 复审结论"可以定稿";`herdr/a2a/src/a2a/messages.py` 迁移表已对齐。Broker 阶段待办:故障注入测试,覆盖作废前后各副作用已持久化的崩溃点(Codex,非必要)。
+- **错误码实测(2026-10-09,迁移表不变)**:§4 规则 7 同步改为引用实测结果(Codex 指出遗漏)。§5 的四个"待验证"项在 herdr 0.9.3 上实测为"未写入":`agent_blocked` → `TARGET_BLOCKED`,调用后的 `agent_not_found` → `TARGET_MISSING`,`agent_not_ready` 与 `server_not_running` → `RETRYING`。新增 `agent_prompt_failed`(实测已写入)→ `DELIVERY_UNCERTAIN`。结论绑定 herdr 版本。详见 `09` 号文档。
 - **版本 1(2026-10-09)**:初版。
 
 ## 12. 与 `herdr/a2a_codex` 对齐

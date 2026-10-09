@@ -211,7 +211,9 @@
 - [ ] 每目标一个串行 worker,FIFO
 - [ ] READY 判定:`idle` / `done` 可投递;`working` 等待;`blocked` 立即失败;`unknown` 等到超时后失败
 - [ ] 投递后用 `agent wait --until working` 确认
-- [ ] **Broker 实现前**:在真实 herdr 上实测 `agent_blocked`、`agent_not_ready`、`server_not_running`、调用后 `agent_not_found` 的"未提交"语义,写回 08 §5(需你同意方案后再跑)
+- [x] **Broker 实现前**:实测 4 个错误码的"未提交"语义 ✅ herdr 0.9.3 上四者均未写入,已写回 08 §5;新发现 `agent_prompt_failed`(写入中途 pane 被关闭)返回时**已写入**,走 `DELIVERY_UNCERTAIN`(`09` 号文档 §7)
+- [ ] `HerdrClient` 的错误码映射补上 `agent_prompt_failed`(目前按未知错误码处理,结果正确但不显式)
+- [ ] 升级 herdr 后重跑 `review-probes/probe_herdr_errors.py`
 - [ ] `queue_seq`(每目标持久单调、原子分配;重试继承原值),改 `Router` / `Spool`
 - [ ] 队列头调度:确定失败与不确定态都暂停该目标;槽位放行记录持久化
 - [ ] 操作员命令:裁定已送达 / 重试 / 放弃并继续 / 作废裁定 / 恢复投递(命令形式与 `actor` 来源待设计,08 §10)
