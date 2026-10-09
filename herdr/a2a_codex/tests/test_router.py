@@ -20,7 +20,7 @@ from a2a_codex import (
     Topology,
     TopologyStore,
 )
-from a2a_codex.messages import QUEUED
+from a2a_codex.messages import DELIVERY_UNCERTAIN, QUEUED
 from a2a_codex.messages import Message, now_iso, new_msg_id
 from a2a_codex.spool import SpoolError
 
@@ -55,6 +55,7 @@ def _crash_after_done_archive(root, msg_id, exit_code):
         return original_unlink(path, *args, **kwargs)
 
     Path.unlink = crash_before_pending_unlink
+    spool.update(msg_id, state="DISPATCHING")
     spool.update(msg_id, state="DELIVERED")
 
 
@@ -135,7 +136,8 @@ class RouterTests(unittest.TestCase):
         uart = self.router.send("dv_done", self.env(ip_id="uart"))
         gpio = self.router.send("dv_done", self.env(ip_id="gpio"))
         self.assertEqual((uart.dst, gpio.dst), ("sw_uart", "sw_gpio"))
-        self.assertEqual([item.dst for item in self.spool.pending()], ["sw_uart", "sw_gpio"])
+        # 不同目标之间没有全局 FIFO；这里只验证两个同 IP 路由目标都入队。
+        self.assertEqual({item.dst for item in self.spool.pending()}, {"sw_uart", "sw_gpio"})
 
     def test_identity_and_pane_spoofing_are_rejected_and_audited(self):
         cases = [
@@ -235,14 +237,83 @@ class SpoolAuditTests(unittest.TestCase):
     def test_fifo_update_archive_and_lookup(self):
         first = self.spool.enqueue(self.message())
         second = self.spool.enqueue(self.message())
-        self.assertEqual([msg.msg_id for msg in self.spool.pending("sw_uart")],
-                         sorted([first.msg_id, second.msg_id]))
+        self.assertLess(first.queue_seq, second.queue_seq)
+        self.assertEqual([msg.queue_seq for msg in self.spool.pending("sw_uart")],
+                         [first.queue_seq, second.queue_seq])
         self.spool.update(first.msg_id, state="DISPATCHING", attempts=1)
         archived = self.spool.update(first.msg_id, state="DELIVERED")
         self.assertEqual(archived.state, "DELIVERED")
         self.assertEqual(self.spool.done(), [archived])
         self.assertEqual([msg.msg_id for msg in self.spool.pending()], [second.msg_id])
         self.assertEqual(self.spool.get(first.msg_id).state, "DELIVERED")
+
+    def test_queue_seq_is_persistent_and_scoped_per_target(self):
+        first = self.spool.enqueue(self.message())
+        other_target = self.spool.enqueue(self.message(dst="sw_gpio"))
+        second = Spool(self.spool.root).enqueue(self.message())
+        third = Spool(self.spool.root).enqueue(self.message())
+        self.assertEqual([first.queue_seq, second.queue_seq, third.queue_seq], [1, 2, 3])
+        self.assertEqual(other_target.queue_seq, 1)
+
+    def test_unreleased_failure_holds_queue_head_until_operator_release(self):
+        failed = self.spool.enqueue(self.message())
+        later = self.spool.enqueue(self.message())
+        self.spool.update(failed.msg_id, state="FAILED", detail="permanent failure")
+        self.assertEqual(self.spool.queue_head("sw_uart").msg_id, failed.msg_id)
+        self.assertIn("sw_uart", self.spool.queue_targets())
+        self.assertTrue(self.spool.release_slot("sw_uart", failed.queue_seq,
+                                                ruling_id="ruling-1", reason="abandon"))
+        self.assertFalse(self.spool.release_slot("sw_uart", failed.queue_seq,
+                                                 ruling_id="ruling-1", reason="abandon"))
+        self.assertEqual(self.spool.queue_head("sw_uart").msg_id, later.msg_id)
+
+    def test_delivered_releases_queue_slot_and_retry_inherits_original_slot(self):
+        delivered = self.spool.enqueue(self.message())
+        failed = self.spool.enqueue(self.message())
+        later = self.spool.enqueue(self.message())
+        self.spool.update(delivered.msg_id, state="DISPATCHING")
+        self.spool.update(delivered.msg_id, state="DELIVERED")
+        self.spool.update(failed.msg_id, state="FAILED")
+        retry_id = new_msg_id()
+        now = now_iso()
+        retry = Message(retry_id, now, failed.edge_id, failed.src, failed.dst, failed.project_id,
+                        failed.ip_id, failed.session, failed.text, QUEUED, failed.topology_revision,
+                        updated_at=now, queue_seq=failed.queue_seq, retry_of=failed.msg_id)
+        self.spool.enqueue_retry(retry, original_msg_id=failed.msg_id)
+        self.assertEqual(self.spool.queue_head("sw_uart").msg_id, retry_id)
+        self.spool.update(retry_id, state="FAILED")
+        self.assertEqual(self.spool.queue_head("sw_uart").msg_id, retry_id)
+        self.assertGreater(later.queue_seq, retry.queue_seq)
+
+    def test_spool_enforces_protocol_v2_transitions(self):
+        queued = self.spool.enqueue(self.message())
+        with self.assertRaises(SpoolError):
+            self.spool.update(queued.msg_id, state=DELIVERY_UNCERTAIN)
+
+        self.spool.update(queued.msg_id, state="DISPATCHING")
+        with self.assertRaises(SpoolError):
+            self.spool.update(queued.msg_id, state="WAITING_TARGET")
+        uncertain = self.spool.update(queued.msg_id, state=DELIVERY_UNCERTAIN)
+        self.assertEqual(uncertain.state, DELIVERY_UNCERTAIN)
+        delivered = self.spool.update(queued.msg_id, state="DELIVERED")
+        self.assertEqual(delivered.state, "DELIVERED")
+
+    def test_terminal_messages_are_immutable_and_rejected_never_enters_spool(self):
+        queued = self.spool.enqueue(self.message())
+        self.spool.update(queued.msg_id, state="DISPATCHING")
+        terminal = self.spool.update(queued.msg_id, state="DELIVERED")
+        for changes in ({"detail": "rewrite"}, {"attempts": 99}, {"state": "DELIVERED"},
+                        {"state": "FAILED"}):
+            with self.subTest(changes=changes), self.assertRaises(SpoolError):
+                self.spool.update(terminal.msg_id, **changes)
+        with self.assertRaises(SpoolError):
+            self.spool.enqueue(self.message(state="REJECTED"))
+
+    def test_corrupt_terminal_record_fails_closed_during_recovery(self):
+        self.spool.done_dir.mkdir(parents=True, exist_ok=True)
+        (self.spool.done_dir / "corrupt.json").write_text("{not json\n", encoding="utf-8")
+        with self.assertRaises(SpoolError):
+            Spool(self.spool.root)
 
     def test_spool_rejects_path_traversal_and_unknown_message(self):
         with self.assertRaises(SpoolError):
@@ -273,8 +344,7 @@ class SpoolAuditTests(unittest.TestCase):
         messages = self.spool.pending("sw_uart")
         self.assertEqual(len(messages), 48)
         self.assertEqual(len({message.msg_id for message in messages}), 48)
-        self.assertEqual([message.msg_id for message in messages],
-                         sorted(message.msg_id for message in messages))
+        self.assertEqual([message.queue_seq for message in messages], list(range(1, 49)))
 
     def test_concurrent_audit_appends_remain_complete_jsonl_records(self):
         context = multiprocessing.get_context("fork")

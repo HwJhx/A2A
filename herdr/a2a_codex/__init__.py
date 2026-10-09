@@ -14,7 +14,15 @@ from .registry import (
     RegistryError,
     RuntimeAddressConflictError,
 )
-from .messages import Message
+from .messages import (
+    ALLOWED_TRANSITIONS,
+    ALL_STATES,
+    DELIVERY_UNCERTAIN,
+    NON_TERMINAL_STATES,
+    TERMINAL_STATES,
+    Message,
+    can_transition,
+)
 from .spool import MessageNotFoundError, Spool, SpoolError
 from .audit import AuditLog
 from .router import Router, SendReceipt, SendRejected
@@ -24,6 +32,8 @@ __all__ = ["HerdrClient", "Agent", "ResourceRef", "LauncherError",
            "TopologyError", "TopologyStore", "AgentIdentity", "IdentityError", "IdentityMismatchError",
            "AgentAlreadyRegisteredError", "AgentNotRegisteredError", "AgentRecord",
            "AmbiguousPaneError", "Registry", "RegistryError", "RuntimeAddressConflictError",
-           "Message", "MessageNotFoundError", "Spool", "SpoolError", "AuditLog",
+           "Message", "ALLOWED_TRANSITIONS", "ALL_STATES", "NON_TERMINAL_STATES",
+           "TERMINAL_STATES", "DELIVERY_UNCERTAIN", "can_transition",
+           "MessageNotFoundError", "Spool", "SpoolError", "AuditLog",
            "Router", "SendReceipt", "SendRejected", "HerdrPromptOutcomeUnknown",
-           "HerdrAgentNameTaken", "HerdrInvalidAgentName"]
+           "HerdrAgentPromptFailed", "HerdrAgentNameTaken", "HerdrInvalidAgentName"]

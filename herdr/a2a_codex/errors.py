@@ -41,10 +41,12 @@ class HerdrNotFound(HerdrError):
 
 
 class HerdrAgentNotReady(HerdrError):
+    """herdr 0.9.3 实测为 prompt 写入前拒绝；Broker 退避后复核再试。"""
     pass
 
 
 class HerdrAgentBlocked(HerdrError):
+    """herdr 0.9.3 实测为 prompt 写入前拒绝；Broker 应转 TARGET_BLOCKED。"""
     pass
 
 
@@ -60,12 +62,18 @@ class HerdrPromptOutcomeUnknown(HerdrError):
     """Prompt 可能已提交；调用方必须核查后再考虑重试。"""
 
 
+class HerdrAgentPromptFailed(HerdrPromptOutcomeUnknown):
+    """herdr 0.9.3 的 PTY 写入中断错误；实测 prompt 可能已部分/全部写入。"""
+
+
 _ERRORS = {
     "server_not_running": HerdrServerNotRunning,
     "agent_not_ready": HerdrAgentNotReady,
     "agent_blocked": HerdrAgentBlocked,
+    "agent_not_found": HerdrNotFound,
     "agent_name_taken": HerdrAgentNameTaken,
     "invalid_agent_name": HerdrInvalidAgentName,
+    "agent_prompt_failed": HerdrAgentPromptFailed,
     "agent_prompt_stalled": HerdrPromptOutcomeUnknown,
     "timeout": HerdrTimeout,
 }

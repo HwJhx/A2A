@@ -11,9 +11,11 @@ from unittest import mock
 from a2a_codex import HerdrClient
 from a2a_codex import cli as cli_module
 from a2a_codex.errors import (
+    HerdrAgentPromptFailed,
     HerdrAgentNameTaken,
     HerdrAgentNotReady,
     HerdrInvalidAgentName,
+    HerdrNotFound,
     HerdrPromptOutcomeUnknown,
     from_code,
 )
@@ -40,6 +42,12 @@ class TestHerdrClient(unittest.TestCase):
     def test_agent_name_errors_are_mapped(self) -> None:
         self.assertIsInstance(from_code("agent_name_taken", "taken"), HerdrAgentNameTaken)
         self.assertIsInstance(from_code("invalid_agent_name", "invalid"), HerdrInvalidAgentName)
+
+    def test_prompt_errors_follow_herdr_093_probe_classification(self) -> None:
+        prompt_failed = from_code("agent_prompt_failed", "PTY actor closed during input submission")
+        self.assertIsInstance(prompt_failed, HerdrAgentPromptFailed)
+        self.assertIsInstance(prompt_failed, HerdrPromptOutcomeUnknown)
+        self.assertIsInstance(from_code("agent_not_found", "missing"), HerdrNotFound)
 
     def test_create_tab_maps_to_cli_and_model(self) -> None:
         r = Runner(response({"tab": {"tab_id": "w1:t2", "workspace_id": "w1"},
