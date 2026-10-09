@@ -11,7 +11,8 @@ import time
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 from .errors import (
-    HerdrBinaryNotFound, HerdrError, HerdrTimeout, HerdrUsageError, from_code,
+    HerdrBinaryNotFound, HerdrError, HerdrPromptOutcomeUnknown, HerdrTimeout,
+    HerdrUsageError, from_code,
 )
 from .models import Agent, ResourceRef, agent_model, resource_ref
 
@@ -154,6 +155,16 @@ class HerdrClient:
     def delete_pane(self, pane_id: str) -> Dict[str, Any]:
         return dict(self._call("pane", "close", self._target(pane_id)))
 
+    def pane_process_info(self, pane_id: str) -> Dict[str, Any]:
+        result = self._call("pane", "process-info", "--pane", self._target(pane_id))
+        value = result.get("process_info", result) if isinstance(result, dict) else result
+        return dict(value)
+
+    def pane_process_info(self, pane_id: str) -> Dict[str, Any]:
+        result = self._call("pane", "process-info", "--pane", self._target(pane_id))
+        value = result.get("process_info", result) if isinstance(result, dict) else result
+        return dict(value)
+
     def rename_pane(self, pane_id: str, label: Optional[str]) -> Dict[str, Any]:
         target = self._target(pane_id)
         return dict(self._call("pane", "rename", target, "--clear" if label is None else label))
@@ -172,10 +183,12 @@ class HerdrClient:
         result = self._call("agent", "list")
         return [agent_model(item) for item in result.get("agents", [])]
 
-    def rename_agent(self, target: str, name: str) -> Agent:
-        if not name:
-            raise ValueError("agent name 不能为空")
-        return agent_model(self._call("agent", "rename", self._target(target), name))
+    def rename_agent(self, target: str, name: Optional[str]) -> Agent:
+        args: list[object] = ["agent", "rename", self._target(target)]
+        args.append("--clear" if name is None else name)
+        if name == "":
+            raise ValueError("agent name 不能为空；清除名称请传 None")
+        return agent_model(self._call(*args))
 
     def find_agent(self, pane_id: str) -> Optional[Agent]:
         return next((agent for agent in self.list_agents() if agent.pane_id == pane_id), None)
@@ -203,10 +216,22 @@ class HerdrClient:
                     timeout_ms: Optional[int] = None) -> Agent:
         if not prompt:
             raise ValueError("prompt 不能为空")
+        if wait and timeout_ms is None:
+            raise ValueError("wait=True 时必须提供 timeout_ms，避免无界等待")
         args: list[object] = ["agent", "prompt", self._target(target), prompt]
         if wait: args.append("--wait")
         if timeout_ms is not None: args += ["--timeout", str(timeout_ms)]
-        return agent_model(self._call(*args, timeout=(timeout_ms / 1000 + 10) if timeout_ms else None))
+        try:
+            return agent_model(self._call(*args, timeout=(timeout_ms / 1000 + 10) if timeout_ms else None))
+        except HerdrPromptOutcomeUnknown:
+            raise
+        except HerdrTimeout as exc:
+            # The CLI may have submitted the prompt before its wait or response timed out.
+            raise HerdrPromptOutcomeUnknown(
+                f"prompt 结果不确定；可能已送达，重试前请核查目标 agent: {exc}",
+                code=exc.code or "client_timeout", argv=exc.argv,
+                returncode=exc.returncode, stdout=exc.stdout, stderr=exc.stderr,
+            ) from exc
 
     def wait_agent(self, target: str, *, until: Iterable[str] = ("idle", "done", "blocked"),
                    timeout_ms: Optional[int] = None) -> Agent:

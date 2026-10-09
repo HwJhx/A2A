@@ -1,7 +1,7 @@
 """a2a: 基于 herdr 的多智能体编排框架。
 
-当前只有 herdr 调用层(HerdrClient)和启动命令构造(launcher);
-拓扑、路由、broker 等后续按 herdr/claude/04-design-python-framework.md 逐层添加。
+当前有:herdr 调用层(HerdrClient)、启动命令构造(launcher)、拓扑(含动态修改和热加载)、
+身份与注册表。路由、broker 等后续按 herdr/claude/04-design-python-framework.md 逐层添加。
 """
 from .errors import (
     HerdrAgentBlocked,
@@ -26,9 +26,80 @@ from .herdr_client import (
     session_list,
     session_stop,
 )
+from .identity import (
+    AgentIdentity,
+    IdentityError,
+    IdentityMismatchError,
+    NodeNotInTopologyError,
+    SenderNotRegisteredError,
+    SenderNotRunningError,
+    identity_env,
+    resolve_sender,
+)
 from .launcher import LauncherError, build_launch_command, preflight_launcher
+from .audit import AuditLog
+from .messages import ALLOWED_TRANSITIONS, Message, can_transition
+from .paths import (
+    PathConfigError,
+    default_audit_path,
+    default_registry_path,
+    default_spool_dir,
+    default_topology_path,
+    state_dir,
+)
+from .registry import (
+    AgentAlreadyRegisteredError,
+    AgentNotRegisteredError,
+    AgentRecord,
+    AmbiguousPaneError,
+    Registry,
+    RegistryError,
+    RuntimeAddressConflictError,
+)
+from .router import Router, SendReceipt, SendRejected, session_from_env
+from .spool import IllegalTransitionError, InvalidIdError, MessageNotFoundError, Spool, SpoolError
+from .topology import Edge, RoleSpec, Topology, TopologyError, TopologyStore
 
 __all__ = [
+    "AgentAlreadyRegisteredError",
+    "AgentIdentity",
+    "AgentNotRegisteredError",
+    "ALLOWED_TRANSITIONS",
+    "AgentRecord",
+    "AuditLog",
+    "AmbiguousPaneError",
+    "Edge",
+    "IdentityError",
+    "IdentityMismatchError",
+    "NodeNotInTopologyError",
+    "PathConfigError",
+    "Registry",
+    "RegistryError",
+    "RoleSpec",
+    "RuntimeAddressConflictError",
+    "SenderNotRegisteredError",
+    "SenderNotRunningError",
+    "Topology",
+    "TopologyError",
+    "TopologyStore",
+    "IllegalTransitionError",
+    "InvalidIdError",
+    "MessageNotFoundError",
+    "Message",
+    "Router",
+    "SendReceipt",
+    "SendRejected",
+    "Spool",
+    "SpoolError",
+    "can_transition",
+    "default_audit_path",
+    "default_registry_path",
+    "default_spool_dir",
+    "session_from_env",
+    "default_topology_path",
+    "identity_env",
+    "resolve_sender",
+    "state_dir",
     "AGENT_STATUSES",
     "READY_OR_BLOCKED",
     "READY_STATUSES",

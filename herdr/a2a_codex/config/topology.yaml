@@ -1,0 +1,44 @@
+version: 1
+project_id: soc_a
+workspace_label: SoC-A
+
+# role ID 同时用于 A2A_ROLE 与业务 agent_id 的前缀。
+# 未部署的角色 launcher 可先留空；Provisioner 阶段再负责启动能力检查。
+roles:
+  spec:
+    label: Spec智能体
+    kind: pi
+    launcher: null
+  arch:
+    label: 架构智能体
+    kind: pi
+    launcher: null
+  rtl:
+    label: RTL智能体
+    kind: pi
+    launcher: null
+  dv:
+    label: 验证智能体
+    kind: pi
+    launcher: /home/jhx/.forenyx/fnx_dv/bin/fnx_dv
+  sw:
+    label: 软件智能体
+    kind: pi
+    launcher: /home/jhx/.forenyx/fnx_sw/bin/fnx_sw
+
+ips:
+  - uart
+  - gpio
+  - spi
+  - i2c
+
+# 边只定义角色方向，不携带 IP；目标 IP 永远从已验证的发送方身份继承。
+edges:
+  - id: dv_done
+    from: dv
+    to: sw
+    template: "{ip}已完成 UVM 验证，请开始驱动程序和 HAL 框架开发。"
+  - id: dv_to_rtl_fix
+    from: dv
+    to: rtl
+    template: "{ip}验证发现 RTL 问题，请检查并修复。"

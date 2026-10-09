@@ -29,6 +29,7 @@ from a2a import (
     HerdrTimeout,
     READY_STATUSES,
     build_launch_command,
+    identity_env,
     preflight_launcher,
     session_delete,
     session_list,
@@ -125,10 +126,10 @@ class TestSessionAndLayout(IntegrationBase):
         self.assertEqual({t["tab_id"]: t.get("label") for t in client.tab_list()}[created.tab_id], "t_renamed")
 
     def test_env_injection_reaches_the_shell(self):
-        created = self.new_tab("t_env", env={"A2A_ROLE": "dv", "A2A_IP": "uart"})
-        client.pane_run(created.pane_id, 'echo "ENVCHK $A2A_ROLE $A2A_IP $HERDR_PANE_ID $HERDR_ENV"')
-        text = wait_for_text(created.pane_id, "ENVCHK dv uart %s 1" % created.pane_id)
-        self.assertIn("ENVCHK dv uart", text)
+        created = self.new_tab("t_env", env=identity_env("soc_a", "dv", "uart"))
+        client.pane_run(created.pane_id, 'echo "ENVCHK $A2A_PROJECT_ID $A2A_ROLE $A2A_IP $HERDR_PANE_ID $HERDR_ENV"')
+        text = wait_for_text(created.pane_id, "ENVCHK soc_a dv uart %s 1" % created.pane_id)
+        self.assertIn("ENVCHK soc_a dv uart", text)
 
     def test_split_rename_process_info_close(self):
         created = self.new_tab("t_split")
@@ -245,7 +246,7 @@ class TestRealFnxLaunch(IntegrationBase):
             self.skipTest("没有安装 %s" % name)
         self.assertEqual(preflight_launcher(launcher), [])
 
-        created = self.new_tab("t_" + role, env={"A2A_ROLE": role, "A2A_IP": "uart"})
+        created = self.new_tab("t_" + role, env=identity_env("soc_a", role, "uart"))
         client.pane_run(created.pane_id, build_launch_command(launcher))
         agent = client.wait_for_agent_detected(created.pane_id, timeout_s=60)
         self.assertEqual(agent["agent"], "pi")
@@ -257,10 +258,10 @@ class TestRealFnxLaunch(IntegrationBase):
         self.assertIn(name, banner)
 
         # pi 的 `!` 前缀直接执行 shell,不经过模型
-        client.pane_send_text(created.pane_id, "! echo FNXENV $A2A_ROLE $A2A_IP $HERDR_PANE_ID")
+        client.pane_send_text(created.pane_id, "! echo FNXENV $A2A_PROJECT_ID $A2A_ROLE $A2A_IP $HERDR_PANE_ID")
         time.sleep(0.6)  # 实测:TUI 需要一点间隔才会处理紧跟着的回车,否则文字留在输入框里不执行
         client.pane_send_keys(created.pane_id, "enter")
-        wait_for_text(created.pane_id, "FNXENV %s uart %s" % (role, created.pane_id), timeout=20)
+        wait_for_text(created.pane_id, "FNXENV soc_a %s uart %s" % (role, created.pane_id), timeout=20)
 
         client.agent_rename(created.pane_id, "%s_uart" % role)
         self.assertEqual(client.agent_get("%s_uart" % role)["pane_id"], created.pane_id)

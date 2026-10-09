@@ -1,7 +1,7 @@
 # 路线图与进度清单
 
 > 规则:**完成一项,在行尾打 ✅**。未完成的行尾留空。只有真正做过并确认的才打 ✅。
-> 最后更新:2026-10-08
+> 最后更新:2026-10-09
 >
 > 相关文档:
 > - `01-install-and-launch-agents.md` 安装与启动
@@ -115,28 +115,94 @@
 - [ ] `blocked` 状态下 `agent prompt` 的真实行为(代码按文档映射,未实测)
 - [ ] 文本以 `-` 开头的 `agent prompt` 是否被 herdr 当成选项
 
-## 阶段 3:拓扑、身份、注册表
+## 阶段 3:拓扑、身份、注册表(已完成,代码在 `herdr/a2a/`)
 
-- [ ] `topology.yaml` 的读取与校验(角色、IP、有向边、模板)
-- [ ] 业务 ID:`agent_id` = `{角色码}_{ip}`,不带项目前缀;名字长度 ≤ 32 的检查
-- [ ] 注册表:业务 ID → 当前 workspace / tab / pane / agent_name / 状态,持久化
-- [ ] 身份解析:`A2A_ROLE` + `A2A_IP` + `HERDR_PANE_ID` 与注册表交叉核对
-- [ ] pane 重建后只更新注册表,业务 ID 不变
+拓扑与注册表移植自 `herdr/a2a_codex`(该目录未被改动);保留 `project_id`;动态拓扑一并实现。
 
-## 阶段 4:Router 与固定模板
+- [x] `topology.yaml` 的读取与校验(角色、IP、有向边、模板)✅ 模板只允许 `{ip}`;拒绝属性访问、格式说明、空占位符
+- [x] 业务 ID:`agent_id` = `{角色码}_{ip}`,不带项目前缀;名字长度 ≤ 32 的检查 ✅
+- [x] 保留 `project_id`(D13)✅ 拓扑必填;`A2A_PROJECT_ID` 注入;不进入 `agent_id`
+- [x] 注册表:业务 ID → 当前 workspace / tab / pane / agent_name / 状态,持久化 ✅ JSON + 跨进程文件锁 + 原子替换
+- [x] 身份解析收成一个入口 `resolve_sender` ✅ 环境变量 + `HERDR_PANE_ID` 与注册表交叉核对;要求 running;用拓扑重新校验节点还在;session 必须显式传入
+- [x] pane 重建后只更新注册表,业务 ID 不变 ✅ `update_runtime`
+- [x] 状态目录解析 ✅ `A2A_STATE_DIR` > `XDG_STATE_HOME/a2a` > `~/.local/state/a2a`;拒绝相对路径
+- [x] **动态拓扑**(D14)✅ `TopologyStore`:热加载(坏文件保留上一份合法拓扑)、增删 IP / 角色 / 边、改模板、跨进程文件锁、写前备份、修订号
+- [x] 身份失败用例全覆盖 ✅ 缺各个环境变量、project 不符、伪造 role / ip、他人的 pane、未登记、已注销、重建后旧 pane 号、错误会话、非 running、节点已不在拓扑
+- [x] 跨进程并发与崩溃验证 ✅ 6 个进程并发改拓扑、8 个进程并发登记注册表不丢更新;`os.replace` 前强杀进程,原文件完好
+- [x] 测试:161 个全部通过 ✅(Mac,Python 3.9.6;虚拟机,Python 3.10 + PyYAML 5.4.1,含真实 herdr 与真实 fnx 的集成测试)
 
-- [ ] 鉴权六步(§3.1):身份、发送方已注册、边存在且方向对、目标已注册、模板字段合法、入队
-- [ ] 同 IP 铁律硬编码
-- [ ] 模板渲染,`{ip}` 由框架填入
-- [ ] 拓扑与模板的动态增删改(`add_edge` / `remove_edge` / `set_template`)
-- [ ] **反向用例全部被拒绝并写审计日志**:
-  - [ ] 同角色跨 IP(`dv_uart` → `sw_gpio`)
-  - [ ] 未配置的边
-  - [ ] 方向反了(`sw` → `dv`)
-  - [ ] 目标不存在或已 `purge`
-  - [ ] 伪造 `A2A_IP`,而 `HERDR_PANE_ID` 对应别的节点
-  - [ ] 模板字段不合法
-  - [ ] 目标 `blocked`:立即得到 `TARGET_BLOCKED`,且不向其写入任何输入
+阶段 4 要接上的约定:
+
+- Router 每次发送都用 `TopologyStore.current()` 取拓扑,并把 `revision` 写进审计日志
+- Router 必须显式传入 session 调 `resolve_sender`
+- 创建 tab / pane 时的 `env=` 用 `identity_env(project_id, role, ip)` 生成,不要手拼
+- `lifecycle` 删除 IP / 角色前要先清除对应 agent(`TopologyStore` 不检查)
+
+## 阶段 4:Router 与固定模板(已完成,代码在 `herdr/a2a/`)
+
+`router.py` 负责鉴权、拓扑校验、固定模板渲染、入队;**不碰 herdr**。同时新增 `messages.py`、`spool.py`(持久队列)、`audit.py`(审计日志)。
+
+- [x] 鉴权(§3.1):身份、边存在、方向正确、目标节点在拓扑里、目标已登记且 running、模板渲染 ✅
+- [x] 同 IP 铁律 ✅ 接口里没有目标 IP / 目标名字 / 自由文本参数;目标 = (边的 to 角色, 发送方自己的 IP)
+- [x] 模板渲染,`{ip}` 由框架填入 ✅ 并检查非空、长度上限、控制字符
+- [x] 拓扑与模板的动态变化即时生效 ✅ 每次发送取 `TopologyStore.current()`;审计里记录拓扑修订号
+- [x] 持久队列 ✅ 原子写入;msg_id 按时间排序,同一目标按入队顺序(FIFO);终态消息归档到 `done/`
+- [x] 审计日志 ✅ 追加写 JSON Lines、跨进程文件锁、文件权限 0600
+- [x] **反向用例全部被拒绝并写审计日志** ✅(每次拒绝恰好一条审计记录,且不入队):
+  - [x] 同角色跨 IP(`dv_uart` → `sw_gpio`)✅ 按构造不可能:目标 IP 恒等于发送方 IP;`sw_uart` 缺失时消息不会落到 `sw_gpio`
+  - [x] 未配置的边 ✅ `unknown_edge`
+  - [x] 方向反了(`sw` → `dv`)✅ `wrong_direction`;反向边配置后才通,删除后立即失效
+  - [x] 目标不存在或已 `purge` ✅ `target_missing`;目标非 running → `target_not_running`
+  - [x] 伪造 `A2A_IP` / `A2A_ROLE` / `A2A_PROJECT_ID`,或使用他人的 pane ✅ `identity`
+  - [x] 缺环境变量、pane 未登记 / 已注销 / 重建后旧号、别的会话冒充、发送方非 running、节点已不在拓扑 ✅ `identity`
+  - [x] 模板内容不合法 ✅ 拓扑加载时拒绝非法字段;渲染后超长 / 含控制字符 → `bad_message`
+  - [ ] 目标 `blocked`:立即得到 `TARGET_BLOCKED`,且不向其写入任何输入 —— **属于阶段 5**(要向 herdr 查实时状态,Router 不查)
+- [x] 多进程并发发送 ✅ 6 个进程并发发送 30 条,全部入队、ID 唯一、审计日志无交织
+- [x] 测试:214 个全部通过 ✅(Mac,Python 3.9.6;虚拟机,Python 3.10,含真实 herdr 与真实 fnx 的集成测试)
+
+### 阶段 4 补强:复核(对照 `herdr/a2a_codex`)后修复
+
+复核意见见 `07-review-of-a2a_codex.md`。对我自己的实现用同样的探针测出 6 个缺陷(P1~P7),已全部修复并有测试:
+
+- [x] **P2 队列**:终态归档两步之间崩溃会留下 pending / done 两份,broker 重启后会重复投递 ✅ `pending()` 读取时过滤已有 done 记录的消息;`recover()` 清理残留与临时文件(Broker 启动时调用)
+- [x] **P3 队列**:`msg_id` / 目标 ID 无格式校验,可路径穿越 ✅ 严格正则校验,非法一律 `InvalidIdError`
+- [x] **P6 队列**:`update` 接受未知状态名 ✅ 未知状态 → `SpoolError`
+- [x] **P7 队列**:终态可回退为非终态 ✅ 状态只能沿合法迁移表前进;终态不可再修改任何字段;新消息只能以 `QUEUED` 入队
+- [x] **P1 审计**:崩溃留下半行后,下一条记录被拼进坏行丢失 ✅ 追加前把残片隔离到 `audit.jsonl.corrupt`,补记 `AUDIT_REPAIRED`;`read()` 仍容忍中间坏行且不修改文件;写入循环处理短写
+- [x] **P4 Router**:不检查目标登记的会话 ✅ 目标会话必须等于发送方会话,否则 `target_missing`
+- [x] 状态迁移表写入协议文档 `08-protocol.md` ✅ 并新增 `DELIVERY_UNCERTAIN`;`tests/test_protocol.py` 逐行对照文档与代码,不一致即失败
+- [x] 测试:246 个全部通过 ✅(Mac,Python 3.9.6,17 个集成测试按设计跳过;虚拟机,Python 3.10,含真实 herdr 与真实 fnx)
+
+### 协议版本 2 定稿(与 Codex 多轮复核)
+
+- [x] `08-protocol.md` 修订为版本 2 并经三次补充决议 ✅ Codex 复审结论"可以定稿"
+  - `DELIVERY_UNCERTAIN` 默认不自动重发,没有时间出口,只能由操作员裁定或经验证的机制离开;删除 `DISPATCHING → WAITING_TARGET`;新增 `RETRYING → TARGET_BLOCKED / TARGET_MISSING`
+  - herdr 错误分类表(§5):只有能证明未提交的错误才能重试;`agent_blocked` / `agent_not_ready` / `server_not_running` / 调用后 `agent_not_found` 待实测
+  - 新增 §7 目标队列:队列头模型、确定失败也暂停、操作员动作(裁定已送达 / 重试 / 放弃并继续)、`queue_seq`、裁定幂等与作废
+- [x] `messages.py` 迁移表对齐版本 2 ✅ `test_code_table_equals_the_document` 通过
+- [x] 测试:279 个全部通过 ✅(Mac,Python 3.9.6,17 个跳过;虚拟机,Python 3.10,16 个跳过,未开启集成测试开关)
+- [ ] `a2a_codex` 的对齐由 Codex 自行完成(`a2a` 已对齐不代表 `a2a_codex` 已对齐)
+
+另外:文件权限经查无问题(状态文件均为 0600)。以下是 Codex 复核意见里**我认可、但尚未处理**的项,留给阶段 5 或之后:
+
+- [ ] 客户端缺口:`rename_agent` 不能清除名字已有(`agent_rename(None)`);仍需补 `agent_prompt` 的客户端超时与 `agent_prompt_stalled` 一并映射为"结果不确定"(`HerdrPromptStalled` 已有,Broker 要据此进入 `DELIVERY_UNCERTAIN`)
+- [ ] `done/` 目录的保留期、归档与磁盘告警策略(不做无策略删除)
+- [ ] `Spool.recover()` 放在 Broker 启动时调用(已实现方法,待 Broker 接上)
+
+新发现(已写进 04 号文档):
+
+- 命名会话里的 pane 带有 `HERDR_SESSION`(会话名)和 `HERDR_SOCKET_PATH`,`a2a send` 可直接据此得到会话名,不需要额外注入。**默认会话里的取值未测**。
+
+阶段 5 要接上的约定:
+
+- **启动顺序**:按 `08-protocol.md` §8:`Spool.recover()` → 停在 `DISPATCHING` 的消息迁到 `DELIVERY_UNCERTAIN` → 对账未生效的操作员裁定 → 恢复槽位放行记录 → 从各目标队列头继续
+- broker 从 `Spool.pending_targets()` / `pending(dst)` 取消息,**按 `queue_seq` 只处理队列头**(现在按 msg_id,需改);状态更新用 `Spool.update`(只能沿合法迁移表前进,到终态自动归档;**归档不等于放行**,槽位放行要单独持久记录)
+- 调用 herdr 后结果不明(含 `agent_prompt_stalled`、客户端超时、未经验证语义的错误码)→ `DELIVERY_UNCERTAIN`,**默认不自动重发,也不自动转 `FAILED`**,等操作员裁定
+- broker **持有 Spool 锁时不能等待 herdr**:锁只覆盖短的文件操作
+- broker 的每次状态变化都要写审计日志,并带上 `msg_id`
+- 投递时才查 herdr 实时状态;`blocked` 立即 `TARGET_BLOCKED`
+- 去重(§4.7)在 broker 里做
+- 还没写 `a2a send` / `a2a status` 命令行(属于阶段 5 的交付物)
 
 ## 阶段 5:Broker
 
@@ -145,10 +211,18 @@
 - [ ] 每目标一个串行 worker,FIFO
 - [ ] READY 判定:`idle` / `done` 可投递;`working` 等待;`blocked` 立即失败;`unknown` 等到超时后失败
 - [ ] 投递后用 `agent wait --until working` 确认
-- [ ] 超时、重试、去重(`msg_id`)
+- [ ] **Broker 实现前**:在真实 herdr 上实测 `agent_blocked`、`agent_not_ready`、`server_not_running`、调用后 `agent_not_found` 的"未提交"语义,写回 08 §5(需你同意方案后再跑)
+- [ ] `queue_seq`(每目标持久单调、原子分配;重试继承原值),改 `Router` / `Spool`
+- [ ] 队列头调度:确定失败与不确定态都暂停该目标;槽位放行记录持久化
+- [ ] 操作员命令:裁定已送达 / 重试 / 放弃并继续 / 作废裁定 / 恢复投递(命令形式与 `actor` 来源待设计,08 §10)
+- [ ] 裁定对账:`ruling_id` 幂等补做、`RULING_APPLIED`、裁定记录不可读时 fail-closed
+- [ ] 告警:不确定态 1 小时提醒、24 小时升级(暂定)
+- [ ] 观察窗口(暂定 30 秒)、状态查询退避与上限(暂定 5 次 / 300 秒),实测后定
+- [ ] 超时、去重(`msg_id`)
 - [ ] 消息状态机与审计日志(§4.6)
 - [ ] `a2a send <edge_id>` 立即返回 `msg_id`;`a2a status <msg_id>` 可查
 - [ ] 并发测试:同一目标同时收到多条,不交织
+- [ ] 行为测试:队列排序、暂停与放行、重试继承序号、恢复幂等;故障注入覆盖作废前后各副作用已持久化的崩溃点(Codex 建议)
 
 ## 阶段 6:pi 侧接入
 

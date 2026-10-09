@@ -48,10 +48,25 @@ class HerdrAgentBlocked(HerdrError):
     pass
 
 
+class HerdrAgentNameTaken(HerdrError):
+    pass
+
+
+class HerdrInvalidAgentName(HerdrError):
+    pass
+
+
+class HerdrPromptOutcomeUnknown(HerdrError):
+    """Prompt 可能已提交；调用方必须核查后再考虑重试。"""
+
+
 _ERRORS = {
     "server_not_running": HerdrServerNotRunning,
     "agent_not_ready": HerdrAgentNotReady,
     "agent_blocked": HerdrAgentBlocked,
+    "agent_name_taken": HerdrAgentNameTaken,
+    "invalid_agent_name": HerdrInvalidAgentName,
+    "agent_prompt_stalled": HerdrPromptOutcomeUnknown,
     "timeout": HerdrTimeout,
 }
 

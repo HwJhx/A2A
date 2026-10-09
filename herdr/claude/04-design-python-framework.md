@@ -22,7 +22,28 @@
 > - 拓扑配置里每个智能体只记录**启动脚本路径**(§3);Provisioner 的启动与预检按 §2.3、§5 修订
 > - `done` 不会自己变回 `idle`、`agent wait --until idle` 在 `done` 时会超时等实测结论写入 §4.4、§10.3
 >
-> 本文是**设计草案**,未实现。部分结论已在虚拟机实测。每个结论标注依据等级:
+> **v7 更新(复核后修复 P1~P7,状态迁移表写入协议文档)**:
+> - 消息状态、合法迁移表、`DELIVERY_UNCERTAIN`、崩溃恢复规则、拒绝代码的**权威定义在 `08-protocol.md`**;`tests/test_protocol.py` 逐行对照其中的迁移表与代码
+> - 队列:状态只能沿迁移表前进,终态不可变;所有 ID 严格校验;`recover()` + `pending()` 过滤,归档两步之间崩溃不会重复投递
+> - 审计:崩溃留下的半行在下次追加前被隔离到 `.corrupt`,不再吞掉下一条记录
+> - Router:目标登记的会话必须与发送方会话一致
+>
+> **v6 更新(Router 已实现,代码在 `herdr/a2a/`)**:
+> - `router.py`:发送方鉴权 + 拓扑校验 + 固定模板渲染 + 入队;不碰 herdr(§3.1)
+> - 新增 `messages.py`(消息模型与状态常量)、`spool.py`(持久队列)、`audit.py`(审计日志)
+> - 接口里没有"目标 IP / 目标名字 / 自由文本"参数:目标 = (边的 to 角色, 发送方自己的 IP),消息 = 边上的模板
+> - 发送方的会话名取自 pane 环境变量 `HERDR_SESSION`(命名会话里已实测会被 herdr 注入,D16)
+> - 拒绝原因有固定代码,每次拒绝在审计日志里恰好留下一条记录
+>
+> **v5 更新(拓扑、身份、注册表已实现,代码在 `herdr/a2a/`)**:
+> - 保留 `project_id`(D13):随环境变量 `A2A_PROJECT_ID` 注入,不进入 `agent_id`(仍是 `{角色码}_{ip}`)
+> - 动态拓扑现在就实现(D14):`TopologyStore` 支持热加载和增删 IP / 角色 / 边 / 模板,跨进程文件锁 + 原子写回
+> - 状态目录解析(D15):`A2A_STATE_DIR` > `$XDG_STATE_HOME/a2a` > `~/.local/state/a2a`
+> - 发送方判定收成一个入口 `identity.resolve_sender`(§3.1)
+> - 拓扑 schema 以实现为准(§3):`version: 1`、`project_id`、`workspace_label`、角色用 `label`
+> - 拓扑与注册表代码移植自 `herdr/a2a_codex`(该目录未被改动)
+>
+> 本文是**设计草案**,实现部分见代码与 `herdr/a2a/README.md`。部分结论已在虚拟机实测。每个结论标注依据等级:
 > - **[实测]**:我在虚拟机(herdr 0.9.3)里实际运行得到的结果
 > - **[本机验证]**:我在本机运行 `herdr <子命令>` 看到的用法输出(只读,未创建任何对象)
 > - **[文档]**:官方文档或视频转写所述,尚未实测
@@ -143,6 +164,7 @@ herdr 的位置 ID(`w1:p27`)只表示"我现在在哪",会因移动、重建、�
 业务身份(你已决定**不带项目前缀**):
 
 ```text
+project_id = soc_a      # 保留(D13),随环境变量 A2A_PROJECT_ID 注入;不进入 agent_id
 role     = dv
 ip       = uart
 agent_id = dv_uart        # 业务 ID,框架里的唯一身份。herdr 名字默认与它相同,但需启动后 agent rename 设置(见下)
@@ -152,16 +174,24 @@ agent_id = dv_uart        # 业务 ID,框架里的唯一身份。herdr 名字默
 
 ```json
 {
-  "dv_uart": {
-    "role": "dv",
-    "ip": "uart",
-    "agent_name": "dv_uart",
-    "workspace_id": "w1",
-    "tab_id": "w1:t4",
-    "pane_id": "w1:p27",
-    "status": "idle",
-    "registered_at": "...",
-    "lifecycle": "running"
+  "format_version": 1,
+  "updated_at": "2026-10-09T10:00:00Z",
+  "agents": {
+    "dv_uart": {
+      "project_id": "soc_a",
+      "ip_id": "uart",
+      "role": "dv",
+      "agent_id": "dv_uart",
+      "session": "walk1",
+      "workspace_id": "w1",
+      "tab_id": "w1:t4",
+      "pane_id": "w1:p27",
+      "agent_name": "dv_uart",
+      "status": "idle",
+      "lifecycle": "running",
+      "registered_at": "2026-10-09T09:00:00Z",
+      "updated_at": "2026-10-09T10:00:00Z"
+    }
   }
 }
 ```
@@ -169,6 +199,8 @@ agent_id = dv_uart        # 业务 ID,框架里的唯一身份。herdr 名字默
 规则:
 
 1. 通信永远按 `agent_id` 查注册表,取出当前 `pane_id`/`agent_name` 再调 herdr。agent 自己不接触 pane id。
+   `session` 必须是非空字符串(默认会话写 `"default"`):pane 编号在不同会话里会重复。
+   `status` 只是上次观察到的快照,会过期;投递前必须向 herdr 查实时状态。
 2. pane 被移动、重建或 herdr 恢复后,**只更新注册表**,`agent_id` 不变。
 3. 显示名(workspace/tab/pane 的 label)可随意改名,不影响 `agent_id`。
 4. 以后若出现多项目共用一个 herdr session,再引入项目前缀;当前不需要。
@@ -205,19 +237,26 @@ agent_id = dv_uart        # 业务 ID,框架里的唯一身份。herdr 名字默
 ### 2.2 Python 包结构(借鉴 codex)
 
 ```text
-a2a/
-├── pyproject.toml
+a2a/                              # 实际位置:herdr/a2a/
+├── pyproject.toml                # 依赖:PyYAML>=5.4
+├── config/topology.example.yaml
 ├── src/a2a/
-│   ├── herdr_client.py   # 薄封装 herdr CLI(subprocess + 解析 JSON)
-│   ├── topology.py       # 角色、IP、有向边、模板(§3)
-│   ├── identity.py       # 解析发送方身份(env + HERDR_PANE_ID + 注册表交叉核对)
-│   ├── registry.py       # 业务 ID <-> 当前 herdr 位置
-│   ├── routing.py        # 鉴权与模板渲染(§3.1)
-│   ├── broker.py         # 投递:队列、等待 READY、投递、重试、审计(§4)
-│   ├── lifecycle.py      # 创建/停止/关闭/清除/恢复(§5)
-│   └── cli.py            # 给 agent 用的 `a2a send <edge_id>`
-└── config/
-    └── topology.yaml
+│   ├── errors.py         # herdr 调用错误(按 error.code 映射)             [已实现]
+│   ├── herdr_client.py   # 薄封装 herdr CLI(subprocess + 解析 JSON)        [已实现]
+│   ├── launcher.py       # 覆盖 exec 的启动命令 + 启动脚本预检(§2.3)       [已实现]
+│   ├── paths.py          # 状态目录与默认文件路径                            [已实现]
+│   ├── _fsutil.py        # 跨进程文件锁 + 原子写入                           [已实现]
+│   ├── topology.py       # Topology(不可变快照)+ TopologyStore(热加载/动态修改) [已实现]
+│   ├── identity.py       # AgentIdentity + resolve_sender(发送方判定唯一入口)  [已实现]
+│   ├── registry.py       # 业务 ID <-> 当前 herdr 位置                       [已实现]
+│   ├── messages.py       # 消息模型、状态常量、按时间排序的 msg_id           [已实现]
+│   ├── spool.py          # 持久队列:pending/<目标>/ 与 done/,原子写入        [已实现]
+│   ├── audit.py          # 审计日志:追加写 JSON Lines,跨进程文件锁          [已实现]
+│   ├── router.py         # 鉴权 + 拓扑校验 + 模板渲染 + 入队(§3.1)           [已实现]
+│   ├── broker.py         # 投递:队列、等待 READY、投递、重试、审计(§4)       [阶段 5]
+│   ├── lifecycle.py      # 创建/停止/关闭/清除/恢复(§5)                      [待做]
+│   └── cli.py            # 给 agent 用的 `a2a send <edge_id>`                [待做]
+└── tests/                # 161 个测试(含虚拟机集成测试)
 ```
 
 底层先用 `subprocess` 调 herdr CLI;长时间等待与事件订阅留到后期再用 socket(已决定,见 D12)。
@@ -317,28 +356,28 @@ bash -c 'exec(){ builtin exec -a pi "$@"; }; source "<launcher>" "$@"' _ <参数
 > v2:边是**有向**的;消息内容由**模板**生成;二者同属一份配置,是"谁能给谁发什么"的**唯一事实源**。
 
 ```yaml
-version: 2
-workspace: soc_a
+version: 1
+project_id: soc_a            # 保留(D13);随 A2A_PROJECT_ID 注入;不进入 agent_id
+workspace_label: SoC-A
 
-roles:                       # 角色 = tab
-  spec: {tab_label: "Spec智能体", kind: pi}
-  arch: {tab_label: "架构智能体", kind: pi}
-  rtl:  {tab_label: "RTL智能体",  kind: pi}
-  dv:   {tab_label: "验证智能体", kind: pi, launcher: /home/jhx/.forenyx/fnx_dv/bin/fnx_dv}   # 本地 pi-custom / VerifAgent
-  sw:   {tab_label: "软件智能体", kind: pi, launcher: /home/jhx/.forenyx/fnx_sw/bin/fnx_sw}   # 本地 fnx-sw
+roles:                       # 角色 = tab;role ID 同时用于 A2A_ROLE 和 agent_id 前缀
+  spec: {label: "Spec智能体", kind: pi, launcher: null}
+  arch: {label: "架构智能体", kind: pi, launcher: null}
+  rtl:  {label: "RTL智能体",  kind: pi, launcher: null}
+  dv:   {label: "验证智能体", kind: pi, launcher: /home/jhx/.forenyx/fnx_dv/bin/fnx_dv}   # 本地 pi-custom / VerifAgent
+  sw:   {label: "软件智能体", kind: pi, launcher: /home/jhx/.forenyx/fnx_sw/bin/fnx_sw}   # 本地 fnx-sw
 
-ips: [uart, gpio, spi, i2c]  # 动态,可增删
+ips: [uart, gpio, spi, i2c]  # 可以为空,运行中用 TopologyStore.add_ip 动态添加
 
 edges:                       # 有向边:from -> to;反方向必须另写一条
   - id: dv_done
     from: dv
     to: sw
-    template: "{ip}已完成uvm验证,请执行驱动程序的开发"
-  - id: dv_to_rtl_fix        # 回退示例:验证 -> RTL(句式为示例,请替换为你的真实文案)
+    template: "{ip}已完成 UVM 验证，请开始驱动程序和 HAL 框架开发。"
+  - id: dv_to_rtl_fix        # 回退示例(句式为示例,请替换为你的真实文案)
     from: dv
     to: rtl
-    template: "{ip}验证发现RTL问题,请检查并修复"
-  # ... 其余边同理
+    template: "{ip}验证发现 RTL 问题，请检查并修复。"
 ```
 
 规则:
@@ -347,7 +386,8 @@ edges:                       # 有向边:from -> to;反方向必须另写一条
 2. **唯一入口**:没有写进 `edges` 的跳转,一律不存在。框架里没有任何旁路。
 3. **同 IP 是硬编码铁律**:发送方与接收方 IP 必须相同。`edges` 只决定"同一 IP 内哪些角色之间能通",不能被配置放开为跨 IP。
 4. **模板是字符串 + 占位符**。默认只有 `{ip}` 一个占位符,由框架从发送方身份填入,**发送方不能传入**。
-5. **如需更多字段**:在边上声明 `fields`,并为每个字段给出正则白名单;字段值不符合正则则拒绝发送。
+5. **第一版模板只允许 `{ip}`**,已实现的校验会拒绝其他字段名、`{ip.__class__}` 这类属性访问、`{ip!r}` / `{ip:>10}` 这类格式说明、空占位符。
+   以下"声明额外字段并用正则白名单"的设想**尚未实现**(E6 默认只有 `{ip}`),留待需要时再做:
 
 ```yaml
   - id: dv_done
@@ -358,23 +398,45 @@ edges:                       # 有向边:from -> to;反方向必须另写一条
       cov: {regex: "^[0-9]{1,3}(\\.[0-9]+)?%$"}    # 示例
 ```
 
-6. **动态配置**:拓扑与模板都在配置文件里,框架支持热加载(重新读取文件)与 API 方式增删边/模板;不需要改代码。
+6. **动态配置(已实现,D14)**:拓扑与模板都在配置文件里,用 `TopologyStore` 读写:
+   - **热加载**:`current()` 每次比较文件签名,文件被改动(人工编辑或其他进程修改)就重新加载;新内容不合法时保留上一份合法拓扑继续服务,错误记在 `last_error`,不会让 broker 崩溃。
+   - **动态修改**:`add_ip` / `remove_ip` / `add_role` / `remove_role` / `set_role_launcher` / `add_edge` / `remove_edge` / `set_template`。每次修改都在跨进程文件锁里:重新读磁盘 → 修改 → 整体校验 → 备份上一版为 `.bak` → 原子写回。多个进程同时修改不同条目不会互相覆盖;修改会让拓扑非法时整体拒绝,文件不变。
+   - **修订号**:`revision` 是文件内容的 SHA-256 前 12 位,审计日志应记录它。
+   - **局限**:程序写回会整体重写 YAML,**不保留注释**(上一版在 `.bak`)。`remove_ip` / `remove_role` 不检查是否还有对应 agent 在运行,调用方(lifecycle)应先清除 agent。
 7. **一条边一个模板**(v2 默认)。若同一对角色之间要有多种句式,给它们不同的 `id`,发送时按 `id` 选择(见 §10 的待确认项 E1)。
 
 ### 3.1 鉴权顺序(发送一条消息时,任一步失败即报错,**不执行任何 herdr 命令**)
 
+已实现于 `router.py` 的 `Router.send(edge_id, env)`。接口里**没有**目标 IP、目标名字、自由文本这些参数,
+发送方身份只能从环境变量推出:
+
 ```
-send(edge_id, [fields]):
- 1. 解析发送方身份
-      读 A2A_ROLE / A2A_IP,并用 HERDR_PANE_ID 与注册表交叉核对,二者不一致 → 拒绝(防冒充)
- 2. 发送方节点必须已在注册表中                    → 否则拒绝
- 3. edge_id 必须存在,且 edge.from == 发送方角色    → 否则拒绝 (无效跳转 / 方向错误)
- 4. 目标节点 = (edge.to, 发送方的 IP) 必须已在注册表中 → 否则拒绝 (目标不存在 / 已删除)
- 5. 用模板渲染消息;字段不合法                      → 拒绝
- 6. 写入持久队列,返回 msg_id                       (此后才进入 §4 的等待与投递)
+send(edge_id, env):
+ 1. 发送方身份 —— identity.resolve_sender(env, registry, topology, session)(唯一入口)   拒绝代码: identity
+      · 环境变量 A2A_PROJECT_ID / A2A_ROLE / A2A_IP / HERDR_PANE_ID 必须齐全,且 A2A_PROJECT_ID 与拓扑一致
+      · 用 HERDR_PANE_ID + 会话在注册表里找到该 pane 登记的 agent;找不到 → SenderNotRegisteredError
+      · 环境变量声明的 (project, ip, role) 必须与登记记录完全一致 → 否则 IdentityMismatchError(防冒充)
+      · 该 agent 必须是 running → 否则 SenderNotRunningError
+      · (role, ip) 必须仍在当前拓扑里 → 否则 NodeNotInTopologyError
+      · 会话来自 Router 构造参数,否则取环境变量 HERDR_SESSION,再没有则按 "default"
+ 2. 边必须存在                                                                       拒绝代码: unknown_edge
+ 3. 边的 from 角色 == 发送方角色(方向正确)                                           拒绝代码: wrong_direction
+ 4. 目标 = (边的 to 角色, 发送方自己的 IP) —— 同 IP 铁律由构造保证,没有参数能改变目标 IP
+    目标节点必须在当前拓扑里(纵深防御)                                                 拒绝代码: target_not_in_topology
+ 5. 目标必须已登记                                                                   拒绝代码: target_missing
+    目标登记的 project / IP 必须与发送方一致(注册表被破坏时的防御)                      拒绝代码: target_missing
+    目标必须是 running                                                               拒绝代码: target_not_running
+ 6. 渲染模板(只填入 {ip});检查非空、长度(默认 ≤ 1000 字符)、控制字符(允许 \n \t)   拒绝代码: bad_message
+ 7. 写入持久队列(状态 QUEUED),写审计日志,返回回执(msg_id、src、dst、text、拓扑修订号)
 ```
 
-所有拒绝都写审计日志:时间、发送方、edge_id、拒绝原因。
+要点:
+
+- **每次拒绝在审计日志里恰好留下一条记录**,含 `msg_id`、`edge_id`、`reject_code`、原因、拓扑修订号。身份未核实时,日志里的 `src` 为空,环境变量声称的身份记在 `claimed_*` 字段(不可信,仅供排查)。
+- 每次发送都取 `TopologyStore.current()`,所以模板、边的改动无需重启即生效;审计里记录当时的拓扑修订号。
+- **Router 不检查目标是否 `blocked`**:那要问 herdr,属于 broker 的投递阶段(`TARGET_BLOCKED`,§4.3)。
+- 被拒绝的消息不入队,查它请看审计日志;已入队的消息可用 `Router.status(msg_id)` 查询。
+- 去重(同一 `(edge_id, ip, 关联键)` 在幂等窗口内只投递一次)放在 broker(§4.7),Router 不做。
 
 ## 4. 等待与投递机制(你 Q4 让我设计的部分)
 
@@ -467,6 +529,10 @@ deliver(msg):
 
 ### 4.6 消息状态机与审计日志(借鉴 codex)
 
+> **权威定义见 `08-protocol.md`**(状态、合法迁移表、每个迁移的触发条件、崩溃恢复规则、审计事件、拒绝代码)。本节是概览,与 08 不一致时以 08 为准。
+> 当前为**协议版本 2(已定稿,2026-10-09)**。要点:`DELIVERY_UNCERTAIN` 默认不自动重发,只能由操作员裁定或经真实 herdr 验证的机制离开,且没有由时间触发的出口;只有能证明 prompt 未提交的错误才能重试;每个目标只处理队列头,不确定态和确定失败都会暂停该目标的队列,等操作员处理(08 §7)。
+> 下面的 `CREATED` / `ROUTED` 只是示意,协议里没有这两个状态:Router 鉴权通过后直接以 `QUEUED` 入队。
+
 ```text
 CREATED ──鉴权通过──▶ ROUTED ──入队──▶ QUEUED
 QUEUED ──目标 READY──▶ DISPATCHING ──herdr 接受 prompt──▶ DELIVERED
@@ -477,12 +543,13 @@ QUEUED ──目标 READY──▶ DISPATCHING ──herdr 接受 prompt──�
 | 状态 | 触发 | 是否自动重试 |
 | --- | --- | --- |
 | `REJECTED` | 鉴权失败(无效跳转、跨 IP、身份不符、字段不合法) | 否 |
-| `TARGET_BLOCKED` | 目标卡在审批/提问 | **否**(你的决定:立即返回) |
+| `TARGET_BLOCKED` | 目标卡在审批/提问 | **否**(你的决定:立即返回;Broker 不自动重试,操作员可显式裁定重试) |
 | `TARGET_MISSING` | 目标节点不存在或已删除 | 否 |
 | `WAITING_TARGET` | 目标 BUSY,正在等 | (等待中) |
-| `TIMEOUT` | 等待 READY 超时 | 可配置重试次数 |
-| `RETRYING` | herdr 调用失败、临时错误 | 是,退避 |
-| `FAILED` | 重试耗尽 | 否 |
+| `TIMEOUT` | 等待 READY 超时,或目标状态查询持续失败 | 否(终态;暂停该目标队列,等操作员"重试"或"放弃并继续") |
+| `RETRYING` | **已证明 prompt 未提交**的错误(08 §5;验证前实际只有"请求发出前的客户端失败") | 是,退避 |
+| `FAILED` | 操作员放弃,或确定不可恢复的错误;从 `DELIVERY_UNCERTAIN` 只能由操作员放弃进入 | 否 |
+| `DELIVERY_UNCERTAIN` | 调用 herdr 后结果不明(超时、`agent_prompt_stalled`、无法证明未提交的错误、Broker 崩溃窗口、观察窗口内没看到目标开始处理) | **否**:默认不自动重发;只有操作员明确裁定,或经真实 herdr 验证的机制确认后,才转 `DELIVERED` / `RETRYING`;超时只告警 |
 
 审计日志(追加写,每条记录一行 JSON):
 
@@ -722,6 +789,11 @@ herdr 文档里 pane 是真实终端,有最小尺寸。可选思路(都需实测
 | D9 | `done` | **当作可投递**(归入 READY),已实测证实必要 | §4.4 |
 | D10 | 业务 ID | **不带项目前缀**:`agent_id` = `{角色码}_{ip}` | §2.1 |
 | D11 | 接收方校验 | **先不验证消息来源**;去重只放在 broker,不在固定句式后附加标记 | §4.7 |
+| D13 | `project_id` | **保留**。拓扑必填;随 `A2A_PROJECT_ID` 注入;进入注册表和身份校验;**不进入 `agent_id`**(仍是 `{角色码}_{ip}`,与 D10 不冲突) | §2.1、§3 |
+| D14 | 动态拓扑 | **现在实现**:热加载 + 动态增删 IP / 角色 / 边 / 模板 + 跨进程文件锁 + 原子写回 + 写前备份 | §3 |
+| D17 | 消息状态迁移 | 写入协议文档 `08-protocol.md`:状态只能沿合法迁移表前进;终态之后不可再修改;新增 `DELIVERY_UNCERTAIN`;Broker 启动时先 `recover()`,再把停在 `DISPATCHING` 的消息迁到 `DELIVERY_UNCERTAIN` | `08-protocol.md`、`messages.py` |
+| D16 | 发送方的会话名 | 取自 pane 环境变量 `HERDR_SESSION`。**命名会话里已实测 herdr 会注入它**(以及 `HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`);默认会话里的取值未测,没有该变量时按 `"default"` 处理 | `router.session_from_env` |
+| D15 | 状态目录 | `A2A_STATE_DIR` > `$XDG_STATE_HOME/a2a` > `~/.local/state/a2a`;路径必须是绝对路径(agent 工作目录各不相同,相对路径会悄悄产生多份状态);拓扑文件另可用 `A2A_TOPOLOGY` 指定 | `paths.py` |
 | D12 | herdr 调用方式 | **CLI 先行**(subprocess 调 herdr CLI);**socket API 留到规模化阶段**(事件订阅、大量并发等待),压测证明需要时再做。`HerdrClient` 公开方法不绑定传输方式,日后只需重写内部 `_call` / `_call_text` | §2.2、§4.1 |
 
 ### 10.2 仍待确认
@@ -747,6 +819,10 @@ herdr 文档里 pane 是真实终端,有最小尺寸。可选思路(都需实测
 | 7 | `blocked` 状态下 `agent prompt` 的行为 | 未验证(pi 默认没有审批界面,未找到触发办法) |
 | 8 | pi 模型侧 bash 工具是否弹批准 | 未验证(只验证了用户侧 `!` 命令) |
 | 9 | 办法 C 的前提(只有一处 `exec`、不用 `$0`)对另外三个智能体是否成立 | 未验证;框架启动前预检(§2.3.5) |
+| 12 | pane 里注入的 herdr 环境变量 | **已验证(命名会话)**:`HERDR_ENV=1`、`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SESSION`(会话名)、`HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`。默认会话未测 |
+| 14 | 队列与审计的崩溃恢复(复核后修复 P1~P7) | **已验证**(Mac 与虚拟机):归档两步之间强杀 → `pending()` 不再返回已送达消息,`recover()` 清理残留;审计写到一半强杀 → 下次追加前残片被隔离,新记录完整;ID 路径穿越、未知状态、终态回退、目标在另一会话均被拒绝 |
+| 13 | Router 的反向用例、多进程并发发送 | **已验证**(Mac 与虚拟机):见 `tests/test_router.py`;6 个进程并发发送 30 条,全部入队、ID 唯一、审计无交织 |
+| 11 | 拓扑与注册表的跨进程并发、写入中途崩溃 | **已验证**(Mac 与虚拟机):6 个进程并发修改拓扑、8 个进程并发登记注册表均不丢更新;在 `os.replace` 之前强杀进程,原文件完好、可继续写入 |
 | 10 | `agent rename` 与按名字通信 | **已验证**:改名成功;按名字 `get` / `prompt` / `wait` / `read` 都成功;重名与非法名被拒;退出后名字失效、重启后不自动恢复(§2.1.1) |
 
 > 另:`herdr agent list` 本身输出 JSON,本机版本**不接受** `--json` 参数(用法输出为 `usage: herdr agent list`)。所有示例都不要写 `--json`。

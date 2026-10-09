@@ -7,7 +7,7 @@ name = "a2a-herdr-codex"
 version = "0.1.0"
 description = "Herdr CLI Python client for the A2A project"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = ["PyYAML>=5.4"]
 
 [project.scripts]
 a2a-herdr = "a2a_codex.cli:main"
