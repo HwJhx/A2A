@@ -21,7 +21,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent / "src"))
 
-from a2a.herdr_client import HerdrClient, HerdrError, session_delete, session_stop  # noqa: E402
+from a2a.herdr_client import HerdrClient, HerdrError, session_delete, session_list, session_stop  # noqa: E402
 
 FAKE = HERE.parent / "fake_agent.py"
 
@@ -62,10 +62,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tabs", type=int, default=5)
     parser.add_argument("--panes", type=int, default=30)
-    parser.add_argument("--session", default="a2a_s8probe")
+    parser.add_argument("--session", default=f"a2a_s8probe_{os.getpid()}")
     args = parser.parse_args()
 
+    # 只使用、只清理本次新建的会话:同名会话已存在就直接退出,不碰它
     tmux = args.session + "_tty"
+    if any(row.get("name") == args.session for row in session_list()):
+        print(f"herdr 会话 {args.session} 已存在,不使用、也不清理它")
+        return 2
+    if subprocess.run(["tmux", "has-session", "-t", tmux], capture_output=True).returncode == 0:
+        print(f"tmux 会话 {tmux} 已存在,不使用、也不清理它")
+        return 2
     work = Path(tempfile.mkdtemp(prefix="a2a-s8probe-"))
     report = {"tabs": args.tabs, "panes_per_tab": args.panes, "mem_available_mb_before": mem_available_mb(),
               "steps": [], "failures": []}
@@ -73,16 +80,24 @@ def main() -> int:
     subprocess.run(["tmux", "new-session", "-d", "-x", "200", "-y", "50", "-s", tmux,
                     f"cd {Path.home()} && herdr session attach {args.session}"], check=True)
     client = HerdrClient(args.session)
+    owns_session = False
+    status = 0
     try:
         deadline = time.monotonic() + 30
         while not client.is_server_running():
             if time.monotonic() > deadline:
                 raise RuntimeError("会话没有启动")
             time.sleep(0.5)
+        if not any(row.get("name") == args.session for row in session_list()):
+            raise RuntimeError(f"会话 {args.session} 没有出现在 herdr session list 里")
+        owns_session = True
         new_servers = server_pids() - servers_before
-        spid = new_servers.pop() if len(new_servers) == 1 else 0
+        if len(new_servers) != 1:
+            # 找不准本会话的服务进程就无法测它的内存;不输出可能误导的数值
+            raise RuntimeError(f"会话启动后新增的 herdr server 进程有 {len(new_servers)} 个(预期 1 个)")
+        spid = new_servers.pop()
         report["server_pid"] = spid
-        report["server_pss_mb_empty"] = pss_mb(spid) if spid else None
+        report["server_pss_mb_empty"] = pss_mb(spid)
 
         launch = f"bash -c 'exec -a pi {sys.executable} {FAKE} {work}/%s.log work'"
         ws, dt = timed(client.workspace_create, label="s8probe", cwd=str(work))
@@ -101,9 +116,9 @@ def main() -> int:
                 try:
                     created, dt = timed(client.pane_split, last, direction="down", cwd=str(work))
                 except HerdrError as exc:
+                    # 方案 §3.0:布局放不下就停下来请用户决定,不在不完整的布局上继续
                     report["failures"].append({"tab": t, "pane_index": p, "error": f"{type(exc).__name__}: {exc}"})
-                    print(f"tab{t} 第 {p + 1} 个 pane 拆分失败:{exc}")
-                    break
+                    raise RuntimeError(f"tab{t} 第 {p + 1} 个 pane 拆分失败:{exc}") from exc
                 report["steps"].append({"op": "pane_split", "tab": t, "pane": p, "s": round(dt, 3)})
                 last = created.pane_id
                 tab_panes.append(last)
@@ -130,18 +145,49 @@ def main() -> int:
         for name, fn in (("agent_list", client.agent_list), ("pane_list", client.pane_list)):
             samples = [timed(fn)[1] for _ in range(5)]
             report[f"{name}_s"] = {"min": round(min(samples), 3), "max": round(max(samples), 3)}
-        report["server_pss_mb_full"] = pss_mb(spid) if spid else None
+        report["server_pss_mb_full"] = pss_mb(spid)
         report["mem_available_mb_full"] = mem_available_mb()
+        if detected < len(panes):
+            raise RuntimeError(f"只识别到 {detected}/{len(panes)} 个 agent")
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        print("探测失败:", report["error"])
+        status = 1
     finally:
-        for fn in (session_stop, session_delete):
+        cleanup_failures = []
+
+        def attempt(what, fn):
+            """一步清理或检查;任何异常都记为失败并继续,保证报告能写出。"""
             try:
-                fn(args.session)
+                problem = fn()
+                if problem:
+                    cleanup_failures.append(f"{what}: {problem}")
             except Exception as exc:
-                print(f"清理 {fn.__name__} 失败:{exc}")
-        subprocess.run(["tmux", "kill-session", "-t", tmux], capture_output=True)
+                cleanup_failures.append(f"{what}: {type(exc).__name__}: {exc}")
+
+        def tmux_gone():
+            subprocess.run(["tmux", "kill-session", "-t", tmux], capture_output=True, timeout=30)
+            alive = subprocess.run(["tmux", "has-session", "-t", tmux], capture_output=True, timeout=30).returncode == 0
+            return "仍在" if alive else None
+
+        left = []
+        if owns_session:
+            attempt("session_stop", lambda: session_stop(args.session) and None)
+            attempt("session_delete", lambda: session_delete(args.session) and None)
+        attempt(f"tmux 会话 {tmux}", tmux_gone)  # 本次新建(开头已确认不存在)
         time.sleep(2)
-        left = subprocess.run(["pgrep", "-f", str(FAKE)], capture_output=True, text=True).stdout.split()
+        attempt("检查残留进程", lambda: left.extend(
+            subprocess.run(["pgrep", "-f", f"{FAKE} {work}"], capture_output=True, text=True, timeout=30).stdout.split()))
+        if left:
+            cleanup_failures.append(f"残留假 agent 进程: {left}")
+        if owns_session:
+            attempt(f"会话 {args.session}",
+                    lambda: "仍在" if any(row.get("name") == args.session for row in session_list()) else None)
         report["leftover_fake_pids"] = left
+        report["cleanup_failures"] = cleanup_failures
+        if cleanup_failures:
+            print("清理失败:", cleanup_failures)
+            status = 1
         report["mem_available_mb_after"] = mem_available_mb()
         print(json.dumps({k: v for k, v in report.items() if k != "steps"}, ensure_ascii=False, indent=2))
         splits = [s["s"] for s in report["steps"] if s["op"] == "pane_split"]
@@ -149,7 +195,7 @@ def main() -> int:
             print(f"pane_split 次数 {len(splits)},耗时 最小 {min(splits)}s 最大 {max(splits)}s")
         (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
         print("完整报告:", work / "report.json")
-    return 0
+    return status
 
 
 if __name__ == "__main__":

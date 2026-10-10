@@ -35,7 +35,7 @@ SRC = HERE.parent.parent / "src"
 sys.path.insert(0, str(SRC))
 
 from a2a.audit import AuditLog  # noqa: E402
-from a2a.herdr_client import HerdrClient, session_delete, session_stop  # noqa: E402
+from a2a.herdr_client import HerdrClient, session_delete, session_list, session_stop  # noqa: E402
 from a2a.messages import DELIVERED, QUEUED  # noqa: E402
 from a2a.registry import Registry  # noqa: E402
 from a2a.spool import MessageNotFoundError, Spool  # noqa: E402
@@ -126,7 +126,8 @@ class Sampler:
     def close(self):
         self.stop.set()
         for t in self.threads:
-            t.join(timeout=5)
+            if t.ident is not None:  # 会话建立前就中止时,采样线程还没启动
+                t.join(timeout=5)
 
     def _resources(self):
         while not self.stop.wait(0.5):
@@ -175,8 +176,9 @@ class Sampler:
         for c in ended:
             key = " ".join(c["cmd"].split()[2:4])  # 去掉 --session <名>
             by_cmd.setdefault(key, []).append(c["end"] - c["start"])
-        return {"calls": len(calls), "concurrency_peak_sampled": peak,
-                "by_command_s": {k: summary(v) for k, v in sorted(by_cmd.items())}}
+        # 起止都由 20 毫秒采样得到:调用次数精确,耗时与并发是估计值;短于采样间隔的调用耗时会记成 0
+        return {"calls": len(calls), "concurrency_peak_sampled": peak, "sample_resolution_s": 0.02,
+                "by_command_sampled_s": {k: summary(v) for k, v in sorted(by_cmd.items())}}
 
     def resource_stats(self, step: str) -> dict:
         rows = [r for r in self.rows if r["step"] == step]
@@ -210,7 +212,9 @@ class Run:
     def __init__(self, args):
         self.n = args.ips
         self.args = args
-        self.session = f"a2a_s8_n{self.n}"
+        self.session = f"a2a_s8_n{self.n}_{os.getpid()}"  # 唯一会话名;清理只碰本次创建、确认归属的资源
+        self.owns_tmux = False
+        self.owns_session = False
         self.out = Path(args.out or Path.home() / "a2a_stage8_run" / f"n{self.n}").resolve()
         if self.out.exists():
             raise SystemExit(f"{self.out} 已存在,先人工确认")
@@ -256,11 +260,36 @@ class Run:
             raise Abort(self.abort_reason)
 
     def a2a(self, *argv, timeout=180):
-        proc = subprocess.run([sys.executable, "-m", "a2a.cli", *argv], env=self.env, capture_output=True,
-                              text=True, timeout=timeout)
+        """运行 a2a 命令行;每 0.2 秒检查一次停止条件,触发时结束整个进程组后中止(不必等命令自己结束)。
+
+        命令在独立的进程组里运行,它调用 herdr 起的子进程也在组里,一起结束。被中断的 spawn 可能已经
+        建了 pane 但还没登记;这类 pane 随清理时删除本次会话一起关闭。"""
+        proc = subprocess.Popen([sys.executable, "-m", "a2a.cli", *argv], env=self.env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+        def kill_group():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    stdout, stderr = proc.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.abort_reason or time.monotonic() > deadline:
+                        kill_group()
+                        self.check()
+                        raise Abort(f"a2a {' '.join(argv)} 超过 {timeout} 秒没有结束")
+        finally:
+            if proc.poll() is None:
+                kill_group()
         if proc.returncode != 0:
-            raise Abort(f"a2a {' '.join(argv)} 失败:{proc.stderr.strip()[-300:]}")
-        return proc.stdout
+            raise Abort(f"a2a {' '.join(argv)} 失败:{stderr.strip()[-300:]}")
+        return stdout
 
     def events(self, agent_id: str) -> List[dict]:
         path = self.out / "logs" / f"{agent_id}.log.events"
@@ -278,6 +307,16 @@ class Run:
                 return value
             time.sleep(0.05)
         raise Abort(f"{timeout} 秒内没有等到:{what}")
+
+    def sleep_checked(self, seconds: float):
+        """分段等待,每 0.5 秒检查一次停止条件。"""
+        deadline = time.monotonic() + seconds
+        while True:
+            self.check()
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(0.5, left))
 
     def start_broker(self):
         before = sum(1 for e in self.audit.read() if e.get("state") == "BROKER_STARTED")
@@ -301,6 +340,7 @@ class Run:
 
     def trigger(self, ip: str, count: int) -> int:
         """给 dv_<ip> 一次输入,返回这是它的第几次输入(假 agent 按自己收到的行数计数)。"""
+        self.check()
         self.inputs[ip] = self.inputs.get(ip, 0) + 1
         self.client.agent_prompt(f"dv_{ip}", str(count))
         return self.inputs[ip]
@@ -362,12 +402,23 @@ class Run:
 
     # ---- 步骤 ---------------------------------------------------------------
     def setup_session(self):
+        if any(row.get("name") == self.session for row in session_list()):
+            raise Abort(f"herdr 会话 {self.session} 已存在,不使用、也不清理它")
+        if subprocess.run(["tmux", "has-session", "-t", self.session + "_tty"], capture_output=True).returncode == 0:
+            raise Abort(f"tmux 会话 {self.session}_tty 已存在,不使用、也不清理它")
         before = herdr_servers()
         subprocess.run(["tmux", "new-session", "-d", "-x", "200", "-y", "50", "-s", self.session + "_tty",
                         f"cd {Path.home()} && herdr session attach {self.session}"], check=True)
+        self.owns_tmux = True
         self.wait(self.client.is_server_running, "会话启动", 30)
+        if not any(row.get("name") == self.session for row in session_list()):
+            raise Abort(f"会话 {self.session} 没有出现在 herdr session list 里")
+        self.owns_session = True
         new = herdr_servers() - before
-        self.server_pid = new.pop() if len(new) == 1 else 0
+        if len(new) != 1:
+            # 找不准本会话的服务进程就无法测它的资源;不输出可能误导的 0
+            raise Abort(f"会话启动后新增的 herdr server 进程有 {len(new)} 个(预期 1 个),无法确定被测进程")
+        self.server_pid = new.pop()
         self.sampler.start()
 
     def step_spawn(self):
@@ -376,6 +427,7 @@ class Run:
         for role in ROLES:
             for ip in self.ips:
                 started = time.monotonic()
+                self.check()
                 self.a2a("agent", "spawn", role, ip, "--cwd", str(self.out), "--session", self.session)
                 times.append(time.monotonic() - started)
                 self.check()
@@ -387,9 +439,9 @@ class Run:
 
     def step_idle(self):
         self.start_broker()
-        time.sleep(5)
+        self.sleep_checked(5)
         self.step = "idle"
-        time.sleep(self.args.idle_s)
+        self.sleep_checked(self.args.idle_s)
         self.report["idle"] = {"seconds": self.args.idle_s, "herdr": self.sampler.herdr_stats("idle"),
                                "resources": self.sampler.resource_stats("idle")}
 
@@ -480,27 +532,61 @@ class Run:
     delivered_per_ip: Dict[str, int] = {}
     inputs: Dict[str, int] = {}
 
-    def wait_dv_idle(self, ips: List[str]):
+    def wait_dv_idle(self, ips: List[str], timeout: float = 60):
         for ip in ips:
-            self.client.agent_wait(f"dv_{ip}", until=("idle", "done"), timeout_ms=60000)
+            self.wait(lambda: self.client.agent_get(f"dv_{ip}").get("agent_status") in ("idle", "done"),
+                      f"dv_{ip} 回到 idle", timeout)
 
     # ---- 收尾 ---------------------------------------------------------------
-    def cleanup(self):
+    def cleanup(self) -> List[str]:
+        """只清理本次创建、确认归属的资源;返回清理失败项(非空即本次运行失败)。"""
         self.step = "cleanup"
-        self.stop_broker()
-        for record in self.registry.list():
-            subprocess.run([sys.executable, "-m", "a2a.cli", "agent", "purge", record.role, record.ip_id,
-                            "--session", self.session], env=self.env, capture_output=True, timeout=120)
-        for fn in (session_stop, session_delete):
+        failures: List[str] = []
+
+        def attempt(what: str, fn) -> None:
+            """执行一步清理;任何异常(含超时)都记为失败并继续后面的步骤。"""
             try:
-                fn(self.session)
+                problem = fn()
+                if problem:
+                    failures.append(f"{what}:{problem}")
             except Exception as exc:
-                print(f"清理 {fn.__name__} 失败:{exc}")
-        subprocess.run(["tmux", "kill-session", "-t", self.session + "_tty"], capture_output=True)
-        self.sampler.close()
+                failures.append(f"{what}:{type(exc).__name__}: {exc}")
+
+        def purge(record):
+            proc = subprocess.run([sys.executable, "-m", "a2a.cli", "agent", "purge", record.role, record.ip_id,
+                                   "--session", self.session], env=self.env, capture_output=True, text=True,
+                                  timeout=120)
+            return proc.stderr.strip()[-200:] if proc.returncode != 0 else None
+
+        def tmux_gone():
+            subprocess.run(["tmux", "kill-session", "-t", self.session + "_tty"], capture_output=True, timeout=30)
+            alive = subprocess.run(["tmux", "has-session", "-t", self.session + "_tty"],
+                                   capture_output=True, timeout=30).returncode == 0
+            return "仍在" if alive else None
+
+        attempt("停止 broker", self.stop_broker)
+        if self.owns_session:
+            records = []
+            attempt("读注册表", lambda: records.extend(self.registry.list()))
+            for record in records:
+                attempt(f"purge {record.agent_id}", lambda r=record: purge(r))
+            attempt("session_stop", lambda: session_stop(self.session) and None)
+            attempt("session_delete", lambda: session_delete(self.session) and None)
+        if self.owns_tmux:
+            attempt(f"tmux 会话 {self.session}_tty", tmux_gone)
+        attempt("停止采样", self.sampler.close)
         time.sleep(2)
-        self.report["leftover_fake_pids"] = pids_matching(f"{FAKE} {self.out}")
+        leftover: List[int] = []
+        attempt("检查残留进程", lambda: leftover.extend(pids_matching(f"{FAKE} {self.out}")))
+        if leftover:
+            failures.append(f"残留假 agent 进程:{leftover}")
+        if self.owns_session:
+            attempt(f"会话 {self.session}",
+                    lambda: "仍在" if any(row.get("name") == self.session for row in session_list()) else None)
+        self.report["leftover_fake_pids"] = leftover
+        self.report["cleanup_failures"] = failures
         self.report["min_mem_available_ratio"] = round(self.sampler.min_avail_ratio, 3)
+        return failures
 
 
 def main() -> int:
@@ -515,12 +601,15 @@ def main() -> int:
     parser.add_argument("--burst", type=int, default=20)
     parser.add_argument("--backlog", default="3,20", help="每个 IP 的积压条数,逗号分隔")
     parser.add_argument("--out")
+    parser.add_argument("--abort-after", type=float, help="测试清理路径:运行 N 秒后人为触发停止条件")
     args = parser.parse_args()
     args.backlog = [int(k) for k in args.backlog.split(",") if k]
     run = Run(args)
     run.delivered_per_ip = {}
     run.inputs = {}
     status = 0
+    if args.abort_after:
+        threading.Timer(args.abort_after, lambda: setattr(run, "abort_reason", "人为触发(--abort-after)")).start()
     try:
         run.setup_session()
         for step in args.steps.split(","):
@@ -531,7 +620,10 @@ def main() -> int:
         print(f"中止于 {run.step}:{exc}", flush=True)
         status = 1
     finally:
-        run.cleanup()
+        failures = run.cleanup()
+        if failures:
+            print("清理失败:", failures, flush=True)
+            status = 1
         (run.out / "report.json").write_text(json.dumps(run.report, ensure_ascii=False, indent=2))
         with (run.out / "samples.csv").open("w") as f:
             if run.sampler.rows:
