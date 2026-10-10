@@ -364,7 +364,8 @@ pi 侧接入(不调用模型):
 - [x] 查清 spawn 每个约 4 秒的原因 ✅ herdr 识别 pi 后约 3 秒才把 `unknown` 判为 `idle`,a2a 必须等到可投递才登记;逐个启动时 150 个约 10 分钟
 - [x] 真实 fnx 启动与内存实测 ✅ spawn 每个约 4 秒(与假 agent 相同);60 个实测内存线性增长,每个约 98 MB(首批约 124 MB,共享代码只加载一次);150 个空闲约 14.9 GB,放不下;留 20% 余量约能放 120 个
 - [ ] 并行批量 spawn:用户很少整体重启,暂不做
-- [ ] 真实 fnx 规模测试(方案 `15-stage8-real-fnx-scale-plan.md`,脚本 `tests/stress/real_fnx_scale.py`,Codex 审核多轮):A 档(5 个 IP、25 次模型调用)按框架判定停止——6 次投递 DELIVERY_UNCERTAIN。会话记录证明消息都已送达、5 条链路模型层面都走完、无重复无串 IP;根因是同一 tab 里对半拆分的 pane 太小(2–4 行),herdr 只靠屏幕识别 Working,看不到。修复后待重跑 A 档,再由用户决定 B 档
+- [x] VM 安装 node 22.20.0(用户同意,2026-10-11)✅ 装在 `~/.local/lib`,链接 `~/.local/bin/node`,SHA256 已校验;插件单元测试在 VM 上也能跑:VM 全套 462 个通过、**0 跳过**(含真实 herdr 集成 36 个)
+- [ ] 真实 fnx 规模测试(方案 `15-stage8-real-fnx-scale-plan.md`,脚本 `tests/stress/real_fnx_scale.py`,Codex 审核多轮):A 档(5 个 IP、25 次模型调用)按框架判定停止——6 次投递 DELIVERY_UNCERTAIN。会话记录证明消息都已送达、5 条链路模型层面都走完、无重复无串 IP;根因是同一 tab 里对半拆分的 pane 太小(2–4 行),herdr 只靠屏幕识别 Working,看不到。修复后重跑 A 档 ✅ 通过:10 次投递全部确认送达(无不确定)、5/5 链路走完、整条链路约 6.2 秒、单次模型调用中位 1.3 秒;B 档待用户决定
 - [x] 修复:插件主动向 herdr 上报 working / idle ✅ 方案 `16-stage8-report-state-plan.md`(Codex 审核六轮)。agent_start 上报 working(等完成,约 2 秒上限);agent_end 只在能确定 pi 已结束时上报 idle(白名单 aborted,或 stop 且按 pi 相同公式算的上下文 token 低于 (窗口 − 实际预留) × 90%),其他保持 working;压缩开始报 working。spawn 注入 A2A_HERDR_BIN。部署约束:fnx 只加载本插件。已知局限与恢复方式(重启 agent)写进方案 §7 与 README。真实 fnx 探测:上报覆盖屏幕判断、进程退出后不残留、重启后序号可重来。测试:插件单元 25 个(Mac),变异检查覆盖各条规则;Mac 单元 462 通过(跳过 37);VM 全套 462 通过(跳过 25,插件单元),真实 herdr 集成 36 个全部通过
 - [x] 修复 broker:全局停止投递(dispatch.halted)挡不住已在途的 worker ✅ Codex 审核真实 fnx 规模测试脚本时发现:投递引擎的停止检查只看停机信号,已在等目标空闲的 worker 在写了 dispatch.halted 后仍会发 prompt。改为停机或全局停止都让引擎在等待循环每一轮、写 DISPATCHING 前、重试退避后停下,消息保持原状态。先补测试确认失败(halt 后目标空闲仍发出 prompt),修后通过。局限:检查与写 DISPATCHING 之间仍有极短窗口。测试:Mac 单元 451 通过(跳过 37);VM 全套 451 通过(跳过 14,插件单元),真实 herdr 集成 36 个全部通过
 - [x] 真实规模的内存方案 ✅ 用户决定(2026-10-10):同时活跃的 IP 不超过 20 个左右(约 100 个 agent,本 VM 空闲时放得下);超过时给服务器加内存。不做"只运行活跃 IP"或多 VM

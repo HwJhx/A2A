@@ -62,6 +62,8 @@ PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 A2A_INTEGRATION=1 A2A_INTEGRATION_FNX=1
   python3 -m unittest discover -s tests -k TestRealFnxLaunch -v
 ```
 
+插件单元测试(`tests/test_pi_extension.py`)需要能直接加载 `.ts` 的 node(22.18 及以上),没有时自动跳过。虚拟机已在 `~/.local/lib/node-v22.20.0-linux-arm64` 安装 node 22.20.0(nodejs.org 官方包,SHA256 已校验),链接到 `~/.local/bin/node`(登录与非登录 shell 的 PATH 里都有)。装好后虚拟机上全套测试(含真实 herdr 集成)零跳过。
+
 > 注意:虚拟机通过 OrbStack 共享 Mac 的目录。刚在 Mac 上改完文件,立刻在虚拟机里运行,偶尔会读到同步中的残缺文件(出现莫名的语法错误),等一两秒再运行即可。
 
 ## 用法示例
