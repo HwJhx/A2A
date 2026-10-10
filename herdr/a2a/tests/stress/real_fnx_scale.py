@@ -128,6 +128,7 @@ def assistant_calls(records: List[dict]) -> List[dict]:
         end = iso_to_epoch(r["timestamp"]) if r.get("timestamp") else None
         usage = m.get("usage") or {}
         calls.append({"provider": m.get("provider"), "model": m.get("model"), "stop": m.get("stopReason"),
+                      "error": (m.get("errorMessage") or "")[:200] if m.get("stopReason") == "error" else "",
                       "tools": tools, "text": text, "start": start, "end": end,
                       "latency_s": (end - start) if start and end else None,
                       "input": usage.get("input"), "output": usage.get("output")})
@@ -171,6 +172,10 @@ class Run:
         self.roots: Dict[str, int] = {}            # agent_id -> fnx 进程 pid
         self.cwds: Dict[str, Path] = {}
         self.call_cap = CALLS_PER_IP * self.n * 2
+        # 默认:所有调用(含出错)合计 ≤ call_cap、任何出错都计入"连续报错"。验证重试时可放宽(见 main 的参数)
+        self.ignore_429 = args.ignore_429
+        self.success_cap = args.success_cap
+        self.request_cap = args.request_cap or self.call_cap
         wrapper = self.out / "herdr_wrapper.sh"    # 透明:记一行后 exec 真正的 herdr
         wrapper.write_text("#!/bin/bash\n"
                            f'printf "%s %s\\n" "$$" "$*" >> {self.out}/herdr_calls.log\n'
@@ -369,11 +374,15 @@ class Run:
                 raise Stop("model", f"IP 入队超过 {MAX_MSGS_PER_IP} 条:{over}")
             calls = self.transcripts()
             total = sum(len(v) for v in calls.values())
-            if total > self.call_cap:
-                raise Stop("model", f"模型调用 {total} 次,超过上限 {self.call_cap}")
+            if total > self.request_cap:
+                raise Stop("model", f"模型请求(含出错){total} 次,超过上限 {self.request_cap}")
+            ok = sum(1 for v in calls.values() for c in v if c["stop"] in ("toolUse", "stop"))
+            if self.success_cap and ok > self.success_cap:
+                raise Stop("model", f"成功的模型调用 {ok} 次,超过上限 {self.success_cap}")
             now_wall = time.time()
             errors = [c for v in calls.values() for c in v if c["stop"] not in ("toolUse", "stop")
-                      and c["end"] and now_wall - c["end"] < 60]
+                      and c["end"] and now_wall - c["end"] < 60
+                      and not (self.ignore_429 and "429" in c["error"])]
             if len(errors) > API_ERRORS_PER_MIN:
                 raise Stop("model", f"最近 1 分钟模型接口出错 {len(errors)} 次:{[e['stop'] for e in errors[:5]]}")
             pending = {m.dst for m in self.spool.pending()}
@@ -391,8 +400,8 @@ class Run:
                     settled[ip] = time.monotonic()
                 elif time.monotonic() - self.kickoff_mono > CHAIN_TIMEOUT_S:
                     raise Stop("model", f"{ip} 的链路超过 {CHAIN_TIMEOUT_S} 秒没有结束")
-            print(f"[{time.strftime('%H:%M:%S')}] 已结束 {len(settled)}/{self.n},入队 {len(queued)},模型调用 {total}",
-                  flush=True)
+            print(f"[{time.strftime('%H:%M:%S')}] 已结束 {len(settled)}/{self.n},入队 {len(queued)},"
+                  f"模型请求 {total}(成功 {ok})", flush=True)
 
     # ---- 结果 -----------------------------------------------------------
     def final_checks(self) -> dict:
@@ -499,7 +508,15 @@ class Run:
         for _, d in intervals:
             cur += d
             peak = max(peak, cur)
-        return {"calls": len(calls), "cap": self.call_cap,
+        errs: Dict[str, int] = {}
+        for c in calls:
+            if c["stop"] == "error":
+                errs[c["error"][:60]] = errs.get(c["error"][:60], 0) + 1
+        ok = [c for c in calls if c["stop"] in ("toolUse", "stop")]
+        ok_lat = [c["latency_s"] for c in ok if c["latency_s"] is not None]
+        return {"calls": len(calls), "successful": len(ok), "request_cap": self.request_cap,
+                "success_cap": self.success_cap, "errors_by_message": errs,
+                "successful_latency_s": stress.summary(ok_lat),
                 "providers": sorted({f"{c['provider']}/{c['model']}" for c in calls}),
                 "stop_reasons": {s: sum(1 for c in calls if c["stop"] == s) for s in {c["stop"] for c in calls}},
                 "latency_s": stress.summary(lat), "missing_timestamps": len(calls) - len(lat),
@@ -629,6 +646,10 @@ def main() -> int:
     parser.add_argument("--ips", type=int, required=True)
     parser.add_argument("--no-kickoff", action="store_true", help="不发开头提示、不调用模型,只验证准备与清理")
     parser.add_argument("--out")
+    parser.add_argument("--ignore-429", action="store_true",
+                        help="验证重试用:HTTP 429 不计入'最近 1 分钟出错次数'的停止条件(其他错误照常计入)")
+    parser.add_argument("--success-cap", type=int, help="成功的模型调用上限(默认不单独限制)")
+    parser.add_argument("--request-cap", type=int, help="全部模型请求(含出错)上限(默认 5 × N × 2)")
     parser.add_argument("--simulate-stop", action="store_true",
                         help="测试保留现场的路径:spawn 并启动 broker 后模拟一次框架失败(不调用模型)")
     args = parser.parse_args()
