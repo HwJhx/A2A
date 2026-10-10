@@ -63,6 +63,21 @@ def _crash_registry_before_replace(path: str) -> None:
                             pane_id="w1:p99")
 
 
+def _crash_topology_before_replace(path: str) -> None:
+    original_replace = topology_module.os.replace
+    replacements = 0
+
+    def exit_before_topology_replace(source, destination):
+        nonlocal replacements
+        replacements += 1
+        if replacements == 2:  # 第一次提交 .bak，第二次才提交 topology.yaml
+            os._exit(74)
+        return original_replace(source, destination)
+
+    topology_module.os.replace = exit_before_topology_replace
+    TopologyStore(path).add_ip("crash_ip")
+
+
 def yaml_dump(data) -> str:
     return yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
 
@@ -193,6 +208,25 @@ class TopologyTests(unittest.TestCase):
                 self.assertEqual(process.exitcode, 0)
             topology = TopologyStore(path).current
             self.assertTrue({f"ip{index}" for index in range(6)}.issubset(topology.ips))
+
+    def test_topology_process_crash_before_replace_preserves_previous_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "topology.yaml"
+            original = yaml_dump(CONFIG).encode("utf-8")
+            path.write_bytes(original)
+
+            context = multiprocessing.get_context("fork")
+            process = context.Process(target=_crash_topology_before_replace, args=(str(path),))
+            process.start()
+            process.join(30)
+
+            self.assertFalse(process.is_alive(), "拓扑故障注入进程超时")
+            self.assertEqual(process.exitcode, 74)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(TopologyStore(path).current.ips, tuple(CONFIG["ips"]))
+            self.assertEqual(path.with_name(path.name + ".bak").read_bytes(), original)
+            # os._exit 绕过临时文件 finally；确认遗留的完整临时文件不会被当成正式拓扑读取。
+            self.assertTrue(list(path.parent.glob(path.name + ".*.tmp")))
 
     def test_content_revision_does_not_change_on_touch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

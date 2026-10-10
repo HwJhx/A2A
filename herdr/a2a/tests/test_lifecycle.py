@@ -155,6 +155,7 @@ class Spawn(Base):
         self.assertEqual(env["A2A_TOPOLOGY"], str(self.dir / "topology.yaml"))
         self.assertTrue(Path(env["A2A_PYTHON"]).exists())
         self.assertTrue((Path(env["A2A_SRC"]) / "a2a" / "cli.py").exists())
+        self.assertTrue(env["A2A_HERDR_BIN"])  # 插件向 herdr 上报状态用的程序
         self.assertEqual((uart.lifecycle, uart.agent_name), ("running", "dv_uart"))
         self.assertEqual(len(self.events("AGENT_SPAWNED")), 2)
 

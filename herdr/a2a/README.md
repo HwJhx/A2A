@@ -171,12 +171,23 @@ else:
 - 审计日志写到一半崩溃时,残片在下次追加前被隔离到 `audit.jsonl.corrupt`,并补记一条 `AUDIT_REPAIRED`;`read()` 容忍中间坏行,且不修改文件。
 - 新增状态 `DELIVERY_UNCERTAIN`:prompt 可能已送达(`agent_prompt_stalled` 或客户端超时),**核实前不得重发**。
 
+## pi 插件(`pi-extension/a2a.ts`)
+
+在 a2a 管理的 fnx pane 里生效(由 `a2a agent spawn` 注入的 `A2A_*` 环境变量判断),普通使用 fnx 时什么都不做。测试或运行时临时复制到 `~/.forenyx/fnx_<x>/agent/extensions/`,用完删除。
+
+- `a2a_send(edge_id)`:调用 `a2a send`,鉴权、模板、目标都由 Router 决定。结果分三类:成功、明确拒绝(未入队)、结果未知(可能已入队,提示不要重试)。
+- 拦截 bash 里直接调用 herdr 写入类命令(软限制)。
+- 状态上报(阶段 8):pi 开始处理时上报 working;只在能确定 pi 已结束时上报 idle(`aborted`,或 `stop` 且上下文 token 低于压缩阈值的 90%;阈值按实际的 `compaction.reserveTokens` 设置计算),其他情况保持 working。设计与依据见 `herdr/claude/16-stage8-report-state-plan.md`。
+- **部署约束**:a2a 管理的 fnx 只加载本插件,不加载其他会在 `agent_end` 里排消息的扩展。
+- **卡在 working 时的恢复**:状态上报失败、模型出错后不再重试、或上下文接近压缩阈值时,目标会一直显示 working,broker 等待超时后暂停该队列并告警。恢复:重启这个 agent(`a2a agent stop <role> <ip>` 再 `a2a agent restore <role> <ip>`),再用 `a2a resolve` 处理被暂停的消息。不要手工 `report-agent` 补报(序号会与插件的计数脱节)。
+
 ## 实测得到的、写代码时必须记住的行为(herdr 0.9.3)
 
 | 行为 | 对代码的影响 |
 | --- | --- |
 | `fnx_*` 的进程名是 `forenyx-cli`,herdr 不认 | 不能用 `agent start`;用 `build_launch_command` 覆盖 `exec`,让 `argv[0]` 变成 `pi` |
-| `report-agent` 上报后 `agent list` 能显示,但 `agent prompt` 报 `agent_not_ready` | 不用上报 |
+| 进程名不是 `pi` 时(早期直接运行 `forenyx-cli`),`report-agent` 上报后 `agent prompt` 报 `agent_not_ready` | 先用覆盖 `exec` 让进程名是 `pi`;此后上报可用(见下一行) |
+| herdr 判断 pi 是否 working 只看屏幕(规则文件 `pi.toml`:出现 `Working...`);pane 太小(只剩 2–4 行)时看不到,投递会因 `agent_prompt_stalled` 判为不确定 | a2a 插件主动 `report-agent` 上报 working / idle;进程名为 `pi` 时上报的状态覆盖屏幕判断,进程退出后不残留,同 pane 重启后序号可从 1 重来(阶段 8 实测) |
 | `done` 不会自己变回 `idle`;`agent wait --until idle` 在 `done` 时会超时 | 等"可投递"一律用 `READY_STATUSES`(`idle` + `done`) |
 | 刚被识别的一瞬间状态可能是 `unknown` | "识别到了"不等于"可以投递",还要再 `agent_wait` 一次 |
 | agent 退出后名字失效,重启后不会恢复 | 每次启动成功后都要重新 `agent_rename` |

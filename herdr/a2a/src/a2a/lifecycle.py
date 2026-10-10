@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import shutil
 import signal
 import sys
 import time
@@ -188,8 +189,14 @@ class Lifecycle:
         """
         env = identity_env(identity.project_id, identity.role, identity.ip_id)
         env.update({"A2A_STATE_DIR": str(self.state_dir), "A2A_TOPOLOGY": str(self.topology.path),
-                    "A2A_PYTHON": sys.executable, "A2A_SRC": str(Path(__file__).resolve().parents[1])})
+                    "A2A_PYTHON": sys.executable, "A2A_SRC": str(Path(__file__).resolve().parents[1]),
+                    # 插件向 herdr 主动上报 working / idle 时用(不依赖 agent 进程的 PATH)
+                    "A2A_HERDR_BIN": self._herdr_bin()})
         return env
+
+    def _herdr_bin(self) -> str:
+        name = getattr(self.client, "herdr_bin", "herdr")
+        return shutil.which(name) or name
 
     @staticmethod
     def _where(created) -> Dict[str, str]:

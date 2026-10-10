@@ -308,6 +308,9 @@ class RealFnxPlugin(_Base):
                 self.assertIn(f"{edge_id}:发给 {edge['to']}_uart,内容是「{text}」", send["description"])
             environ = self.environ_of_agent(self.registry.get(f"{role}_uart").pane_id)
             self.assertEqual(environ["A2A_STATE_DIR"], str(self.state))
+            # 插件向 herdr 上报状态用的程序:绝对路径、可执行(阶段 8)
+            herdr_bin = environ["A2A_HERDR_BIN"]
+            self.assertTrue(os.path.isabs(herdr_bin) and os.access(herdr_bin, os.X_OK), herdr_bin)
         self.assertEqual(sorted(p.name for p in self.work.iterdir()), [])
         self.assertEqual(self.registry.get("sw_uart").lifecycle, "running")
 

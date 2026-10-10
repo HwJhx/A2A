@@ -85,9 +85,13 @@ class Broker:
         self.stop_event = threading.Event()
         # 真实运行时,投递引擎里的等待用 stop_event.wait,停机时立刻醒来;测试注入的假 sleep 保持原样
         engine_sleep = (lambda s: self.stop_event.wait(s)) if sleep is time.sleep else sleep
+        # 停机或全局停止投递(08 §7.2)时,在途的 worker 也不再开始新的投递:引擎在等待循环每一轮、
+        # 写 DISPATCHING 之前、重试退避之后检查这里,消息保持原状态返回。已经发出的 prompt 照常收尾。
+        # 局限:检查与写 DISPATCHING 之间仍有极短窗口,其间写入的停止标记要到下一条消息才生效。
         self.engine = DeliveryEngine(spool, registry, audit, client, config=self.config,
                                      semantics_verified=semantics_verified, sleep=engine_sleep,
-                                     monotonic=monotonic, stopping=self.stop_event.is_set)
+                                     monotonic=monotonic,
+                                     stopping=lambda: self.stop_event.is_set() or self.halted() is not None)
         self._lock_handle: Any = None
         self._state_lock = threading.Lock()
         self._paused: Dict[str, Tuple[int, str, str]] = {}       # dst -> (queue_seq, msg_id, state)

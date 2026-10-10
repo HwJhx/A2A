@@ -155,3 +155,22 @@ fnx_dv、fnx_sw 各 3 个,逐个 `a2a agent spawn`,herdr 调用前后打点计�
 - 外推:150 个空闲 fnx 约需 14.9 GB,几乎用尽这台 VM 的 15.2 GB 可用内存,放不下;留 20% 余量时空闲约能放 120 个。工作时的内存增长未测(需调用模型)。
 
 用户决定(2026-10-10):同时活跃的 IP 不超过 20 个左右(约 100 个 agent,本 VM 空闲时放得下);超过时给服务器加内存。不做"只运行活跃 IP 的 agent"或多 VM。
+
+## 真实 fnx 规模测试 A 档(2026-10-11,5 个 IP、10 个真实 fnx,调用模型)
+
+方案 `15-stage8-real-fnx-scale-plan.md`,脚本 `tests/stress/real_fnx_scale.py`(Codex 审核多轮)。结果:**按框架判定停止**(退出码 1),现场已按方案保留、查看后清理;证据在 VM 的 `~/a2a_stage8_real/n5/`(报告、快照、状态目录)与 10 份 fnx 会话记录。
+
+实际情况:
+- 10 个 agent 的模型工作全部完成:每个 dv 3 次、每个 sw 2 次,共 25 次调用(与预计一致);5 条链路在模型层面都走完了,dv 都回复了"收到";每条消息只送达一次、没有串 IP。
+- 但 6 次投递被判为 `DELIVERY_UNCERTAIN`:发往 sw_ip02/03/04 的 `dv_done` 和发往 dv_ip02/03/04 的回复。herdr 接受了 prompt,但 5 秒内没观察到目标进入 working(`agent_prompt_stalled`),按协议判为不确定、暂停队列等操作员裁定。
+
+根因:**pane 太小,herdr 看不到 "Working" 那一行。**
+- herdr 判断 pi 是否 working 只看屏幕(规则文件 `pi.toml`:屏幕出现 `Working...` 或带转圈符号的 `Working`)。
+- spawn 在同一角色的 tab 里不断对半拆最后一个 pane,越往后越小。可见行数:ip00 21 行、ip01 10 行、ip02 4 行、ip03 / ip04 2 行(只剩工作目录和状态栏)。失败的恰好是 ip02–ip04。
+- 之前没发现:压测的假 agent 主动上报状态,不依赖屏幕;阶段 6、7 每个 tab 只有 1 个 pane;布局探测只验证了"建得出来",没验证"看得见"。
+- 这是正式使用时的真实问题:一个 tab 放 20 个 IP 时,大部分 pane 都会太小,投递会大量变成"不确定"。
+
+修复方向的探测(真实 fnx、2 行可见的 pane,不调用模型):
+- `herdr pane report-agent --source X --agent pi --state working` 后状态即为 working,3 秒后仍是 working,不被屏幕兜底覆盖;上报 idle 后显示 done(broker 视 done 为可投递)。
+- fnx 退出后 0.5 秒 herdr 里就找不到该 agent,上报的状态不会残留;同一 pane 重启后用较小的序号上报仍被接受;`release-agent --source X --agent pi` 正常执行。
+- 结论:让插件在 pi 的 `agent_start` / `agent_end` 事件里主动上报 working / idle,可以不依赖屏幕大小。修复方案见 `16-stage8-report-state-plan.md`。

@@ -232,6 +232,31 @@ class GracefulStop(Base):
         self.assertEqual(self.spool.get(m.msg_id).state, WAITING_TARGET)
         self.assertEqual(herdr.prompts, [])
 
+    def test_global_halt_stops_a_worker_already_waiting_for_its_target(self):
+        # 08 §7.2 全局停止:worker 已经在等目标空闲时写了 dispatch.halted,目标随后空闲,
+        # 也不能再发 prompt(否则"全局停止"挡不住已在途的投递);消息保持 WAITING_TARGET
+        herdr = BlockingWaitHerdr()
+        herdr.add("sw_uart", "w1:p2", status="working")
+        m = self.send()
+        broker = Broker(spool=self.spool, registry=self.registry, audit=self.audit, client=herdr,
+                        session=SESSION, state_dir=self.dir, semantics_verified=True,
+                        config=BrokerConfig(scan_interval_s=0.05))
+        runner = threading.Thread(target=broker.run_forever)
+        runner.start()
+
+        def stop_broker():
+            broker.stop_event.set()
+            herdr.release.set()
+            runner.join(timeout=10)
+        self.addCleanup(stop_broker)
+        self.assertTrue(herdr.waiting.wait(10))
+        broker.halt("测试:全局停止")
+        herdr.status["sw_uart"] = "idle"
+        herdr.release.set()            # 等待返回,目标已空闲
+        time.sleep(1.0)
+        self.assertEqual(herdr.prompts, [])
+        self.assertEqual(self.spool.get(m.msg_id).state, WAITING_TARGET)
+
 
 class StartupRecovery(Base):
     def test_dispatching_becomes_uncertain_and_is_not_resent(self):
