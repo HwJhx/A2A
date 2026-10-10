@@ -151,7 +151,8 @@ class Broker:
 
     def reconcile_rulings(self) -> int:
         """08 §8 第 3 步:补做已落盘但未生效的操作员裁定;读不出的裁定或补做失败 -> 全局停止(fail-closed)。"""
-        count, problem = rulings.reconcile(self.spool, self.audit)
+        with rulings.lock(self.state_dir):  # 与并发的 a2a resolve / ruling void 串行
+            count, problem = rulings.reconcile(self.spool, self.audit)
         if problem:
             self.halt(problem)
         return count
@@ -211,8 +212,13 @@ class Broker:
             last = head.last_terminal
             assert last is not None  # spool.head 保证:无活动消息时一定有终态消息,否则已抛 QueueStateError
             if last.state == DELIVERED:
-                record = self.spool.release(dst, head.queue_seq, reason="delivered")
-                self._audit_queue(QUEUE_RELEASED, dst, head, last, "队列头已送达,自动放行", record.get("ruling_id"))
+                rid = self._delivered_ruling(last)
+                record = self.spool.release(dst, head.queue_seq, reason="delivered", ruling_id=rid)
+                if record.get("already_released"):
+                    continue  # 裁定线程刚好先放行了;谁实际放行谁写审计,这里不再记
+                self._audit_queue(QUEUE_RELEASED, dst, head, last,
+                                  "操作员裁定为已送达,自动放行" if rid else "队列头已送达,自动放行",
+                                  record.get("ruling_id"))
                 continue
             self._pause(dst, head, last, f"队列头确定失败({last.state}),等待操作员重试或放弃并继续")
             return "paused"
@@ -352,6 +358,17 @@ class Broker:
                            "dst": message.dst, "state": message.state, "detail": detail,
                            "session": message.session, "topology_revision": message.topology_revision,
                            "queue_seq": message.queue_seq})
+
+    def _delivered_ruling(self, message: Message) -> Optional[str]:
+        """消息是被操作员裁定为已送达的,返回该裁定的 ruling_id(放行要与它关联,08 §7.3);否则 None。
+        消息上的 ruling_id 也可能来自更早的"未送达,重试"裁定,所以要查审计确认裁定类型。"""
+        if not message.ruling_id:
+            return None
+        for entry in self.audit.read():
+            if (entry.get("state") == rulings.OPERATOR_RULING and entry.get("ruling_id") == message.ruling_id
+                    and entry.get("ruling") == rulings.DELIVERED_RULING):
+                return message.ruling_id
+        return None
 
     def _audit_queue(self, event: str, dst: str, head: QueueHead, message: Message, reason: str,
                      ruling_id: Optional[str]) -> None:

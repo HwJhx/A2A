@@ -105,9 +105,12 @@ class FakeHerdr:
         self.agents[target]["name"] = name
 
     def agent_get(self, target):
-        if target not in self.agents:
-            raise HerdrNotFound("x", code="agent_not_found")
-        return self.agents[target]
+        if target in self.agents:
+            return self.agents[target]
+        for agent in self.agents.values():  # 也可以按名字寻址
+            if agent.get("name") == target:
+                return agent
+        raise HerdrNotFound("x", code="agent_not_found")
 
 
 class Base(unittest.TestCase):
@@ -198,6 +201,15 @@ class StopRestoreClosePurge(Base):
         with self.assertRaisesRegex(LifecycleError, "不是 agent"):
             self.life.stop("dv", "uart")
         self.assertEqual(self.killed, [])
+
+    def test_stop_refuses_when_the_pane_holds_a_different_agent(self):
+        # 登记的 agent 退出后,同一 pane 里有人手动启动了另一个 pi(没有改名)
+        record = self.life.spawn("dv", "uart")
+        self.herdr.agents[record.pane_id] = {"pane_id": record.pane_id, "agent": "pi", "agent_status": "idle"}
+        with self.assertRaisesRegex(LifecycleError, "不是登记的"):
+            self.life.stop("dv", "uart")
+        self.assertEqual(self.killed, [])
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "running")
 
     def test_restore_after_stop_reuses_the_pane_and_renames_again(self):
         record = self.life.spawn("dv", "uart")

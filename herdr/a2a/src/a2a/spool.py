@@ -163,15 +163,20 @@ class Spool:
                           json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
     def _queue_or_init(self, dst: str) -> Dict[str, Any]:
-        """读取目标队列状态;不存在时按已有消息初始化(兼容升级前留下的消息),保证不复用序号。"""
+        """读取目标队列状态;不存在时初始化。
+
+        入队时先写队列状态再写消息,所以只要该目标已有带 queue_seq 的消息,状态文件就一定存在过;
+        此时文件不见了说明未放行记录已丢失,不能当作"没有未放行槽位"(08 §7.2 fail-closed)。
+        只有升级前留下的、没有 queue_seq 的消息才允许初始化。
+        """
         data = self._read_queue(dst)
         if data is not None:
             return data
-        highest = 0
-        for message in self._all_messages_unlocked(dst):
-            if message.queue_seq is not None:
-                highest = max(highest, message.queue_seq)
-        return {"next_seq": highest + 1, "unreleased": {}, "last_release": None}
+        numbered = [m.msg_id for m in self._all_messages_unlocked(dst) if m.queue_seq is not None]
+        if numbered:
+            raise QueueStateError(f"目标 {dst} 已有带 queue_seq 的消息(如 {numbered[0]}),但队列状态文件不见了;"
+                                  f"未放行记录可能丢失,停止该目标的投递: {self._queue_path(dst)}")
+        return {"next_seq": 1, "unreleased": {}, "last_release": None}
 
     def _all_messages_unlocked(self, dst: str) -> List[Message]:
         found: List[Message] = []
@@ -354,8 +359,11 @@ class Spool:
                         continue
                     if queue is None:
                         continue
+                    # 只有"done/ 里没有、pending/ 里还有未终结副本"才是归档第一步后崩溃留下的过早记录;
+                    # 两边都没有、或 done/ 文件读不出时保留记录,由 head() 对该目标 fail-closed
                     stale = [seq for seq, entry in queue["unreleased"].items()
-                             if not self._has_valid_done(entry["msg_id"])]
+                             if not self._done_path(entry["msg_id"]).exists()
+                             and self._has_unfinished_pending(qpath.stem, entry["msg_id"])]
                     for seq in stale:
                         del queue["unreleased"][seq]
                     if stale:
@@ -371,6 +379,15 @@ class Spool:
         if unreadable:
             result["unreadable_queue_files"] = unreadable
         return result
+
+    def _has_unfinished_pending(self, dst: str, msg_id: str) -> bool:
+        path = self._pending_path(dst, msg_id)
+        if not path.exists():
+            return False
+        try:
+            return self._load(path).state not in TERMINAL_STATES
+        except SpoolError:
+            return False
 
     def _has_valid_done(self, msg_id: str) -> bool:
         done = self._done_path(msg_id)

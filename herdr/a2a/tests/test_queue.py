@@ -75,11 +75,13 @@ class QueueSeq(Base):
         again = Spool(self.root).enqueue(make())
         self.assertEqual(again.queue_seq, 2)
 
-    def test_missing_queue_file_resumes_above_existing_messages(self):
+    def test_missing_queue_file_with_numbered_messages_fails_closed(self):
+        # 原先按已有消息推算序号继续入队;Codex 审核指出这会丢失未放行记录,改为 fail-closed
         for _ in range(3):
             self.spool.enqueue(make())
         (self.root / "queues" / "sw_uart.json").unlink()
-        self.assertEqual(self.spool.enqueue(make()).queue_seq, 4)
+        with self.assertRaises(QueueStateError):
+            self.spool.enqueue(make())
 
     def test_corrupt_queue_file_fails_closed(self):
         self.spool.enqueue(make())
@@ -256,6 +258,36 @@ class CrashRecovery(Base):
         for p in (self.root / "pending" / "sw_uart").glob("*.json"):
             p.unlink()
         with self.assertRaises(QueueStateError):
+            self.spool.head("sw_uart")
+
+    def failed_head_then_second(self):
+        m1 = self.spool.enqueue(make())
+        fail(self.spool, m1.msg_id, TIMEOUT)
+        m2 = self.spool.enqueue(make())
+        return m1, m2
+
+    def test_missing_queue_state_file_fails_closed_instead_of_skipping_the_failed_head(self):
+        # Codex 审核阻断 1:状态文件丢失时,不能当作"没有未放行槽位"而直接投递 m2
+        self.failed_head_then_second()
+        (self.root / "queues" / "sw_uart.json").unlink()
+        with self.assertRaises(QueueStateError):
+            self.spool.head("sw_uart")
+        with self.assertRaises(QueueStateError):
+            self.spool.enqueue(make())
+
+    def test_recover_keeps_a_slot_whose_terminal_record_is_lost(self):
+        # Codex 审核阻断 2:done/ 记录丢失、pending/ 也没有副本 -> 不能删槽位放行后续消息
+        m1, _ = self.failed_head_then_second()
+        (self.root / "done" / f"{m1.msg_id}.json").unlink()
+        self.assertEqual(self.spool.recover()["removed_stale_slot_records"], 0)
+        with self.assertRaises(QueueStateError):
+            self.spool.head("sw_uart")
+
+    def test_recover_keeps_a_slot_whose_terminal_record_is_corrupt(self):
+        m1, _ = self.failed_head_then_second()
+        (self.root / "done" / f"{m1.msg_id}.json").write_text("{坏")
+        self.assertEqual(self.spool.recover()["removed_stale_slot_records"], 0)
+        with self.assertRaises(SpoolError):
             self.spool.head("sw_uart")
 
     def test_legacy_message_without_queue_seq_is_not_skipped(self):

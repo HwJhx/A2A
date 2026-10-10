@@ -4,7 +4,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -26,6 +29,7 @@ TOPOLOGY = {
     "version": 1, "project_id": "soc_a", "roles": {"dv": {}, "sw": {}}, "ips": ["uart", "gpio"],
     "edges": [{"id": "dv_done", "from": "dv", "to": "sw", "template": "{ip}已完成UVM验证,请开发驱动。"}],
 }
+SRC = Path(__file__).resolve().parents[1] / "src"
 PANES = {"dv_uart": "w1:p2", "sw_uart": "w1:p3", "dv_gpio": "w1:p4", "sw_gpio": "w1:p5"}
 
 
@@ -184,6 +188,108 @@ class CrashAndReconcile(Env):
         self.broker.recover()
         self.assertTrue(self.spool.head("sw_uart").active.msg_id == second)  # 已放行
         self.assertEqual(len(self.events("RULING_APPLIED")), 1)
+        # Codex 审核应修 4:迁移的审计在崩溃前没写,补做时要补记(且只记一次)
+        self.assertEqual(len(self.ruled(FAILED, event)), 1)
+        self.assertEqual(len(self.ruled("QUEUE_RELEASED", event)), 1)
+
+    def ruled(self, state, event):
+        return [e for e in self.events(state) if e.get("ruling_id") == event["ruling_id"]]
+
+    def test_crash_after_release_before_its_audit_backfills_the_release_event(self):
+        first, second = self.uncertain_head()
+        event = self.recorded_but_not_applied(first, "abandon")
+        self.spool.update(first, state=FAILED, detail="已迁移", ruling_id=event["ruling_id"])
+        self.audit.record({"state": FAILED, "msg_id": first, "ruling_id": event["ruling_id"], "dst": "sw_uart"})
+        self.spool.release("sw_uart", event["queue_seq"], reason="abandon", ruling_id=event["ruling_id"])
+        self.broker.recover()  # 放行已落盘,QUEUE_RELEASED 没写
+        self.assertEqual(len(self.ruled("QUEUE_RELEASED", event)), 1)
+        self.assertEqual(len(self.ruled(FAILED, event)), 1)  # 已有的不重复记
+        self.assertEqual(len(self.events("RULING_APPLIED")), 1)
+
+    def test_retry_enqueue_audit_is_not_duplicated_on_reconcile(self):
+        first, _ = self.failed_head()
+        event = self.recorded_but_not_applied(first, "retry")
+        rulings.apply(self.spool, self.audit, event)
+        # 模拟 RULING_APPLIED 写之前崩溃:删掉它再恢复
+        lines = [line for line in self.audit.path.read_text().splitlines() if "RULING_APPLIED" not in line]
+        self.audit.path.write_text("\n".join(lines) + "\n")
+        self.broker.recover()
+        self.assertEqual(len([e for e in self.ruled(QUEUED, event) if e["msg_id"] == event["retry_msg_id"]]), 1)
+        self.assertEqual(len(self.events("RULING_APPLIED")), 1)
+
+    def test_broker_auto_release_is_not_audited_twice(self):
+        # 裁定为已送达、迁移已落盘;broker 随后自动放行;再补做裁定时不另记一次放行
+        first, second = self.uncertain_head()
+        event = self.recorded_but_not_applied(first, "delivered")
+        self.spool.update(first, state=DELIVERED, detail="已迁移", ruling_id=event["ruling_id"])
+        self.scan()
+        self.broker.recover()
+        released = [e for e in self.events("QUEUE_RELEASED") if e.get("queue_seq") == event["queue_seq"]]
+        self.assertEqual(len(released), 1)
+        self.assertEqual(released[0].get("ruling_id"), event["ruling_id"])  # 自动放行与裁定关联
+        self.assertEqual(self.spool.get(second).state, DELIVERED)
+
+    def test_auto_release_after_a_delivered_ruling_is_linked_to_it(self):
+        # Codex 复核应修 1:裁定"已送达"后 broker 先自动放行,放行审计要带 ruling_id
+        first, second = self.uncertain_head()
+        event = self.recorded_but_not_applied(first, "delivered")
+        self.spool.update(first, state=DELIVERED, detail="已迁移", ruling_id=event["ruling_id"])
+        self.scan()
+        released = [e for e in self.events("QUEUE_RELEASED") if e.get("queue_seq") == event["queue_seq"]]
+        self.assertEqual([e.get("ruling_id") for e in released], [event["ruling_id"]])
+        self.assertEqual(self.spool.head("sw_uart"), None)
+
+    def test_ruling_releases_first_and_broker_sees_already_released(self):
+        # Codex 第二次复核应修:broker 读到 DELIVERED 队列头之后、放行之前,裁定线程先放行并写了审计;
+        # broker 的 release 得到 already_released,不能再写一条不带 ruling_id 的放行记录
+        first, second = self.uncertain_head()
+        event = self.recorded_but_not_applied(first, "delivered")
+        self.spool.update(first, state=DELIVERED, detail="已迁移", ruling_id=event["ruling_id"])
+        real_release, interleaved = self.spool.release, []
+
+        def ruling_first_then_release(*args, **kwargs):
+            if not interleaved:  # broker 的第一次放行调用:此时它已读到 DELIVERED 队列头
+                interleaved.append(True)
+                with mock.patch.object(self.spool, "release", side_effect=real_release):
+                    rulings.apply(self.spool, self.audit, event)  # 裁定线程恰好先放行并写审计
+            return real_release(*args, **kwargs)
+
+        with mock.patch.object(self.spool, "release", side_effect=ruling_first_then_release):
+            self.scan()
+        self.assertEqual(interleaved, [True])
+        released = [e for e in self.events("QUEUE_RELEASED") if e.get("queue_seq") == event["queue_seq"]]
+        self.assertEqual([e.get("ruling_id") for e in released], [event["ruling_id"]])
+        self.assertEqual(self.spool.get(second).state, DELIVERED)  # broker 照常继续处理后续消息
+
+    def test_auto_release_after_an_earlier_retry_ruling_is_not_attributed_to_it(self):
+        # 消息上的 ruling_id 来自"未送达,重试",之后由 broker 正常送达:放行不归到那条裁定
+        first, _ = self.uncertain_head()
+        code, out, _ = self.cli("resolve", first, "retry", "--reason", "确认没写入")
+        self.assertEqual(code, 0)
+        self.scan()
+        self.assertEqual(self.spool.get(first).state, DELIVERED)
+        released = [e for e in self.events("QUEUE_RELEASED") if e.get("msg_id") == first]
+        self.assertEqual([e.get("ruling_id") for e in released], [None])
+
+    def test_concurrent_resolves_of_the_same_head_record_only_one_ruling(self):
+        # Codex 复核应修 2:两个 resolve 进程同时裁定同一个队列头,只能有一个落盘生效,另一个被拒绝
+        first, _ = self.uncertain_head()
+        env = dict(os.environ, PYTHONPATH=str(SRC), A2A_STATE_DIR=str(self.state))
+        with rulings.lock(self.state):  # 先占住锁,让两个进程都卡在检查之前,再同时放开
+            procs = [subprocess.Popen([sys.executable, "-m", "a2a.cli", "resolve", first, action, "--reason", "并发"],
+                                      env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                     for action in ("delivered", "abandon")]
+            time.sleep(1.5)
+            self.assertEqual(self.events("OPERATOR_RULING"), [])
+        codes = sorted(p.wait(timeout=30) for p in procs)
+        for p in procs:
+            p.stdout.close()
+            p.stderr.close()
+        self.assertEqual(codes, [0, cli.EXIT_INVALID])
+        self.assertEqual(len(self.events("OPERATOR_RULING")), 1)
+        self.assertEqual(len(self.events("RULING_APPLIED")), 1)
+        self.broker.recover()
+        self.assertIsNone(self.broker.halted())  # 没有留下补做不了的裁定
 
     def test_applied_retry_is_not_redone_after_the_message_became_uncertain_again(self):
         # "重试"已生效、broker 重发后消息又不确定;此时补做不能再重试一次(否则重复投递)

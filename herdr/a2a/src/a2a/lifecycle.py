@@ -213,6 +213,15 @@ class Lifecycle:
 
     def _terminate(self, record: AgentRecord) -> None:
         """SIGTERM agent 的前台进程组,等它从 herdr 里消失。不碰 pane 的 shell。"""
+        # 先按登记的名字找 agent(与投递引擎一致),确认它就在登记的 pane 上;
+        # 防止 pane 里换成了别的 pi 进程(例如有人手动启动)时误发信号
+        try:
+            named = self.client.agent_get(record.agent_name) if record.agent_name else None
+        except HerdrNotFound:
+            named = None
+        if named is None or named.get("pane_id") != record.pane_id:
+            raise LifecycleError(f"{record.pane_id} 上的 agent 不是登记的 {record.agent_name!r},拒绝发信号;"
+                                 f"请人工确认后处理")
         info = self.client.pane_process_info(record.pane_id)
         pgid, shell_pid = info.get("foreground_process_group_id"), info.get("shell_pid")
         argv0 = [(p.get("argv") or [""])[0] for p in info.get("foreground_processes", [])]

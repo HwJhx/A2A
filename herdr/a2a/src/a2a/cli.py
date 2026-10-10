@@ -148,18 +148,19 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
 def cmd_resolve(args: argparse.Namespace) -> int:
     spool, audit = _spool(), _audit()
-    try:
-        event = rulings.plan(spool, args.msg_id, args.action, actor=_actor(), reason=args.reason)
-    except MessageNotFoundError:
-        return _err(f"找不到消息 {args.msg_id}", EXIT_NOT_FOUND)
-    except (rulings.RulingError, SlotError, SpoolError) as exc:
-        return _err(str(exc), EXIT_INVALID)
-    audit.record(event)  # 先落盘;写不进去会抛异常,什么都不会生效
-    try:
-        steps = rulings.apply(spool, audit, event)
-    except Exception as exc:
-        return _err(f"裁定 {event['ruling_id']} 已记录但生效失败:{exc};broker 下次启动会补做,"
-                    f"或核实后用 a2a ruling void 作废", EXIT_INVALID)
+    with rulings.lock(state_dir()):  # 检查 → 落盘 → 生效 整个过程与其他裁定、broker 补做串行
+        try:
+            event = rulings.plan(spool, args.msg_id, args.action, actor=_actor(), reason=args.reason)
+        except MessageNotFoundError:
+            return _err(f"找不到消息 {args.msg_id}", EXIT_NOT_FOUND)
+        except (rulings.RulingError, SlotError, SpoolError) as exc:
+            return _err(str(exc), EXIT_INVALID)
+        audit.record(event)  # 先落盘;写不进去会抛异常,什么都不会生效
+        try:
+            steps = rulings.apply(spool, audit, event)
+        except Exception as exc:
+            return _err(f"裁定 {event['ruling_id']} 已记录但生效失败:{exc};broker 下次启动会补做,"
+                        f"或核实后用 a2a ruling void 作废", EXIT_INVALID)
     _out({"ruling_id": event["ruling_id"], "ruling": event["ruling"], "msg_id": event["msg_id"],
           "retry_msg_id": event.get("retry_msg_id"), "steps": steps})
     return 0
@@ -167,7 +168,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
 
 def cmd_ruling_void(args: argparse.Namespace) -> int:
     try:
-        _out(rulings.void(_audit(), args.target, actor=_actor(), reason=args.reason, verified=args.verified))
+        with rulings.lock(state_dir()):
+            _out(rulings.void(_audit(), args.target, actor=_actor(), reason=args.reason, verified=args.verified))
         return 0
     except rulings.RulingError as exc:
         return _err(str(exc), EXIT_INVALID)

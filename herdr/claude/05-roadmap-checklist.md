@@ -279,6 +279,20 @@
 
 **阶段 5 完成。**
 
+### 阶段 5 审核修复(Codex 审核提交 4a003bd)
+
+- [x] 队列状态文件丢失时 fail-closed ✅ 已有带 queue_seq 的消息而状态文件不见了 → `QueueStateError`,不再按"无未放行槽位"初始化(否则失败的队列头会被跳过)
+- [x] 恢复时不误删未放行槽位 ✅ 只有"done/ 里没有、pending/ 里还有未终结副本"才删;done/ 丢失或读不出时保留,由队列头 fail-closed
+- [x] stop 核对 agent 身份 ✅ 发信号前按登记的 agent_name 查 herdr,必须在登记的 pane 上;pane 里换成了别的 pi 时拒绝(Codex 定为阻断,我们评为应修,一并修)
+- [x] 裁定补做时补齐审计 ✅ 按 (ruling_id, 事件, msg_id) 补记缺失的迁移 / 重试入队 / 放行事件,已有的不重复;一个槽位的放行只记一次(含 broker 自动放行)
+
+- [x] 裁定后的自动放行与裁定关联(Codex 复核应修 1)✅ 消息被裁定为已送达后由 broker 自动放行时,`release` 与 `QUEUE_RELEASED` 带该 ruling_id(查审计确认是"已送达"裁定;来自更早"未送达,重试"裁定的不算);运行中裁定遇到"已放行"不再另记,只有启动恢复时补记崩溃丢失的放行审计
+- [x] 裁定跨进程串行(Codex 复核应修 2)✅ `rulings.lock`(状态目录下 rulings.lock):`a2a resolve` 的 检查 → 落盘 → 生效、`a2a ruling void`、broker 启动补做共用一把全局锁;并发测试用两个真实进程裁定同一队列头,只有一个落盘
+- [x] broker 自动放行遇到"已放行"不再写审计(Codex 第二次复核应修)✅ 裁定线程先放行时,broker 的 release 得到 already_released,直接继续;谁实际放行谁写审计(裁定侧与 broker 侧一致)。测试在 broker 读到队列头之后、放行之前插入裁定
+- [ ] 将来考虑:stop 在"核对 agent 名字"与 killpg 之间仍有极短的进程替换窗口,可评估进程身份快照校验(如核对 pid 与启动时间)
+
+测试:单元测试 423 个(Mac 30 跳过,都是集成测试);VM 全套 423 个通过、0 跳过,其中**真实 herdr 集成测试 29 个全部通过**(含真实 fnx 3 个,不发提示词)。
+
 其他:
 
 - [ ] 升级 herdr 后重跑 `review-probes/probe_herdr_errors.py`
