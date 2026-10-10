@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,17 @@ from typing import Any, Dict, List, Mapping, Optional
 from ._fsutil import exclusive_lock
 from .messages import now_iso
 from .paths import default_audit_path
+
+
+def fingerprint(text: str) -> str:
+    """损坏内容的指纹:操作员作废一条读不出的裁定时用它来指代(08 §7.3 规则 8)。"""
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def corrupt_entry(line: str) -> Dict[str, Any]:
+    """无法解析的一行。mentions_ruling 表示它可能是一条操作员裁定(08 §7.3 规则 7:读不出的裁定要 fail-closed)。"""
+    return {"ts": "", "state": "CORRUPT_LINE", "detail": line[:200], "fingerprint": fingerprint(line),
+            "mentions_ruling": "OPERATOR_RULING" in line}
 
 
 class AuditLog:
@@ -119,11 +131,27 @@ class AuditLog:
                 try:
                     value = json.loads(line)
                 except ValueError:
-                    entries.append({"ts": "", "state": "CORRUPT_LINE", "detail": line[:200]})
+                    entries.append(corrupt_entry(line))
                     continue
-                entries.append(value if isinstance(value, dict)
-                               else {"ts": "", "state": "CORRUPT_LINE", "detail": line[:200]})
+                entries.append(value if isinstance(value, dict) else corrupt_entry(line))
         return entries
+
+    def quarantined(self) -> List[str]:
+        """被隔离到 <日志>.corrupt 的残片(每段一条)。"""
+        if not self.corrupt_path.exists():
+            return []
+        fragments: List[str] = []
+        current: List[str] = []
+        for line in self.corrupt_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("# ") and "隔离" in line:
+                if current:
+                    fragments.append("\n".join(current))
+                current = []
+            elif line:
+                current.append(line)
+        if current:
+            fragments.append("\n".join(current))
+        return fragments
 
     def tail(self, n: int = 50) -> List[Dict[str, Any]]:
         if n < 0:

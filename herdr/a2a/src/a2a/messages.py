@@ -9,7 +9,7 @@ import secrets
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, Mapping
+from typing import Any, Dict, FrozenSet, Mapping, Optional
 
 # ---- 状态 --------------------------------------------------------------
 QUEUED = "QUEUED"                        # 鉴权通过,已写入持久队列,等待 broker 投递
@@ -67,7 +67,7 @@ def now_iso() -> str:
 
 
 def new_msg_id() -> str:
-    """按时间排序的消息 ID:同一目标的消息按 ID 排序即为入队顺序(FIFO)。"""
+    """消息 ID:唯一标识。**不作排序键**——同一目标的顺序由 queue_seq 决定(08 §4 规则 10、§7.4)。"""
     return "%016x-%s" % (time.time_ns(), secrets.token_hex(3))
 
 
@@ -87,6 +87,9 @@ class Message:
     attempts: int = 0
     detail: str = ""
     updated_at: str = ""
+    queue_seq: Optional[int] = None  # 目标队列中的槽位序号,只由 Spool 在入队时分配(08 §7.4)
+    retry_of: Optional[str] = None   # 终态后重试:被重试的原消息 msg_id(继承它的 queue_seq)
+    ruling_id: Optional[str] = None  # 最近一次改变本消息状态的操作员裁定;与状态同一次落盘,用于幂等补做
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

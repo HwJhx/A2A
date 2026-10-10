@@ -391,6 +391,17 @@ class DocumentStatesRules(unittest.TestCase):
         self.assertIn("复核目标", rule)
         self.assertNotIn("待设计", rule)
 
+    def test_fifo_ordering_key_is_queue_seq_everywhere(self):
+        # 规则 10 与 §7.1 / §7.4 必须用同一个排序键;msg_id 只是标识
+        rule = next(line for line in self.text.splitlines() if line.startswith("10. "))
+        self.assertIn("按 `queue_seq` 顺序", rule)
+        self.assertIn("`msg_id` 只是唯一标识,不作排序键", rule)
+        for line in self.text.splitlines():
+            if line.startswith(("- **", "  - ")):
+                continue  # 修订记录是历史,不检查
+            self.assertNotRegex(line, r"按 `msg_id`[^,。]*(顺序|排序|FIFO)(?!.*没有 `queue_seq`)", line[:80])
+        self.assertIn("按 `queue_seq`", self.section7().split("### 7.1")[1].split("### 7.2")[0])
+
     def test_future_extensions_are_not_in_v1(self):
         section = self.section7().split("### 7.5")[1]
         for phrase in ("v1 不做", "`CANCELLED`", "`continue_on_failure`", "`workflow_id`"):

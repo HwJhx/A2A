@@ -78,6 +78,14 @@ class HerdrPromptStalled(HerdrError):
     """
 
 
+class HerdrPromptFailed(HerdrError):
+    """agent_prompt_failed:写入过程中出错(例如 pane 被关闭,"PTY actor closed during input submission")。
+
+    重要:实测(herdr 0.9.3,09 号文档 §7)这种情况下文字**已经写入**目标,
+    绝不能当作"没发出去"而重试。投递结果按"不确定"处理。
+    """
+
+
 class HerdrTimeout(HerdrError):
     """等待超时(herdr 侧的 timeout,或本进程等待子进程超时)。"""
 
@@ -90,6 +98,8 @@ CODE_TO_EXCEPTION = {
     "agent_name_taken": HerdrAgentNameTaken,
     "invalid_agent_name": HerdrInvalidAgentName,
     "agent_prompt_stalled": HerdrPromptStalled,
+    "agent_prompt_failed": HerdrPromptFailed,
+    "agent_not_found": HerdrNotFound,
     "timeout": HerdrTimeout,
 }
 

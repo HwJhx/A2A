@@ -1,0 +1,29 @@
+# a2a broker 的 systemd 用户服务模板(实例名 = herdr 会话名)。
+#
+# 安装(在 VM 里,以你自己的用户):
+#   mkdir -p ~/.config/systemd/user
+#   cp a2a-broker@.service ~/.config/systemd/user/
+#   # 按需修改下面的 PYTHONPATH 与 A2A_STATE_DIR
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now a2a-broker@<会话名>.service
+#   journalctl --user -u a2a-broker@<会话名> -f      # 查看日志(含告警)
+#
+# 前提:该 herdr 会话已经在运行;会话不在时 broker 会暂停投递并等待,不会让消息超时。
+# 一个状态目录只能有一个 broker(单实例锁);不同会话请用不同的 A2A_STATE_DIR。
+
+[Unit]
+Description=a2a broker for herdr session %i
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=%h/A2A/herdr/a2a/src
+Environment=A2A_STATE_DIR=%h/.local/state/a2a/%i
+ExecStart=/usr/bin/env python3 -m a2a.cli broker run --session %i
+Restart=on-failure
+RestartSec=5
+# 停止时发 SIGTERM,broker 结束当前一步后退出;被强杀时停在 DISPATCHING 的消息会在下次启动时转为 DELIVERY_UNCERTAIN
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

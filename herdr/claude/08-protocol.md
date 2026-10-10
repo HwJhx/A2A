@@ -115,7 +115,7 @@ QUEUED ─▶ WAITING_TARGET ─▶ [复核通过] ─▶ DISPATCHING ─▶ DEL
 7. **只有能证明 prompt 未提交的错误才能安全重试。** 不能只按错误名分类:每个错误码的语义都要在真实 herdr 上实测确认,未确认的(含未知错误码)按"不确定"处理。当前状态见 §5:`agent_blocked`、`agent_not_ready`、`agent_not_found`、`server_not_running` 已在 herdr 0.9.3 上实测为"未写入"并已定类;`agent_prompt_failed` 实测为"已写入";升级 herdr 后须重测,结果不一致就退回"不确定"。
 8. **`unknown` 不是 READY。** 只能等待,等到超时 → `TIMEOUT`。
 9. **`idle` 和 `done` 都是 READY(D9)。** 实测:`done` 不会自己变回 `idle`,只等 `idle` 会永远等不到。
-10. **同一目标按 `msg_id` 顺序串行投递(FIFO)。** 实测:同时发给忙碌的 agent 的多条 prompt 都会被接受,但处理顺序不确定,所以顺序必须由 Broker 保证。
+10. **同一目标按 `queue_seq` 顺序串行投递(FIFO,§7.4)。** `msg_id` 只是唯一标识,不作排序键。实测:并发发给同一 agent 的多条 prompt 都会被接受并写入,处理顺序不确定(09 号文档 §7),所以顺序必须由 Broker 保证。
 11. **所有 ID 严格校验。** `msg_id` 必须匹配 `^[0-9a-f]{16}-[0-9a-f]{6}$`,目标 `agent_id` 必须匹配 `^[a-z][a-z0-9_-]{0,31}$`,不合格一律 `InvalidIdError`(防路径穿越)。
 12. **每个目标只处理队列头;队列头没有放行,后续消息一律不投递。** 暂停**只作用于这一个目标**,其他目标、其他 IP 照常运行。暂停的依据是"队列头尚未放行",不是某一时刻的状态名:队列头从 `DELIVERY_UNCERTAIN` 经裁定转 `RETRYING` 后仍占住队列头,再次进入 `DELIVERY_UNCERTAIN` 时暂停连续保持。只有 `DELIVERED` 自动放行;不确定态和确定失败终态都要经操作员动作才放行。**没有任何由时间触发的放行。** 详见 §7。
 13. **时间只能触发告警,不能触发 `DELIVERY_UNCERTAIN` 的状态迁移。** 见 §6。
@@ -242,7 +242,7 @@ herdr 文档明确说:超时或 `agent_prompt_stalled` **不代表没有发出**
 4. 同一槽位任何时刻**最多一条未终结的消息**(即最多一个活动重试)。
 5. 该槽位放行之前,不投递 `queue_seq` 更大的消息。
 
-**实现现状:** 当前 `Spool.pending()` 按 `msg_id` 排序,没有 `queue_seq`。实现留到 Broker 阶段(需改 `Router` / `Spool`),见 §10。
+**实现现状(`herdr/a2a`,阶段 5a):** `queue_seq` 由 `Spool.enqueue` 在锁内分配,存于 `<spool>/queues/<dst>.json`(同一文件还记录未放行槽位);`Spool.head()` 求队列头,`Spool.release()` 放行,`Spool.enqueue_retry()` 是受信任的重试入队路径(按新 `msg_id` 幂等)。消息到终态时先记未放行槽位、再归档,所以归档不等于放行。
 
 ### 7.5 将来扩展(v1 不做)
 
@@ -326,10 +326,10 @@ herdr 接受了但观察窗口内没看到目标开始处理 → **不记 `DELIV
 | 5 | `state_change_seq` 作为核实依据的可靠性 | 待在真实 herdr 上验证;验证前不得自动使用 |
 | 6 | 观察窗口长度 | 暂定 30 秒,可配置,待 Broker 实测 |
 | 7 | 状态查询的退避与上限(1 秒起、每次加倍、单次 ≤ 30 秒;连续 5 次;总等待 300 秒) | 暂定,可配置,待 Broker 实测 |
-| 8 | 操作员裁定的命令行形式(例如 `a2a resolve <msg_id> ...`)与 `actor` 的来源 | 待设计 |
+| 8 | 操作员裁定的命令行形式与 `actor` 的来源 | **已定**:`actor` 取执行命令的系统用户名,只作审计署名,不作认证;命令为 `a2a resolve <msg_id> delivered \| retry \| abandon --reason ...`、`a2a ruling void <ruling_id\|corrupt:指纹> --reason ... --verified ...`、`a2a dispatch resume --reason ...`(`herdr/a2a` 阶段 5d) |
 | 8a | 终态后重试新建的消息是否重新鉴权 | **已定**:继承原授权,不重新鉴权,投递前照常复核目标(§7.3 规则 3) |
-| 8c | 槽位放行记录、裁定对账的持久化方式(§7.1 第 5 条、§7.3 规则 5) | Broker 阶段设计 |
-| 8b | `queue_seq` 的实现(改 `Router` / `Spool`,§7.4) | Broker 阶段实现 |
+| 8c | 槽位放行记录、裁定对账的持久化方式(§7.1 第 5 条、§7.3 规则 5) | `herdr/a2a` 已实现:放行记录在 `<spool>/queues/<dst>.json`;裁定以审计日志为依据,消息记录最近一次裁定的 `ruling_id`(与状态同一次落盘)用于判断补做是否已做 |
+| 8b | `queue_seq` 的实现(改 `Router` / `Spool`,§7.4) | `herdr/a2a` 已实现(阶段 5a);`a2a_codex` 由 Codex 各自实现 |
 | 9 | `a2a` 的迁移表对齐(`messages.py`)与 `a2a_codex` 的对齐 | `a2a` **已对齐**(2026-10-09);`a2a_codex` 由 Codex 自行对齐,**`a2a` 已对齐不代表 `a2a_codex` 已对齐** |
 
 ## 11. 修订记录
@@ -368,6 +368,7 @@ herdr 接受了但观察窗口内没看到目标开始处理 → **不记 `DELIV
   - 依据 Codex 对补充决议三的复审(无阻断,3 条应修):终态重试经 Router 的重试入队路径创建,操作员不直接写状态(§1、§7.3 规则 3);裁定副作用都以 `ruling_id` 幂等,`RULING_APPLIED` 只在全部效果持久化后写入,裁定记录不可读时 fail-closed(§7.3 规则 6、7);测试改为逐项断言每个 `ruling` 的语义。
   - 依据 Codex 的再次复审(2 条应修):新增解除 fail-closed 的人工流程——作废旧裁定(`RULING_VOIDED`,只停止补做、不撤销已生效效果;作废后以已持久化的实际状态重新确定队列头,不"回到"任何状态,按实际状态分 5 种情况处理)与恢复全局投递(`DISPATCH_RESUMED`)(§7.3 规则 8);裁定触发的 `QUEUE_PAUSED` / `QUEUE_RELEASED` 必须带 `ruling_id`;"Router 的重试入队路径"改为"受信任的重试入队路径",模块归属留到 Broker 阶段。
 - **定稿(2026-10-09)**:Codex 复审结论"可以定稿";`herdr/a2a/src/a2a/messages.py` 迁移表已对齐。Broker 阶段待办:故障注入测试,覆盖作废前后各副作用已持久化的崩溃点(Codex,非必要)。
+- **规则 10 修正(2026-10-09)**:排序键由 `msg_id` 改为 `queue_seq`,与 §7.1、§7.4 一致(Codex 指出)。
 - **错误码实测(2026-10-09,迁移表不变)**:§4 规则 7 同步改为引用实测结果(Codex 指出遗漏)。§5 的四个"待验证"项在 herdr 0.9.3 上实测为"未写入":`agent_blocked` → `TARGET_BLOCKED`,调用后的 `agent_not_found` → `TARGET_MISSING`,`agent_not_ready` 与 `server_not_running` → `RETRYING`。新增 `agent_prompt_failed`(实测已写入)→ `DELIVERY_UNCERTAIN`。结论绑定 herdr 版本。详见 `09` 号文档。
 - **版本 1(2026-10-09)**:初版。
 

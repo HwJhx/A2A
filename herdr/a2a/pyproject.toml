@@ -5,9 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "a2a"
 version = "0.1.0"
-description = "基于 herdr 的多智能体编排框架(当前阶段:herdr 调用层)"
+description = "基于 herdr 的多智能体编排框架"
 requires-python = ">=3.9"
 dependencies = ["PyYAML>=5.4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.scripts]
+a2a = "a2a.cli:main"

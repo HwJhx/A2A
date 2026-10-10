@@ -253,9 +253,12 @@ a2a/                              # 实际位置:herdr/a2a/
 │   ├── spool.py          # 持久队列:pending/<目标>/ 与 done/,原子写入        [已实现]
 │   ├── audit.py          # 审计日志:追加写 JSON Lines,跨进程文件锁          [已实现]
 │   ├── router.py         # 鉴权 + 拓扑校验 + 模板渲染 + 入队(§3.1)           [已实现]
-│   ├── broker.py         # 投递:队列、等待 READY、投递、重试、审计(§4)       [阶段 5]
-│   ├── lifecycle.py      # 创建/停止/关闭/清除/恢复(§5)                      [待做]
-│   └── cli.py            # 给 agent 用的 `a2a send <edge_id>`                [待做]
+│   ├── policy.py         # prompt 返回分类、Broker 配置、退避                [已实现]
+│   ├── delivery.py       # 单条消息投递引擎(08 §3–§6)                      [已实现]
+│   ├── broker.py         # 投递进程:队列头调度、暂停/放行、恢复、告警(§4)   [已实现]
+│   ├── rulings.py        # 操作员裁定:先落盘、再生效、幂等补做、作废        [已实现]
+│   ├── lifecycle.py      # 创建/停止/关闭/清除/恢复(§5)                      [已实现]
+│   └── cli.py            # `a2a` 命令行:send/status/queue/resolve/agent/topology/broker [已实现]
 └── tests/                # 161 个测试(含虚拟机集成测试)
 ```
 
@@ -586,7 +589,7 @@ prov.spawn("dv", "uart")                         # 拆 pane + 注入身份 + 预
 prov.spawn_all(roles=["dv", "sw"], ips=topo.ips) # 批量
 prov.stop("dv", "uart")                          # 只停 agent 进程,保留 pane 与注册信息(默认,可恢复)
 prov.close("dv", "uart")                         # 关闭 pane,但保留注册信息与消息历史,可重建
-prov.purge("dv", "uart")                         # 彻底删除:pane、注册表、拓扑中的该节点;历史仍留审计日志
+prov.purge("dv", "uart")                         # 彻底删除:pane、注册表;历史仍留审计日志。实现(阶段 5f)不修改拓扑:节点是 角色×IP,删 IP 用 a2a topology remove-ip
 prov.restore("dv", "uart")                       # 按注册表重建 pane 并重启 agent
 prov.rename_tab("dv", "验证智能体")               # 改显示名,不影响寻址
 

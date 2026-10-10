@@ -171,7 +171,7 @@
 - [x] **P1 审计**:崩溃留下半行后,下一条记录被拼进坏行丢失 ✅ 追加前把残片隔离到 `audit.jsonl.corrupt`,补记 `AUDIT_REPAIRED`;`read()` 仍容忍中间坏行且不修改文件;写入循环处理短写
 - [x] **P4 Router**:不检查目标登记的会话 ✅ 目标会话必须等于发送方会话,否则 `target_missing`
 - [x] 状态迁移表写入协议文档 `08-protocol.md` ✅ 并新增 `DELIVERY_UNCERTAIN`;`tests/test_protocol.py` 逐行对照文档与代码,不一致即失败
-- [x] 测试:246 个全部通过 ✅(Mac,Python 3.9.6,17 个集成测试按设计跳过;虚拟机,Python 3.10,含真实 herdr 与真实 fnx)
+- [x] 测试:246 个全部通过 ✅(Mac,Python 3.9.6,17 个集成测试按设计跳过;虚拟机,Python 3.10)。**更正(2026-10-09)**:按会话记录核对,这一轮没有打开集成开关,不含真实 herdr / fnx。真实 herdr 集成测试的实际记录:2026-10-08(阶段 2/3)、2026-10-09 上午(阶段 4)、2026-10-09 阶段 5a 之后(16 个:herdr 14 + 真实 fnx 启动 2,全部通过)
 
 ### 协议版本 2 定稿(与 Codex 多轮复核)
 
@@ -204,27 +204,85 @@
 - 去重(§4.7)在 broker 里做
 - 还没写 `a2a send` / `a2a status` 命令行(属于阶段 5 的交付物)
 
-## 阶段 5:Broker
+## 阶段 5:Broker(子阶段经与 Codex 对照、用户确认,2026-10-09)
 
-- [ ] 单实例(`flock` 保证只有一个 broker)
-- [ ] 持久队列(`spool/{dst}/{msg_id}.json`),重启后恢复
-- [ ] 每目标一个串行 worker,FIFO
-- [ ] READY 判定:`idle` / `done` 可投递;`working` 等待;`blocked` 立即失败;`unknown` 等到超时后失败
-- [ ] 投递后用 `agent wait --until working` 确认
-- [x] **Broker 实现前**:实测 4 个错误码的"未提交"语义 ✅ herdr 0.9.3 上四者均未写入,已写回 08 §5;新发现 `agent_prompt_failed`(写入中途 pane 被关闭)返回时**已写入**,走 `DELIVERY_UNCERTAIN`(`09` 号文档 §7)
-- [ ] `HerdrClient` 的错误码映射补上 `agent_prompt_failed`(目前按未知错误码处理,结果正确但不显式)
+依据 `08-protocol.md` v2。用户确认的决定:采用"方案 C"(生命周期留在阶段 5 末尾的 5f,拓扑命令放 5d);**不加**"RETRYING 次数上限转 FAILED",由总等待时限转 `TIMEOUT` 兜底;操作员裁定的 `actor` v1 取执行命令的系统用户名,只作审计署名,不作认证。
+
+前置(已完成):
+
+- [x] 实测 4 个错误码的"未提交"语义 ✅ herdr 0.9.3 上四者均未写入,已写回 08 §5;新发现 `agent_prompt_failed` 返回时**已写入**,走 `DELIVERY_UNCERTAIN`(`09` 号文档 §7)
+- [x] 协议规则 10 的排序键改为 `queue_seq` ✅ 加一致性测试(Codex 指出)
+
+### 5.0 准备
+
+- [x] `HerdrClient` 显式映射 `agent_prompt_failed`(结果不确定)✅ 新增 `HerdrPromptFailed`;`agent_not_found` 也显式映射
+- [x] 按 08 §5 的 prompt 返回分类函数 ✅ `policy.classify_prompt_result`;测试逐行解析 08 §5 表格对照;herdr 版本不在实测范围(`VERIFIED_HERDR_VERSIONS`,当前 0.9.3)时四个实测错误码退回"不确定";新增 `herdr_version()`
+- [x] Broker 配置与暂定默认值 ✅ `policy.BrokerConfig`(未知配置项报错)与 `backoff_delays`;等待 READY 总超时 300 秒;观察窗口 30 秒;状态查询退避 1 秒起倍增、单次 ≤30 秒、连续失败 5 次(均可配置,实测后定)
+
+测试:296 个通过(Mac 17 跳过;VM 16 跳过,VM 上 herdr 0.9.3 判定为已实测版本)。
+
+### 5a 队列基础(不调用 herdr)
+
+- [x] `queue_seq`:每目标持久单调、锁内原子分配 ✅ 由 `Spool.enqueue` 分配(调用方不能预设),Router 回执与审计带上 `queue_seq`;`Spool.head()` 求队列头
+- [x] 槽位放行记录持久化 ✅ `<spool>/queues/<dst>.json`;到终态时先记未放行槽位再归档;`Spool.release()` 只放行队列头、幂等、记 `ruling_id`
+- [x] 受信任的重试入队路径 ✅ `Spool.enqueue_retry()`:继承授权与 `queue_seq`,按新 `msg_id` 幂等;拒绝非终态、已送达、已放行、槽位已有未终结消息、非最后一次结果
+- [x] 测试 ✅ `tests/test_queue.py` 25 个:时钟回拨下仍按序、跨重启不复用、5 进程并发 50 条序号连续、队列文件损坏 fail-closed、三步归档各崩溃点、旧消息兼容;全部 321 个通过(Mac / VM)
+
+真实 herdr 集成测试(5a 之后补跑,`A2A_INTEGRATION=1`、`A2A_INTEGRATION_FNX=1`):16 个全部通过;临时会话已清理。**以后每个子阶段完成时都跑一次,汇报时与单元测试分开写。**
+
+### 5b 单条消息投递引擎(先用假 HerdrClient)
+
+- [x] 进入 `DISPATCHING` 前复核目标 → 写前标记 → `agent prompt` → 分类 → 观察窗口 → `DELIVERED` / `DELIVERY_UNCERTAIN` ✅ `delivery.DeliveryEngine`。按登记的 agent 名字寻址(agent 退出后名字即失效,不会发到被复用的 pane),并核对 pane 与登记一致;观察窗口用 `agent prompt --wait --until working --until blocked`,由 herdr 观察"这次提交之后"的状态(5 秒内没看到会返回 `agent_prompt_stalled` → 不确定)
+- [x] 覆盖 08 §3 每一条迁移;持有 Spool 锁时不等待 herdr ✅ `tests/test_delivery.py` 34 个(假 HerdrClient + 假时钟):除操作员裁定外的全部迁移、查询失败退避 1/2/4/8 秒后第 5 次判 `TIMEOUT`、`RETRYING` 由总时限兜底转 `TIMEOUT`、herdr 版本未实测时退回不确定;每个用例校验审计里的状态路径都在迁移表内
+- [x] 在 VM 用假 agent 小规模验证,不调用模型 ✅ `tests/test_integration_delivery.py` 5 个**真实 herdr** 用例全部通过:空闲目标送达且文字确实写入;忙碌目标等其空闲后才发;blocked 目标立即失败且未写入;目标不表现出开始处理 → 不确定,且日志证明文字其实已写入;agent 名字不存在 → `TARGET_MISSING`。假 agent `tests/fake_agent.py` 用 `report-agent` 模拟 working/idle
+
+测试(5b 完成时):单元测试 360 个(Mac 22 跳过,VM 21 跳过,跳过的都是集成测试);**真实 herdr 集成测试 21 个全部通过**(herdr 14 + 投递引擎 5 + 真实 fnx 启动 2),临时会话已清理。
+
+限制(v1):等待总时限从本次投递开始计时,broker 重启后重新计时。
+
+### 5c Broker 进程
+
+- [x] 单实例(`flock`);每目标一个串行 worker,只处理队列头;不确定态与确定失败暂停该目标 ✅ `broker.Broker`。补充:herdr 服务不在时整体暂停投递(不消耗查询失败次数,避免服务重启导致整批 `TIMEOUT`);一个状态目录只服务一个会话,别的会话的消息原样不动;broker 内部错误时该目标冷却 30 秒再试
+- [x] 启动恢复按 08 §8 五步;审计 `QUEUE_PAUSED` / `QUEUE_RELEASED` ✅ 第 3 步(对账裁定)留空,5d 实现裁定时补上;损坏的队列文件只让该目标 fail-closed;读不出的待投递消息 → 全局停止(`dispatch.halted` + `DISPATCH_HALTED`)
+- [x] 告警 v1 ✅ 审计 `ALERT`(含裁定命令提示和被暂停的消息数)+ 日志(前台运行时在终端,服务运行时在 journalctl);只告警,不改状态
+- [x] 前台命令 `a2a broker run` ✅ `cli.py`(`--once` 调试用),`pyproject` 注册 `a2a` 命令;systemd 用户服务模板 `config/a2a-broker@.service`(实例名 = 会话名)
+- [x] 故障注入:`DISPATCHING` 中途 kill -9 ✅ 两处:单元测试(假 herdr 可执行文件,prompt 期间 SIGKILL)和**真实 herdr**(假 agent 不响应、herdr 等待期间 SIGKILL);重启后都转 `DELIVERY_UNCERTAIN`、文字只写入一次、后一条不被投递。**裁定各副作用之间**的 kill -9 留到 5d(裁定在 5d 实现)
+
+测试(5c 完成时):单元测试 376 个(Mac 24 跳过,VM 23 跳过,跳过的都是集成测试);**真实 herdr 集成测试 23 个全部通过**(herdr 14、投递引擎 5、broker 子进程 2、真实 fnx 启动 2):broker 按队列顺序写入 3 条、blocked 目标只暂停自己、kill -9 后不重发;临时会话与进程已清理。
+
+### 5d 命令行
+
+- [x] `a2a send <edge_id>`、`a2a status <msg_id>`、`a2a queue [<dst>]` ✅ 输出 JSON;退出码 0/2/3/4/5/6;`status` 对被拒绝的发送从审计里查;`queue` 显示每个目标的队列头、暂停原因、积压数、可用的裁定命令,以及全局停止状态和未生效/读不出的裁定
+- [x] 操作员:`a2a resolve <msg_id> delivered | retry | abandon --reason`、`a2a ruling void`、`a2a dispatch resume` ✅ `rulings.py`:只能裁定队列头;先写 `OPERATOR_RULING` 再生效;每个效果带 `ruling_id` 且幂等;全部生效后写 `RULING_APPLIED`;broker 启动时补做(08 §8 第 3 步已接上);读不出的裁定(审计中间的坏行或被隔离的残片)→ 全局停止,作废后才能 `dispatch resume`;补做时状态与裁定矛盾 → 全局停止。**补充**:消息新增 `ruling_id` 字段,与状态迁移同一次落盘——否则"重试已生效、重发后又不确定"时补做会再重试一次(测试中发现并修正)
+- [x] `a2a topology show / add-ip / remove-ip / add-edge / remove-edge / set-template` ✅ 每次修改写 `TOPOLOGY_CHANGED` 审计(含操作者与前后修订号)
+- [x] 回归:消息入队后删边,旧消息照常投递,新消息被拒绝(`unknown_edge`)✅
+
+测试(5d 完成时):单元测试 395 个(Mac 24 跳过,VM 23 跳过,跳过的都是集成测试),其中裁定与命令行 21 个,覆盖各崩溃点的补做(用进程内模拟崩溃,不是真实 kill -9);**真实 herdr 集成测试 23 个全部通过**。临时会话与进程已清理。
+
+### 5e 端到端(假 agent)
+
+- [x] VM 里用假 agent 跑通 send → broker → 投递 → status,含 broker 重启 ✅ `tests/test_integration_e2e.py`(**真实 herdr**):真实 shell pane(注入 dv_uart 身份)里执行 `a2a send dv_done` → Router 渲染"uart已完成UVM验证,请开发驱动。"入队 → 常驻 broker 投递 → 假 agent sw_uart 收到;broker 停止期间发出的 2 条在重启后按序补投;pane 里 `a2a status` 查到 `DELIVERED`;消息的会话名确实来自 herdr 注入的 `HERDR_SESSION`;另一个 shell pane 冒充 sw_uart 发送被拒(`identity`,退出码 4)
+- [x] 并发:同一目标同时收到多条,按 `queue_seq` 串行、不交织 ✅ 单元级:5 进程并发入队 50 条序号连续(5a)、多线程 broker 两个目标各 3 条按序(5c);真实 herdr 上 broker 按序写入 3 条(5c)。**未做**:多个真实 pane 同时 `a2a send` 的压测(留到规模化阶段)
+- [x] 行为测试:队列排序、暂停与放行、重试继承序号、恢复幂等 ✅ 分布在 `test_queue.py`(5a)、`test_broker.py`(5c)、`test_rulings_cli.py`(5d)
+
+测试(5e 完成时):单元测试 397 个(Mac 26 跳过,VM 25 跳过,跳过的都是集成测试);**真实 herdr 集成测试 25 个全部通过**(herdr 14、投递引擎 5、broker 子进程 2、端到端 2、真实 fnx 启动 2)。临时会话与进程已清理;集成测试结束时回收 broker 子进程。
+
+### 5f 生命周期管理
+
+- [x] 按 IP 启动 agent pane:注入身份环境变量、登记注册表 ✅ `lifecycle.Lifecycle.spawn` / `a2a agent spawn <role> <ip>`:布局 workspace(拓扑 workspace_label)→ 角色 tab(角色 label)→ 每 IP 一个 pane(同角色在同一 tab 里拆分);预检启动脚本 → 覆盖 exec 启动 → 等识别 → 等 READY → 最后 `agent rename` 为 agent_id → 登记;启动失败关闭新建的 pane、不登记
+- [x] stop / close / purge / restore 四档 ✅ stop:对 agent 的前台进程组发 SIGTERM(先核对进程组不是 shell、argv[0] 是 pi),等它从 herdr 消失,pane 与注册保留;close:关 pane,注册保留;purge:关 pane 并注销(**不修改拓扑**,删 IP 用 `a2a topology remove-ip`);restore:stopped 在原 pane 重启、closed 新建 pane,都重新改名;每步写 `AGENT_*` 审计;同一 agent 的操作串行(文件锁)
+- [x] 回归:目标停止后,队列中的消息按 08 §7.2 处理 ✅ 队列头判 `TARGET_MISSING` 并暂停,后续消息不发;restore 之后仍不自动放行,操作员 `resolve retry` 后继续,接收方三条各收到一次
+
+测试(5f 完成时):单元测试 412 个(Mac 30 跳过,VM 29 跳过,跳过的都是集成测试);**真实 herdr 集成测试 29 个全部通过**:herdr 14、投递引擎 5、broker 子进程 2、端到端 2、生命周期(假 agent)3、真实 fnx 启动 2、**真实 fnx 生命周期 1**(fnx_dv / fnx_sw 的 spawn → stop → restore → purge,不发提示词)。临时会话与进程已清理,无 fnx 残留进程。
+
+限制:stop 用 `os.killpg` 发信号,必须与 herdr 在同一台机器上运行(本项目是虚拟机)。
+
+**阶段 5 完成。**
+
+其他:
+
 - [ ] 升级 herdr 后重跑 `review-probes/probe_herdr_errors.py`
-- [ ] `queue_seq`(每目标持久单调、原子分配;重试继承原值),改 `Router` / `Spool`
-- [ ] 队列头调度:确定失败与不确定态都暂停该目标;槽位放行记录持久化
-- [ ] 操作员命令:裁定已送达 / 重试 / 放弃并继续 / 作废裁定 / 恢复投递(命令形式与 `actor` 来源待设计,08 §10)
-- [ ] 裁定对账:`ruling_id` 幂等补做、`RULING_APPLIED`、裁定记录不可读时 fail-closed
-- [ ] 告警:不确定态 1 小时提醒、24 小时升级(暂定)
-- [ ] 观察窗口(暂定 30 秒)、状态查询退避与上限(暂定 5 次 / 300 秒),实测后定
-- [ ] 超时、去重(`msg_id`)
-- [ ] 消息状态机与审计日志(§4.6)
-- [ ] `a2a send <edge_id>` 立即返回 `msg_id`;`a2a status <msg_id>` 可查
-- [ ] 并发测试:同一目标同时收到多条,不交织
-- [ ] 行为测试:队列排序、暂停与放行、重试继承序号、恢复幂等;故障注入覆盖作废前后各副作用已持久化的崩溃点(Codex 建议)
+- [ ] 真实 `fnx_dv → fnx_sw` 端到端归入阶段 7(会调用模型,须用户同意)
 
 ## 阶段 6:pi 侧接入
 

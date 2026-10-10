@@ -653,3 +653,27 @@ def session_delete(name: str, *, herdr_bin: str = "herdr", runner: Optional[Runn
     if name == "default":
         raise ValueError("herdr 不支持删除默认会话")
     return _session_cmd(["delete", _check_target(name, "会话名")], herdr_bin=herdr_bin, runner=runner)
+
+
+_VERSION_RE = re.compile(r"\bherdr\s+v?(\d+\.\d+\.\d+\S*)")
+
+
+def herdr_version(*, herdr_bin: str = "herdr", runner: Optional[Runner] = None) -> str:
+    """返回 `herdr --version` 报告的版本号(例如 "0.9.3")。
+
+    Broker 启动时用它判断 08-protocol.md §5 的实测结论是否适用于当前 herdr。
+    """
+    argv = [herdr_bin, "--version"]
+    run = runner or _default_runner
+    try:
+        proc = run(argv, DEFAULT_TIMEOUT_S)
+    except FileNotFoundError as exc:
+        raise HerdrBinaryNotFound(f"找不到 herdr 可执行文件: {herdr_bin}", argv=argv) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HerdrTimeout("herdr --version 没有返回", code="client_timeout", argv=argv) from exc
+    text = (proc.stdout or "") + (proc.stderr or "")
+    match = _VERSION_RE.search(text)
+    if proc.returncode != 0 or match is None:
+        raise HerdrError(f"无法解析 herdr 版本: {text.strip()[:200]}", argv=argv, returncode=proc.returncode,
+                         stdout=proc.stdout or "", stderr=proc.stderr or "")
+    return match.group(1)

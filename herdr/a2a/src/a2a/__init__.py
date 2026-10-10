@@ -1,7 +1,7 @@
 """a2a: 基于 herdr 的多智能体编排框架。
 
 当前有:herdr 调用层(HerdrClient)、启动命令构造(launcher)、拓扑(含动态修改和热加载)、
-身份与注册表。路由、broker 等后续按 herdr/claude/04-design-python-framework.md 逐层添加。
+身份与注册表、Router、持久队列与审计日志、投递引擎、Broker、操作员裁定、agent 生命周期、命令行 `a2a`。
 """
 from .errors import (
     HerdrAgentBlocked,
@@ -11,6 +11,7 @@ from .errors import (
     HerdrError,
     HerdrInvalidAgentName,
     HerdrNotFound,
+    HerdrPromptFailed,
     HerdrPromptStalled,
     HerdrServerNotRunning,
     HerdrTimeout,
@@ -24,6 +25,7 @@ from .herdr_client import (
     HerdrClient,
     session_delete,
     session_list,
+    herdr_version,
     session_stop,
 )
 from .identity import (
@@ -56,8 +58,13 @@ from .registry import (
     RegistryError,
     RuntimeAddressConflictError,
 )
+from .broker import Broker, BrokerAlreadyRunning
+from .delivery import DeliveryEngine
+from .lifecycle import Lifecycle, LifecycleError
+from .policy import BrokerConfig, VERIFIED_HERDR_VERSIONS, classify_prompt_result, semantics_verified
 from .router import Router, SendReceipt, SendRejected, session_from_env
-from .spool import IllegalTransitionError, InvalidIdError, MessageNotFoundError, Spool, SpoolError
+from .spool import (IllegalTransitionError, InvalidIdError, MessageNotFoundError, QueueHead, QueueStateError,
+                    SlotError, Spool, SpoolError)
 from .topology import Edge, RoleSpec, Topology, TopologyError, TopologyStore
 
 __all__ = [
@@ -91,6 +98,9 @@ __all__ = [
     "SendRejected",
     "Spool",
     "SpoolError",
+    "QueueHead",
+    "QueueStateError",
+    "SlotError",
     "can_transition",
     "default_audit_path",
     "default_registry_path",
@@ -112,7 +122,18 @@ __all__ = [
     "HerdrError",
     "HerdrInvalidAgentName",
     "HerdrNotFound",
+    "HerdrPromptFailed",
     "HerdrPromptStalled",
+    "BrokerConfig",
+    "DeliveryEngine",
+    "Lifecycle",
+    "LifecycleError",
+    "Broker",
+    "BrokerAlreadyRunning",
+    "VERIFIED_HERDR_VERSIONS",
+    "classify_prompt_result",
+    "semantics_verified",
+    "herdr_version",
     "HerdrServerNotRunning",
     "HerdrTimeout",
     "HerdrUsageError",

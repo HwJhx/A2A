@@ -70,6 +70,7 @@ class SendReceipt:
     text: str
     state: str
     topology_revision: str
+    queue_seq: int
 
 
 def session_from_env(env: Mapping[str, str]) -> str:
@@ -187,13 +188,14 @@ class Router:
             project_id=sender.project_id, ip_id=sender.ip_id, session=session, text=text,
             state=QUEUED, topology_revision=revision, attempts=0, detail="", updated_at=now_iso(),
         )
-        self.spool.enqueue(message)
+        stored = self.spool.enqueue(message)
         self.audit.record({
             "msg_id": msg_id, "edge_id": edge_id, "src": message.src, "dst": message.dst,
             "state": QUEUED, "detail": "鉴权通过,已入队", "session": session,
-            "topology_revision": revision,
+            "topology_revision": revision, "queue_seq": stored.queue_seq,
         })
-        return SendReceipt(msg_id, edge_id, message.src, message.dst, text, QUEUED, revision)
+        return SendReceipt(msg_id, edge_id, message.src, message.dst, text, QUEUED, revision,
+                           stored.queue_seq)
 
     def _check_text(self, text: str) -> Optional[str]:
         if not text.strip():

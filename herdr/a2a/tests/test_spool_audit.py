@@ -40,19 +40,19 @@ class SpoolTests(unittest.TestCase):
         self.assertEqual(self.spool.pending("sw_gpio"), [])
         self.assertEqual(self.spool.pending_targets(), ["sw_uart"])
 
-    def test_message_ids_sort_in_creation_order(self):
+    def test_message_ids_are_unique(self):
         ids = [new_msg_id() for _ in range(200)]
-        self.assertEqual(ids, sorted(ids))
         self.assertEqual(len(set(ids)), 200)
 
-    def test_pending_is_fifo_by_msg_id_across_targets_files(self):
+    def test_pending_is_fifo_by_queue_seq(self):
         messages = [self.spool.enqueue(make_message()) for _ in range(10)]
+        self.assertEqual([m.queue_seq for m in messages], list(range(1, 11)))
         self.assertEqual([m.msg_id for m in self.spool.pending("sw_uart")], [m.msg_id for m in messages])
 
     def test_duplicate_id_and_terminal_state_rejected(self):
         m = self.spool.enqueue(make_message())
-        with self.assertRaises(SpoolError):
-            self.spool.enqueue(m)
+        with self.assertRaisesRegex(SpoolError, "已存在"):
+            self.spool.enqueue(make_message(msg_id=m.msg_id))
         with self.assertRaises(SpoolError):
             self.spool.enqueue(make_message(state=DELIVERED))
 
@@ -134,9 +134,9 @@ class SpoolTests(unittest.TestCase):
         self.assertEqual(self.spool.pending_targets(), [])
         self.assertEqual(self.spool.get(m.msg_id).state, DELIVERED)
         # recover() 清理残留,且幂等
-        self.assertEqual(self.spool.recover(), {"removed_duplicate_pending": 1, "removed_temp_files": 0})
+        self.assertEqual(self.spool.recover(), {"removed_duplicate_pending": 1, "removed_temp_files": 0, "removed_stale_slot_records": 0})
         self.assertFalse(stale.exists())
-        self.assertEqual(self.spool.recover(), {"removed_duplicate_pending": 0, "removed_temp_files": 0})
+        self.assertEqual(self.spool.recover(), {"removed_duplicate_pending": 0, "removed_temp_files": 0, "removed_stale_slot_records": 0})
         self.assertEqual(self.spool.get(m.msg_id).state, DELIVERED)
 
     def test_recover_removes_temp_files_but_keeps_real_pending_messages(self):
@@ -144,7 +144,7 @@ class SpoolTests(unittest.TestCase):
         (self.root / "pending" / "sw_uart" / "leftover.json.tmp").write_text("x", encoding="utf-8")
         (self.root / "done").mkdir(exist_ok=True)
         (self.root / "done" / "leftover.json.tmp").write_text("x", encoding="utf-8")
-        self.assertEqual(self.spool.recover(), {"removed_duplicate_pending": 0, "removed_temp_files": 2})
+        self.assertEqual(self.spool.recover(), {"removed_duplicate_pending": 0, "removed_temp_files": 2, "removed_stale_slot_records": 0})
         self.assertEqual(self.spool.pending("sw_uart"), [keep])
 
     def test_recover_ignores_an_unreadable_done_file(self):
