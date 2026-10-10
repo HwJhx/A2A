@@ -46,6 +46,14 @@ a2a spool repair <incident_id> --reason "从备份恢复" --verification "消息
 
 `send_prompt(wait=True)` 必须指定 `timeout_ms`。如果收到 `HerdrPromptOutcomeUnknown`（包括 Herdr 的 `agent_prompt_stalled` 和调用进程超时），prompt 可能已经送达；先检查目标 agent，再决定后续动作，不能直接重试。
 
+## Pi 扩展与真实 fnx 链路
+
+`pi-extension/a2a.ts` 注册 `a2a_send(edge_id)`，通过 `execFile` 调用 `python -m a2a_codex.cli send <edge_id>`，不经 shell；消息仍由 Router 校验身份、授权边并渲染拓扑模板。启动 agent 的 pane 需继承 `A2A_PROJECT_ID`、`A2A_ROLE`、`A2A_IP`、`A2A_STATE_DIR`、`A2A_TOPOLOGY`、`A2A_PYTHON`、`A2A_SRC` 和 Herdr 注入的 `HERDR_PANE_ID` / `HERDR_SESSION`。扩展加载时调用只读 `a2a edges` 生成可选边说明；该命令不替代 `send` 的 Registry 身份校验。
+
+插件把只有退出码 4 且带 Router 拒绝 JSON 的结果报告为确定拒绝；其它错误或不完整回执均按结果未知处理，返回普通工具结果并明确要求不重试、交由操作员核查。它降低模型把发送当作失败而重试的风险，但不是消息级幂等保证。
+
+阶段 7 的真实模型测试必须显式设置 `A2A_STAGE7_MODEL=1`，并使用隔离 Herdr session、临时拓扑/状态目录、临时工作目录、`--no-builtin-tools` 和仅含测试约束的固定模板。测试临时安装扩展后会恢复原文件；它不执行真实 UVM、驱动或 HAL 工作。
+
 Herdr 的删除语义是 `close`，所以 `delete_workspace/tab/pane` 分别封装为对应的 `close` 命令；创建 pane 使用 `pane split`。`start_agent` 使用 `pane run`，这是为了支持 fnx 的 `exec -a pi` 启动方式，而不是使用 `herdr agent start --kind pi`。
 
 ## 拓扑、身份与 Registry

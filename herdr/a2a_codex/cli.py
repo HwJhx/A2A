@@ -17,10 +17,12 @@ from .broker import DeliveryBroker
 from .herdr_client import HerdrClient
 from .messages import DELIVERY_UNCERTAIN, DELIVERED, TERMINAL_STATES
 from .registry import Registry
-from .router import Router, session_from_env
+from .router import Router, SendRejected, session_from_env
 from .runtime import BrokerRuntime
 from .spool import Spool
 from .topology import TopologyStore
+
+EXIT_REJECTED = 4
 
 
 def _topology_path(value: str | None) -> Path:
@@ -94,6 +96,8 @@ def _parser() -> argparse.ArgumentParser:
     wait.add_argument("--until", action="append")
     wait.add_argument("--timeout-ms", type=int)
 
+    edges = sub.add_parser("edges", help="列出当前角色可用的固定消息边（工具说明用）")
+
     run = sub.add_parser("broker", help="Broker 管理")
     run_sub = run.add_subparsers(dest="broker_command", required=True)
     run_sub.add_parser("run", help="启动常驻 Broker")
@@ -159,10 +163,32 @@ def main(argv: list[str] | None = None) -> int:
             _json(value.raw)
             return 0
 
+        if args.command == "edges":
+            topology = TopologyStore(_topology_path(args.topology)).current
+            role = os.environ.get("A2A_ROLE")
+            ip_id = os.environ.get("A2A_IP")
+            if (os.environ.get("A2A_PROJECT_ID") != topology.project_id or
+                    role not in topology.roles or ip_id not in topology.ips):
+                raise ValueError("A2A_PROJECT_ID / A2A_ROLE / A2A_IP 与当前拓扑不匹配")
+            available = [
+                {"edge_id": edge.edge_id,
+                 "dst": f"{edge.target_role}_{ip_id}",
+                 "text": edge.template.format(ip=ip_id)}
+                for edge in topology.edges.values()
+                if edge.source_role == role and topology.has_node(edge.target_role, ip_id)
+            ]
+            _json({"edges": available})
+            return 0
+
         spool, audit = _state_components()
         if args.command == "send":
             router = _router(args, spool, audit)
-            receipt = router.send(args.edge_id)
+            try:
+                receipt = router.send(args.edge_id)
+            except SendRejected as exc:
+                print(json.dumps({"rejected": exc.code, "reason": exc.reason, "msg_id": exc.msg_id},
+                                 ensure_ascii=False), file=sys.stderr)
+                return EXIT_REJECTED
             _json(asdict(receipt))
             return 0
         if args.command == "status":

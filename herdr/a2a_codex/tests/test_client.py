@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import subprocess
+import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -23,7 +24,7 @@ from a2a_codex.errors import (
 )
 from a2a_codex.launcher import build_launch_command
 from a2a_codex.messages import Message
-from a2a_codex.router import SendReceipt
+from a2a_codex.router import SendReceipt, SendRejected
 
 
 def response(result: Any) -> subprocess.CompletedProcess[str]:
@@ -164,6 +165,28 @@ class TestCli(unittest.TestCase):
             self.assertEqual(cli_module.main(["wait-agent", "w1:p1", "--until", "idle"]), 0)
         self.assertEqual(captured["until"], ["idle"])
 
+    def test_edges_lists_only_same_role_fixed_edges_for_tool_discovery(self) -> None:
+        topology = {
+            "version": 1, "project_id": "soc_a", "roles": {"dv": {}, "sw": {}},
+            "ips": ["uart"],
+            "edges": [
+                {"id": "dv_done", "from": "dv", "to": "sw", "template": "{ip} test"},
+                {"id": "sw_back", "from": "sw", "to": "dv", "template": "back {ip}"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "topology.yaml"
+            import yaml
+            path.write_text(yaml.safe_dump(topology, allow_unicode=True), encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch.dict("os.environ", {
+                "A2A_PROJECT_ID": "soc_a", "A2A_ROLE": "dv", "A2A_IP": "uart",
+            }, clear=False), redirect_stdout(output):
+                self.assertEqual(cli_module.main(["--topology", str(path), "edges"]), 0)
+            self.assertEqual(json.loads(output.getvalue()), {"edges": [
+                {"edge_id": "dv_done", "dst": "sw_uart", "text": "uart test"},
+            ]})
+
     def test_free_text_send_prompt_is_not_an_agent_cli_command(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             cli_module.main(["send-prompt", "w1:p1", "arbitrary text"])
@@ -192,6 +215,17 @@ class TestCli(unittest.TestCase):
             "msg_id": receipt.msg_id, "edge_id": receipt.edge_id,
             "src": receipt.src, "dst": receipt.dst, "text": receipt.text,
             "state": receipt.state, "topology_revision": receipt.topology_revision,
+        })
+
+    def test_send_rejection_has_explicit_machine_readable_exit_code(self) -> None:
+        router = mock.Mock()
+        router.send.side_effect = SendRejected("identity", "pane identity mismatch", msg_id="m1")
+        stderr = io.StringIO()
+        with mock.patch.object(cli_module, "_state_components", return_value=(object(), object())), \
+                mock.patch.object(cli_module, "_router", return_value=router), redirect_stderr(stderr):
+            self.assertEqual(cli_module.main(["send", "dv_done"]), cli_module.EXIT_REJECTED)
+        self.assertEqual(json.loads(stderr.getvalue()), {
+            "rejected": "identity", "reason": "pane identity mismatch", "msg_id": "m1",
         })
 
     def test_status_and_queue_print_message_and_queue_state(self) -> None:
