@@ -324,7 +324,7 @@ pi 侧接入(不调用模型):
 - [x] 模型证据:两边 TUI 状态栏 `(SophNet) DeepSeek-Flash`;fnx 会话文件每条 assistant 消息记录 provider=sophnet、model=DeepSeek-Flash 和 token 用量
 - [x] 临时工作目录保持为空
 - [ ] 观察:两边调用 `a2a_send` 后都多输出了一段"已发送"总结,不影响通信;正式使用时可在模板里加约束
-- [ ] `sw_test_fail` 未被真实模型覆盖(该边的鉴权、填模板、投递由不调用模型的测试覆盖);是否补跑由用户决定
+- [x] `sw_test_fail` 用真实模型补跑(用户要求,会话 `a2a_s6b`,状态目录 `~/a2a_stage6_run2`)✅ 为了确定性地走到这条边,本轮用 `a2a topology set-template` 把 `dv_done` 的结尾改为"直接用 a2a_send 回复测试失败"(只改这一轮的拓扑,有 `TOPOLOGY_CHANGED` 审计)。fnx_sw 调 `a2a_send(sw_test_fail)`,fnx_dv 回复"收到";审计两次投递各一次,文字逐字一致,约 3 秒;工作目录为空;fnx 会话文件记录 sophnet / DeepSeek-Flash。插件为修复后的版本
 - [ ] 正式使用:让 `fnx_sw` 收到固定句式后真的开始驱动与 HAL 开发、让 `fnx_dv` 在 UVM 验证完成时调用 `a2a_send(dv_done)`(模板换成真实工作指令)
 
 ### 阶段 6 审核修复(Codex 审核未提交的阶段 6)
@@ -341,7 +341,15 @@ pi 侧接入(不调用模型):
 ## 阶段 7:全链路
 
 - [x] 跑通 `dv_uart` → `sw_uart`(已在阶段 6 用真实模型跑通双向)
-- [ ] 回退通信(如验证 → RTL)按拓扑配置跑通
+- [x] 测试方案 `12-stage7-rollback-plan.md`,经 Codex 审核两轮(1 阻断 + 5 应修已改)✅ 用户决定:spec / arch / rtl 暂不安装,用假 agent;回退边 `dv_bug`(dv → rtl)、`rtl_fixed`(rtl → dv)
+- [x] 假 agent 新增 `script:<边>,...` 模式 ✅ 由 spawn 启动,第 n 次输入执行 `a2a send <第 n 条边>`(用注入的 `A2A_PYTHON` / `A2A_SRC`,与插件一致);可选同步屏障;发送结果写进单独的 events 文件
+- [x] 不调用模型的回退与多 IP 集成测试(真实 herdr)✅ `tests/test_integration_rollback.py` 5 个:回退闭环 dv → rtl → dv(sw 未收到);多条出边不串;uart / gpio 用屏障同时发送,各自只到本 IP;**入队后目标消失**:rtl_gpio 停止后 gpio 队列 TARGET_MISSING 暂停,uart 照常送达;**入队前拒绝**:目标未 spawn(`target_missing`)/ 已停止(`target_not_running`)不入队。按精确内容和次数核对接收日志。变异检查:目标 IP 固定为 uart → 并发隔离用例失败;目标角色固定为 sw → 闭环、多出边用例失败
+- [x] 回退通信的真实模型链路(用户同意,会话 `a2a_s7`,状态目录 `~/a2a_stage7_run`)✅ dv、sw = 真实 fnx(用户要求 sw 也用真实的),rtl = 假 agent(`script:rtl_fixed`)。fnx_dv 在 `dv_done` / `dv_bug` 中选了 `dv_bug` → rtl_uart;假 rtl 自动回 `rtl_fixed`,此时 fnx_dv 仍在输出总结,broker 记 `WAITING_TARGET`,等它空闲后才投递;fnx_dv 回复"收到。"。审计两次投递各一次,文字逐字一致,约 2 秒;sw_uart 没有任何消息,fnx_sw 会话目录为空(模型未被调用);工作目录为空;fnx_dv 会话文件记录 sophnet / DeepSeek-Flash,调用参数 `{'edge_id': 'dv_bug'}`
+
+测试:Mac 单元 450 个通过(跳过 37:36 个集成 + 1 个需本机 fnx);VM 全套 450 个通过、跳过 14 个(插件单元测试,VM 无 node),其中**真实 herdr 集成测试 36 个全部通过**(新增回退 5 个)。
+
+- [x] 审核修复(Codex 应修:"没收到"只靠再等 1 秒,晚到的多余消息可能漏判)✅ 每个用例加队列侧证据:先等所有运行中的 agent 回到 idle、队列无待处理消息,再核对入队记录恰好是预期的(边, 发送方, 目标)、每条最多送达一次。变异检查:假 rtl 3 秒后重复发送 → 闭环用例失败
+- [x] 回退通信(如验证 → RTL)按拓扑配置跑通 ✅ 不调用模型的 5 个集成测试 + 真实模型链路
 - [x] 审计日志里能看到完整一次链路(阶段 6 真实链路)
 
 ## 阶段 8:规模化
