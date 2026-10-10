@@ -83,12 +83,16 @@ class TestStage7RealFnx(unittest.TestCase):
         self._install_extension("fnx_dv")
         self._install_extension("fnx_sw")
 
-        # Capture the two real Pi transcript directories before launching agents.
-        # Non-empty transcripts are intentionally retained as model-call evidence.
+        # Pi stores transcripts under a cwd-derived directory. Each test uses a
+        # unique temporary cwd, so these directories must be new and isolated
+        # from any other fnx sessions on the VM.
         self.session_dirs = {
-            "dv": Path.home() / ".forenyx/fnx_dv/agent/sessions",
-            "sw": Path.home() / ".forenyx/fnx_sw/agent/sessions",
+            "dv": self._session_dir_for_cwd("fnx_dv", self.cwd_dv),
+            "sw": self._session_dir_for_cwd("fnx_sw", self.cwd_sw),
         }
+        for role, directory in self.session_dirs.items():
+            self.assertFalse(directory.exists(),
+                             f"{role} 临时 cwd 对应的 Pi session 目录应为本次新建: {directory}")
         self.session_files_before = {
             role: self._snapshot_session_files(directory)
             for role, directory in self.session_dirs.items()
@@ -173,6 +177,12 @@ class TestStage7RealFnx(unittest.TestCase):
     def _close_workspace(self) -> None:
         if getattr(self, "workspace", None) and self.workspace.workspace_id:
             self.client.delete_workspace(self.workspace.workspace_id)
+
+    @staticmethod
+    def _session_dir_for_cwd(agent: str, cwd: Path) -> Path:
+        encoded_cwd = str(cwd.resolve()).strip("/").replace("/", "-")
+        return (Path.home() / ".forenyx" / agent / "agent" / "sessions"
+                / f"--{encoded_cwd}--")
 
     @staticmethod
     def _snapshot_session_files(directory: Path) -> dict[Path, tuple[int, int]]:
@@ -288,9 +298,12 @@ class TestStage7RealFnx(unittest.TestCase):
         )
         self.client.send_prompt(self.dv_name, prompt, wait=True, timeout_ms=240000)
 
-        messages = self.spool.pending("sw_uart") + [m for m in self.spool.done() if m.dst == "sw_uart"]
-        self.assertEqual(len(messages), 1, "预期只入队一次: %r" % messages)
-        message = messages[0]
+        expected_messages = self.spool.pending("sw_uart") + [
+            message for message in self.spool.done() if message.dst == "sw_uart"
+        ]
+        self.assertEqual(len(expected_messages), 1,
+                         "预期 sw_uart 只入队一次: %r" % expected_messages)
+        message = expected_messages[0]
         self.assertEqual(message.edge_id, "dv_done")
         expected = TEST_TEMPLATE.format(ip="uart")
         self.assertEqual(message.text, expected)
@@ -322,11 +335,13 @@ class TestStage7RealFnx(unittest.TestCase):
                         "DV Pi transcript 必须证明模型实际调用了 a2a_send")
         self.assertTrue(any("收到" in self._message_text(message) for message in sw_assistant),
                         "SW Pi transcript 必须有模板之后由 assistant 生成的收到回复")
-        for role, messages in (("dv", dv_assistant), ("sw", sw_assistant)):
-            model_messages = [message for message in messages
+        for role, assistant_messages in (("dv", dv_assistant), ("sw", sw_assistant)):
+            model_messages = [message for message in assistant_messages
                               if message.get("provider") and message.get("model")]
             self.assertTrue(model_messages, f"{role} Pi transcript 应记录 provider/model")
-        self.assertEqual(len(messages), 1, "整个 Spool 中应只有本次预期的一条 A2A 消息")
+        all_spool_messages = self.spool.pending() + self.spool.done()
+        self.assertEqual(len(all_spool_messages), 1,
+                         "整个 Spool 中应只有本次预期的一条 A2A 消息: %r" % all_spool_messages)
         self.assertEqual(list(self.cwd_dv.iterdir()), [], "DV 临时工作目录不应有文件")
         self.assertEqual(list(self.cwd_sw.iterdir()), [], "SW 临时工作目录不应有文件")
 
