@@ -289,9 +289,10 @@
 - [x] 裁定后的自动放行与裁定关联(Codex 复核应修 1)✅ 消息被裁定为已送达后由 broker 自动放行时,`release` 与 `QUEUE_RELEASED` 带该 ruling_id(查审计确认是"已送达"裁定;来自更早"未送达,重试"裁定的不算);运行中裁定遇到"已放行"不再另记,只有启动恢复时补记崩溃丢失的放行审计
 - [x] 裁定跨进程串行(Codex 复核应修 2)✅ `rulings.lock`(状态目录下 rulings.lock):`a2a resolve` 的 检查 → 落盘 → 生效、`a2a ruling void`、broker 启动补做共用一把全局锁;并发测试用两个真实进程裁定同一队列头,只有一个落盘
 - [x] broker 自动放行遇到"已放行"不再写审计(Codex 第二次复核应修)✅ 裁定线程先放行时,broker 的 release 得到 already_released,直接继续;谁实际放行谁写审计(裁定侧与 broker 侧一致)。测试在 broker 读到队列头之后、放行之前插入裁定
+- [x] broker 优雅停机(审核 Codex 阶段 6 时发现我方同类问题)✅ SIGTERM/SIGINT 后等投递线程收尾:等待目标空闲分段进行(每段 ≤2 秒)、退避等待可被打断,收到停机时消息保持原状态返回;已调用 prompt 的等它返回并分类完再退出(上限 观察窗口+30 秒);systemd 模板加 `KillMode=mixed`、`TimeoutStopSec=90`。测试:单元"等待中停机"、VM"prompt 进行中收到 SIGTERM → DELIVERED 且只写入一次"
 - [ ] 将来考虑:stop 在"核对 agent 名字"与 killpg 之间仍有极短的进程替换窗口,可评估进程身份快照校验(如核对 pid 与启动时间)
 
-测试:单元测试 423 个(Mac 30 跳过,都是集成测试);VM 全套 423 个通过、0 跳过,其中**真实 herdr 集成测试 29 个全部通过**(含真实 fnx 3 个,不发提示词)。
+测试:单元测试 425 个(Mac 31 跳过,都是集成测试);VM 全套 425 个通过、0 跳过,其中**真实 herdr 集成测试 30 个全部通过**(含真实 fnx 3 个,不发提示词)。
 
 其他:
 

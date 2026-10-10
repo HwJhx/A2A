@@ -23,7 +23,10 @@ Restart=on-failure
 RestartSec=5
 # 停止时发 SIGTERM,broker 结束当前一步后退出;被强杀时停在 DISPATCHING 的消息会在下次启动时转为 DELIVERY_UNCERTAIN
 KillSignal=SIGTERM
-TimeoutStopSec=60
+# 只把 SIGTERM 发给 broker 主进程,不发给它正在运行的 `herdr agent prompt` 子进程,
+# 否则这次调用的结果会变得不确定;超时后仍由 SIGKILL 清理整个控制组
+KillMode=mixed
+TimeoutStopSec=90
 
 [Install]
 WantedBy=default.target

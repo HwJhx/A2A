@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -17,8 +18,8 @@ from a2a.audit import AuditLog
 from a2a.broker import Broker, BrokerAlreadyRunning
 from a2a.errors import HerdrAgentBlocked, HerdrNotFound, HerdrPromptFailed
 from a2a.identity import AgentIdentity
-from a2a.messages import (DELIVERED, DELIVERY_UNCERTAIN, DISPATCHING, QUEUED, TARGET_BLOCKED, Message,
-                          new_msg_id, now_iso)
+from a2a.messages import (DELIVERED, DELIVERY_UNCERTAIN, DISPATCHING, QUEUED, TARGET_BLOCKED, WAITING_TARGET,
+                          Message, new_msg_id, now_iso)
 from a2a.policy import BrokerConfig
 from a2a.registry import Registry
 from a2a.spool import Spool
@@ -184,6 +185,52 @@ class Threaded(Base):
             thread.join(timeout=10)
         self.assertEqual([t for d, t in self.herdr.prompts if d == "sw_uart"], ["u0", "u1", "u2"])
         self.assertEqual([t for d, t in self.herdr.prompts if d == "sw_gpio"], ["g0", "g1", "g2"])
+
+
+class BlockingWaitHerdr(StatefulHerdr):
+    """agent_wait 像真实 herdr 一样阻塞到超时(或测试结束时被放开),而不是立即返回。"""
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.waiting = threading.Event()
+
+    def agent_wait(self, target, *, until=None, timeout_ms=None):
+        self.waiting.set()
+        self.release.wait((timeout_ms or 0) / 1000)
+        return self.agent_get(target)
+
+
+class GracefulStop(Base):
+    def test_stop_while_waiting_for_a_busy_target_returns_promptly_and_keeps_the_message(self):
+        # 目标一直 working,worker 在等它空闲(默认最多 300 秒)。停机要能打断这段等待:
+        # run_forever 返回时 worker 已经结束,消息保持 WAITING_TARGET,不因停机变成 TIMEOUT,也没有发 prompt
+        herdr = BlockingWaitHerdr()
+        herdr.add("sw_uart", "w1:p2", status="working")
+
+        def finish_leftover_worker():
+            # 用例失败时投递线程可能还在等;让目标空闲、放开等待,等它投完再清理临时目录
+            herdr.status["sw_uart"] = "idle"
+            herdr.release.set()
+            for t in threading.enumerate():
+                if t.name.startswith("a2a-"):
+                    t.join(timeout=10)
+        self.addCleanup(finish_leftover_worker)
+        m = self.send()
+        broker = Broker(spool=self.spool, registry=self.registry, audit=self.audit, client=herdr,
+                        session=SESSION, state_dir=self.dir, semantics_verified=True,
+                        config=BrokerConfig(scan_interval_s=0.05))
+        runner = threading.Thread(target=broker.run_forever)
+        runner.start()
+        self.assertTrue(herdr.waiting.wait(10))
+        self.assertEqual(self.spool.get(m.msg_id).state, WAITING_TARGET)
+        broker.stop_event.set()
+        runner.join(timeout=5)
+        self.assertFalse(runner.is_alive(), "run_forever 没有在 5 秒内返回")
+        workers = [t.name for t in threading.enumerate() if t.name.startswith("a2a-") and t.is_alive()]
+        self.assertEqual(workers, [], "run_forever 返回时投递线程还在运行")
+        self.assertEqual(self.spool.get(m.msg_id).state, WAITING_TARGET)
+        self.assertEqual(herdr.prompts, [])
 
 
 class StartupRecovery(Base):

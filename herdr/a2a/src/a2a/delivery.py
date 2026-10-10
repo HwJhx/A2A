@@ -39,6 +39,8 @@ from .spool import Spool
 
 EVIDENCE_ACCEPTED_AND_OBSERVED = "accepted_and_observed"
 _STARTABLE = (QUEUED, WAITING_TARGET, RETRYING)
+# 等目标空闲时每次 agent wait 的最长时间:分段等待,才能及时响应停机
+_WAIT_SLICE_MS = 2000
 _OBSERVED = ("working", "blocked")
 
 
@@ -72,6 +74,7 @@ class DeliveryEngine:
         semantics_verified: bool,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        stopping: Callable[[], bool] = lambda: False,
     ) -> None:
         self.spool = spool
         self.registry = registry
@@ -81,6 +84,9 @@ class DeliveryEngine:
         self.semantics_verified = semantics_verified
         self._sleep = sleep
         self._monotonic = monotonic
+        # 停机请求:在调用 prompt 之前的任何等待处收到,消息保持当前状态返回(重启后继续);
+        # 已经调用了 prompt 的,等它返回、分类完再结束,不在半途判不确定
+        self._stopping = stopping
 
     # ------------------------------------------------------------------
     def deliver(self, msg_id: str) -> Message:
@@ -122,6 +128,7 @@ class DeliveryEngine:
         failures = 0
         delays = backoff_delays(self.config.query_backoff_initial_s, self.config.query_backoff_max_s)
         while True:
+            self._stop_if_requested(message)
             if self._monotonic() >= deadline:
                 raise _Finished(self._move(message, TIMEOUT,
                                            f"等待 {message.dst} 可投递超过 {self.config.wait_ready_timeout_s:g} 秒"))
@@ -154,7 +161,7 @@ class DeliveryEngine:
             if remaining_ms <= 0:
                 continue
             try:
-                self.client.agent_wait(target, until=READY_OR_BLOCKED, timeout_ms=remaining_ms)
+                self.client.agent_wait(target, until=READY_OR_BLOCKED, timeout_ms=min(remaining_ms, _WAIT_SLICE_MS))
             except HerdrTimeout:
                 continue  # 回到循环顶部,由总时限判 TIMEOUT
             except HerdrNotFound as exc:
@@ -169,6 +176,7 @@ class DeliveryEngine:
 
     # ---- 第 3、4 步:写前标记 + 调用 herdr + 分类 --------------------------
     def _dispatch(self, message: Message, target: str, deadline: float, retry_delays: Iterator[float]) -> Message:
+        self._stop_if_requested(message)  # 写 DISPATCHING 之前最后一次检查;之后就要等 prompt 返回
         message = self._move(message, DISPATCHING, f"复核通过,向 {target} 发出 prompt", attempts=message.attempts + 1)
         error: Optional[BaseException] = None
         result: Dict[str, Any] = {}
@@ -195,7 +203,12 @@ class DeliveryEngine:
             raise _Finished(message)
         delay = min(next(retry_delays), max(0.0, deadline - self._monotonic()))
         self._sleep(delay)
+        self._stop_if_requested(message)  # RETRYING 的消息重启后照常重试
         return message  # 回到 deliver() 的循环:RETRYING -> 复核 -> ...
+
+    def _stop_if_requested(self, message: Message) -> None:
+        if self._stopping():
+            raise _Finished(message)
 
     # ---- 状态与审计 ------------------------------------------------------
     def _move(self, message: Message, state: str, detail: str, *, attempts: Optional[int] = None,

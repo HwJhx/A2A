@@ -6,6 +6,8 @@
   * 模式 work:每收到一次回车,就用 `herdr pane report-agent` 报告 working,1 秒后报告 idle,
     模拟"收到 prompt 后开始处理"。
   * 模式 silent:只记录,不报告状态(用来制造"herdr 接受了但没看到目标开始处理")。
+  * 模式 slow:同 work,但收到回车 3 秒后才报告 working(短于 herdr 的 5 秒 stall),
+    用来让 `agent prompt --wait` 在一段时间内保持进行中。
 """
 import os
 import subprocess
@@ -25,7 +27,8 @@ def report(state):
                     "--state", state], capture_output=True)
 
 
-def work_once():
+def work_once(delay=0.0):
+    time.sleep(delay)
     report("working")
     time.sleep(1.0)
     report("idle")
@@ -43,8 +46,8 @@ try:
             if not data:
                 break
             out.write(data)
-            if mode == "work" and (b"\r" in data or b"\n" in data):
-                threading.Thread(target=work_once, daemon=True).start()
+            if mode in ("work", "slow") and (b"\r" in data or b"\n" in data):
+                threading.Thread(target=work_once, args=(3.0 if mode == "slow" else 0.0,), daemon=True).start()
             if os.path.exists(log + ".stop"):
                 break
 finally:

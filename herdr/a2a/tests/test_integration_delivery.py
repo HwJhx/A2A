@@ -233,6 +233,21 @@ class RealBrokerProcess(_RealBase):
         time.sleep(0.5)
         self.assertEqual(self.log.read_bytes().count(m.text.encode()), 1)  # 已写入一次,没有重发
 
+    def test_sigterm_mid_prompt_finishes_the_delivery_before_exit(self):
+        # 日常停机(systemctl stop / restart)发 SIGTERM:正在进行的 prompt 要等它返回再退出,
+        # 不能把消息留在 DISPATCHING(重启后会变成 DELIVERY_UNCERTAIN,需要人工裁定)
+        self.start_agent("slow")  # 收到回车 3 秒后才报告 working:prompt --wait 在这段时间里保持进行中
+        m = self.enqueue("停机时正在投递 %s" % new_msg_id())
+        proc = self.broker()
+        self.assertTrue(self.wait_for(lambda: self.spool.get(m.msg_id).state == DISPATCHING, 30))
+        time.sleep(0.5)
+        proc.terminate()
+        proc.wait(timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr.read() if proc.stderr else "")
+        self.assertEqual(self.spool.get(m.msg_id).state, DELIVERED)
+        time.sleep(0.5)
+        self.assertEqual(self.log.read_bytes().count(m.text.encode()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

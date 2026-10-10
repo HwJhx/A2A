@@ -82,8 +82,12 @@ class Broker:
         self.semantics_verified = semantics_verified
         self.herdr_version = herdr_version
         self._sleep, self._monotonic, self._wall = sleep, monotonic, wall_clock
+        self.stop_event = threading.Event()
+        # 真实运行时,投递引擎里的等待用 stop_event.wait,停机时立刻醒来;测试注入的假 sleep 保持原样
+        engine_sleep = (lambda s: self.stop_event.wait(s)) if sleep is time.sleep else sleep
         self.engine = DeliveryEngine(spool, registry, audit, client, config=self.config,
-                                     semantics_verified=semantics_verified, sleep=sleep, monotonic=monotonic)
+                                     semantics_verified=semantics_verified, sleep=engine_sleep,
+                                     monotonic=monotonic, stopping=self.stop_event.is_set)
         self._lock_handle: Any = None
         self._state_lock = threading.Lock()
         self._paused: Dict[str, Tuple[int, str, str]] = {}       # dst -> (queue_seq, msg_id, state)
@@ -92,7 +96,6 @@ class Broker:
         self._foreign_warned: set = set()
         self._workers: Dict[str, threading.Thread] = {}
         self._server_down_logged = False
-        self.stop_event = threading.Event()
 
     # ---- 单实例 --------------------------------------------------------
     def acquire(self) -> None:
@@ -274,6 +277,18 @@ class Broker:
                 log.error("投递已全局停止:%s", reason)
             self.scan()
             self.stop_event.wait(self.config.scan_interval_s)
+        self._join_workers()
+
+    def _join_workers(self) -> None:
+        """停机收尾:等投递线程结束。等待中的会立刻返回;已调用 prompt 的最长等观察窗口加调用余量。
+        超时仍未结束就记日志后退出,该消息停在 DISPATCHING,下次启动按 08 §8 转不确定。"""
+        deadline = self._monotonic() + self.config.observe_window_s + 30
+        with self._state_lock:
+            workers = list(self._workers.items())
+        for dst, worker in workers:
+            worker.join(timeout=max(0.0, deadline - self._monotonic()))
+            if worker.is_alive():
+                log.error("停机时目标 %s 的投递还没结束,直接退出;正在投递的消息下次启动会转为 DELIVERY_UNCERTAIN", dst)
 
     def _server_up(self) -> bool:
         checker = getattr(self.client, "is_server_running", None)
