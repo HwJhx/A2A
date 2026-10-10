@@ -12,6 +12,9 @@
     进程里执行 `a2a send <边>`(用 spawn 注入的 A2A_PYTHON、A2A_SRC,和 pi 插件一样),是 `-` 或超出列表
     就只记录;然后报告 idle。按顺序逐次处理。发送结果写进 <日志>.events(JSON Lines),不混进收到的文字。
     设了环境变量 FAKE_BARRIER(文件路径)时,发送前先在 events 里记 barrier_wait,等该文件出现再发。
+  * 模式 burst:<边>(阶段 8 压测):每收到一行输入,取其中的数字 k(没有数字时为 1),报告 working,
+    (有屏障时先等屏障)串行执行 k 次 `a2a send <边>`,每次成功后在 events 里记单调时钟时间 t 和 msg_id;
+    然后报告 idle。按顺序逐行处理。
 """
 import json
 import os
@@ -69,7 +72,41 @@ def script_worker(edges, inputs):
         report("idle")
 
 
+def burst_worker(edge, inputs):
+    n = 0
+    env = dict(os.environ, PYTHONPATH=os.environ.get("A2A_SRC", ""), PYTHONDONTWRITEBYTECODE="1")
+    while True:
+        line = inputs.get()
+        n += 1
+        # 粘贴括号 ESC[200~ / ESC[201~ 里也有数字,先去掉
+        line = line.replace("\x1b[200~", "").replace("\x1b[201~", "")
+        digits = "".join(ch for ch in line if ch.isdigit())
+        count = int(digits) if digits else 1
+        report("working")
+        barrier = os.environ.get("FAKE_BARRIER")
+        if barrier:
+            event({"n": n, "barrier_wait": edge})
+            while not os.path.exists(barrier):
+                time.sleep(0.02)
+        for k in range(count):
+            proc = subprocess.run([os.environ["A2A_PYTHON"], "-m", "a2a.cli", "send", edge], env=env,
+                                  capture_output=True, text=True, timeout=60)
+            t = time.monotonic()
+            msg_id = None
+            if proc.returncode == 0:
+                try:
+                    msg_id = json.loads(proc.stdout)["msg_id"]
+                except (ValueError, KeyError):
+                    pass
+            event({"n": n, "k": k, "edge": edge, "rc": proc.returncode, "msg_id": msg_id, "t": t,
+                   "stderr": proc.stderr[-500:]})
+        report("idle")
+
+
 inputs = queue.Queue()
+line_buffer = bytearray()
+if mode.startswith("burst:"):
+    threading.Thread(target=burst_worker, args=(mode[len("burst:"):], inputs), daemon=True).start()
 if mode.startswith("script:"):
     threading.Thread(target=script_worker, args=(mode[len("script:"):].split(","), inputs), daemon=True).start()
 
@@ -88,6 +125,14 @@ try:
             if mode.startswith("script:"):
                 for _ in range(data.count(b"\r") or data.count(b"\n")):
                     inputs.put(None)
+            if mode.startswith("burst:"):
+                for byte in data:
+                    if byte in (13, 10):
+                        if line_buffer:
+                            inputs.put(line_buffer.decode("utf-8", "replace"))
+                            line_buffer.clear()
+                    else:
+                        line_buffer.append(byte)
             if mode in ("work", "slow") and (b"\r" in data or b"\n" in data):
                 threading.Thread(target=work_once, args=(3.0 if mode == "slow" else 0.0,), daemon=True).start()
             if os.path.exists(log + ".stop"):

@@ -9,6 +9,8 @@
 - `~/.forenyx/fnx_dv/agent/extensions/a2a.ts`
 - `~/.forenyx/fnx_sw/agent/extensions/a2a.ts`
 
+(2026-10-10 更新:为避免与 Codex 实现的同名工具冲突,已不再常驻安装;只在测试或真实运行时临时复制进去,结束后还原。)
+
 每个 agent 看到的工具不一样，比如 dv 只能选 `dv_done`，sw 能选 `sw_test_pass` 和 `sw_test_fail`。这个差别不是插件代码造成的，而是运行时决定的：
 
 1. `a2a agent spawn` 启动 agent 时，往它的 pane 里注入环境变量：`A2A_PROJECT_ID`、`A2A_ROLE`（如 `sw`）、`A2A_IP`（如 `uart`）、`A2A_STATE_DIR`、`A2A_TOPOLOGY`、`A2A_PYTHON`、`A2A_SRC`。
