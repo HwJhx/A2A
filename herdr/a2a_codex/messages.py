@@ -78,6 +78,10 @@ class Message:
     updated_at: str = ""
     queue_seq: int | None = None
     retry_of: str | None = None
+    # Last operator ruling durably applied to this message, including subsequent state cycles.
+    ruling_id: str | None = None
+    # Unique state-cycle key for audit, pause, and reminder de-duplication.
+    transition_id: str | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

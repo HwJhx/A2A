@@ -18,6 +18,7 @@ from .models import Agent, ResourceRef, agent_model, resource_ref
 
 Runner = Callable[[Sequence[str], Optional[float]], subprocess.CompletedProcess[str]]
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_VERSION = re.compile(r"\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b")
 _STATUSES = {"idle", "working", "blocked", "done", "unknown"}
 
 
@@ -42,6 +43,17 @@ class HerdrClient:
         if self.session:
             prefix += ["--session", self.session]
         return prefix + [str(x) for x in args]
+
+    def version(self) -> Optional[str]:
+        """读取本机 Herdr 版本；无法确认时返回 None，由错误分类按未知版本 fail-closed。"""
+        try:
+            proc = self._runner([self.herdr_bin, "--version"], self.timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        match = _VERSION.search((proc.stdout or "") + "\n" + (proc.stderr or ""))
+        return match.group(1) if match else None
 
     def _execute(self, args: Sequence[object], *, timeout: Optional[float] = None) -> subprocess.CompletedProcess[str]:
         argv = self._argv(*args)

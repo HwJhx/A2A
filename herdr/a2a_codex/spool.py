@@ -42,6 +42,10 @@ class MessageNotFoundError(SpoolError):
     pass
 
 
+class QueueSequenceGapError(SpoolError):
+    """已分配且未放行的 queue_seq 缺少消息记录，必须 fail-closed。"""
+
+
 class Spool:
     def __init__(self, root: Optional[str | Path] = None) -> None:
         try:
@@ -56,7 +60,7 @@ class Spool:
         self.dispatch_control_path = path / "dispatch-control.json"
         with exclusive_lock(self.lock_path):
             try:
-                self._recover_unlocked()
+                self._recover_unlocked(check_gaps=False)
             except SpoolCorruptionError as exc:
                 self._quarantine_unlocked(exc.path, str(exc))
                 self._halt_unlocked("Spool 数据损坏，等待操作员恢复")
@@ -66,10 +70,13 @@ class Spool:
         """显式执行启动恢复；Broker 必须在调度任何目标之前调用。"""
         with exclusive_lock(self.lock_path):
             try:
-                self._recover_unlocked()
+                self._recover_unlocked(check_gaps=True)
             except SpoolCorruptionError as exc:
                 self._quarantine_unlocked(exc.path, str(exc))
                 self._halt_unlocked("Spool 数据损坏，等待操作员恢复")
+                raise
+            except QueueSequenceGapError as exc:
+                self._halt_unlocked(str(exc))
                 raise
 
     def dispatch_control(self) -> dict:
@@ -111,8 +118,9 @@ class Spool:
                                                   "updated_at": now_iso()})
             return True
 
-    def _recover_unlocked(self) -> None:
+    def _recover_unlocked(self, *, check_gaps: bool = False) -> None:
         """清理崩溃遗留临时文件，并以合法终态归档消除 pending/done 双份。"""
+        queue_meta_was_missing = not self.queue_meta_path.exists()
         valid_done_ids = set()
         messages: list[Message] = []
         if self.done_dir.is_dir():
@@ -139,15 +147,38 @@ class Spool:
                 path.unlink(missing_ok=True)
 
         meta = self._load_queue_meta_unlocked()
+        if queue_meta_was_missing and messages:
+            raise SpoolCorruptionError(
+                self.queue_meta_path,
+                "已有消息但 queue metadata 丢失，无法证明此前哪些槽位已放行"
+            )
         minimum_next: dict[str, int] = {}
         for message in messages:
             minimum_next[message.dst] = max(minimum_next.get(message.dst, 1), message.queue_seq + 1)
+        for dst, released in meta["released"].items():
+            if released:
+                minimum_next[dst] = max(minimum_next.get(dst, 1), max(map(int, released)) + 1)
+        old_next = dict(meta["next_seq"])
         for dst, minimum in minimum_next.items():
-            if int(meta["next_seq"].get(dst, 0)) < minimum:
-                raise SpoolCorruptionError(
-                    self.queue_meta_path,
-                    f"{dst} next_seq 小于已持久化 queue_seq，拒绝重排"
-                )
+            current_next = int(meta["next_seq"].get(dst, 1))
+            if current_next < minimum:
+                # 新入队顺序先写消息、再推进 next_seq；若两步之间崩溃，
+                # 只会落后一格，可依据已持久化消息安全向前恢复且不复用序号。
+                if minimum != current_next + 1:
+                    raise SpoolCorruptionError(
+                        self.queue_meta_path,
+                        f"{dst} next_seq={current_next} 与已持久化 queue_seq={minimum - 1} 不连续"
+                    )
+                meta["next_seq"][dst] = minimum
+        if meta["next_seq"] != old_next:
+            self._save_queue_meta_unlocked(meta)
+
+        if check_gaps:
+            all_by_dst: dict[str, set[int]] = {}
+            for message in messages:
+                all_by_dst.setdefault(message.dst, set()).add(message.queue_seq)
+            for dst in set(meta["next_seq"]) | set(meta["released"]) | set(all_by_dst):
+                self._assert_sequence_integrity_unlocked(dst, all_by_dst.get(dst, set()), meta)
 
     def _pending_path(self, dst: str, msg_id: str) -> Path:
         self._validate_ids(dst, msg_id)
@@ -182,6 +213,10 @@ class Spool:
                 raise ValueError("消息缺少有效的 queue_seq；需人工迁移旧队列，不能猜测 FIFO 顺序")
             if message.retry_of is not None and not _MSG_ID.fullmatch(message.retry_of):
                 raise ValueError("retry_of 格式非法")
+            if message.ruling_id is not None and not isinstance(message.ruling_id, str):
+                raise ValueError("ruling_id 必须为字符串或 null")
+            if message.transition_id is not None and not isinstance(message.transition_id, str):
+                raise ValueError("transition_id 必须为字符串或 null")
             return message
         except (OSError, ValueError, TypeError) as exc:
             raise SpoolCorruptionError(path, str(exc)) from exc
@@ -225,7 +260,7 @@ class Spool:
                 self._load_dispatch_control_unlocked()
             else:
                 raise SpoolError(f"不支持的隔离文件类型: {kind!r}")
-            self._recover_unlocked()
+            self._recover_unlocked(check_gaps=True)
         return incident
 
     def mark_quarantine_resolved(self, incident_id: str) -> dict:
@@ -322,12 +357,20 @@ class Spool:
             if self._locate(message.msg_id) is not None:
                 raise SpoolError(f"msg_id 已存在: {message.msg_id}")
             meta = self._load_queue_meta_unlocked()
+            all_messages = self._all_messages_unlocked()
+            self._assert_sequence_integrity_unlocked(
+                message.dst,
+                {item.queue_seq for item in all_messages if item.dst == message.dst},
+                meta,
+            )
             next_seq = int(meta["next_seq"].get(message.dst, 1))
             persisted = replace(message, queue_seq=next_seq)
-            meta["next_seq"][message.dst] = next_seq + 1
-            # 序号先持久化；若后续消息写入失败，只会留下不复用的空洞。
+            # 先确保旧的 next_seq 已独立持久化，再写消息，最后推进 next_seq。
+            # 因此消息写入与推进之间崩溃时，恢复最多只需安全补进一格。
             self._save_queue_meta_unlocked(meta)
             atomic_write_text(self._pending_path(persisted.dst, persisted.msg_id), self._dump(persisted))
+            meta["next_seq"][message.dst] = next_seq + 1
+            self._save_queue_meta_unlocked(meta)
         return persisted
 
     def enqueue_retry(self, message: Message, *, original_msg_id: str) -> Message:
@@ -343,8 +386,6 @@ class Spool:
             original = self._load(original_path)
             if original.state not in TERMINAL_STATES or original.state == DELIVERED:
                 raise SpoolError("只有未放行的确定失败终态消息可创建终态重试消息")
-            if self._slot_released_unlocked(original.dst, original.queue_seq):
-                raise SpoolError("原消息槽位已放行，不能插回历史队列")
             inherited = ("edge_id", "src", "dst", "project_id", "ip_id", "session", "text",
                          "topology_revision", "queue_seq")
             if any(getattr(message, key) != getattr(original, key) for key in inherited):
@@ -352,9 +393,13 @@ class Spool:
             existing = self._locate(message.msg_id)
             if existing is not None:
                 current = self._load(existing)
-                if current != message:
+                immutable = ("msg_id", "created_at", "edge_id", "src", "dst", "project_id", "ip_id",
+                             "session", "text", "topology_revision", "queue_seq", "retry_of")
+                if any(getattr(current, key) != getattr(message, key) for key in immutable):
                     raise SpoolError("retry_msg_id 已存在但内容不匹配")
                 return current
+            if self._slot_released_unlocked(original.dst, original.queue_seq):
+                raise SpoolError("原消息槽位已放行，不能插回历史队列")
             for candidate in self._slot_messages_unlocked(original.dst, original.queue_seq):
                 if candidate.state not in TERMINAL_STATES:
                     raise SpoolError("同一 queue_seq 已有活动消息，不能并行创建重试")
@@ -362,7 +407,8 @@ class Spool:
             return message
 
     def update(self, msg_id: str, *, state: Optional[str] = None, detail: Optional[str] = None,
-               attempts: Optional[int] = None, ruling_id: Optional[str] = None) -> Message:
+               attempts: Optional[int] = None, ruling_id: Optional[str] = None,
+               transition_id: Optional[str] = None) -> Message:
         self._validate_ids("agent", msg_id)
         with exclusive_lock(self.lock_path):
             path = self._locate(msg_id)
@@ -378,7 +424,8 @@ class Spool:
             if requested_state != current.state and not can_transition(current.state, requested_state):
                 raise SpoolError(f"非法状态迁移: {current.state} -> {requested_state}")
 
-            if state is None and detail is None and attempts is None:
+            if (state is None and detail is None and attempts is None and ruling_id is None
+                    and transition_id is None):
                 return current
             changes = {"updated_at": now_iso()}
             if state is not None:
@@ -387,6 +434,10 @@ class Spool:
                 changes["detail"] = detail
             if attempts is not None:
                 changes["attempts"] = attempts
+            if ruling_id is not None:
+                changes["ruling_id"] = ruling_id
+            if transition_id is not None:
+                changes["transition_id"] = transition_id
             updated = replace(current, **changes)
             if updated.state in TERMINAL_STATES:
                 atomic_write_text(self._done_path(msg_id), self._dump(updated))
@@ -446,6 +497,12 @@ class Spool:
         """返回仍有未放行槽位的目标，包括消息已归档但暂停的目标。"""
         with exclusive_lock(self.lock_path):
             messages = self._all_messages_unlocked()
+            meta = self._load_queue_meta_unlocked()
+            by_dst: dict[str, set[int]] = {}
+            for message in messages:
+                by_dst.setdefault(message.dst, set()).add(message.queue_seq)
+            for dst in set(meta["next_seq"]) | set(meta["released"]) | set(by_dst):
+                self._assert_sequence_integrity_unlocked(dst, by_dst.get(dst, set()), meta)
             targets = {message.dst for message in messages
                        if not self._slot_released_unlocked(message.dst, message.queue_seq)}
             return sorted(targets)
@@ -454,7 +511,12 @@ class Spool:
         if not isinstance(dst, str) or not _SAFE_ID.fullmatch(dst):
             raise SpoolError("目标 agent_id 格式非法")
         with exclusive_lock(self.lock_path):
-            pending = self._slot_messages_unlocked(dst, None)
+            messages = self._all_messages_unlocked()
+            meta = self._load_queue_meta_unlocked()
+            pending = [message for message in messages if message.dst == dst]
+            self._assert_sequence_integrity_unlocked(
+                dst, {message.queue_seq for message in pending}, meta
+            )
             by_seq: dict[int, list[Message]] = {}
             for message in pending:
                 by_seq.setdefault(message.queue_seq, []).append(message)
@@ -525,6 +587,29 @@ class Spool:
     def _slot_messages_unlocked(self, dst: str, queue_seq: Optional[int]) -> List[Message]:
         return [message for message in self._all_messages_unlocked()
                 if message.dst == dst and (queue_seq is None or message.queue_seq == queue_seq)]
+
+    def _assert_sequence_integrity_unlocked(self, dst: str, message_seqs: set[int], meta: dict) -> None:
+        next_seq = int(meta["next_seq"].get(dst, 1))
+        released = {int(value) for value in meta["released"].get(dst, {})}
+        highest = max(message_seqs | released, default=0)
+        if next_seq <= highest:
+            raise QueueSequenceGapError(
+                f"目标 {dst} 的 next_seq={next_seq} 不大于已知 queue_seq={highest}，停止投递"
+            )
+        known = sorted(message_seqs | released)
+        expected = 1
+        for sequence in known:
+            if sequence < expected:
+                continue
+            if sequence > expected:
+                raise QueueSequenceGapError(
+                    f"目标 {dst} 的 queue_seq={expected} 未放行且消息记录缺失，拒绝跳过队列头"
+                )
+            expected += 1
+        if expected < next_seq:
+            raise QueueSequenceGapError(
+                f"目标 {dst} 的 queue_seq={expected} 未放行且消息记录缺失，拒绝跳过队列头"
+            )
 
     def _load_queue_meta_unlocked(self) -> dict:
         if not self.queue_meta_path.exists():

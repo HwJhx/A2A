@@ -147,6 +147,71 @@ class RulingTests(unittest.TestCase):
         self.assertEqual(self.spool.get(self.message.msg_id).state, FAILED)
         self.assertTrue(self.spool.slot_released("sw_uart", self.message.queue_seq))
 
+    def test_retry_ruling_marker_prevents_replay_after_message_cycles_back_to_uncertain(self):
+        self.make_uncertain()
+        original_record = self.audit.record
+        failed_once = {"value": False}
+
+        def fail_applied(event):
+            if event.get("event") == "RULING_APPLIED" and not failed_once["value"]:
+                failed_once["value"] = True
+                raise OSError("simulated crash after retry state persisted")
+            return original_record(event)
+
+        self.audit.record = fail_applied
+        with self.assertRaisesRegex(OSError, "simulated crash"):
+            self.resolve("retry", ruling_id="r-retry-cycle")
+        self.audit.record = original_record
+
+        marked = self.spool.get(self.message.msg_id)
+        self.assertEqual(marked.state, RETRYING)
+        self.assertEqual(marked.ruling_id, "r-retry-cycle")
+        self.broker._transition(marked, DISPATCHING, "retry attempt")
+        self.broker._transition(self.spool.get(self.message.msg_id), DELIVERY_UNCERTAIN,
+                                "retry attempt became uncertain")
+        self.assertEqual(self.spool.get(self.message.msg_id).state, DELIVERY_UNCERTAIN)
+
+        self.assertEqual(RulingManager(self.broker).recover_pending(), 1)
+        current = self.spool.get(self.message.msg_id)
+        self.assertEqual(current.state, DELIVERY_UNCERTAIN)
+        self.assertEqual(current.ruling_id, "r-retry-cycle")
+        events = self.audit.read()
+        self.assertEqual(sum(event.get("event") == "STATE_TRANSITION"
+                             and event.get("ruling_id") == "r-retry-cycle" for event in events), 1)
+        self.assertEqual(sum(event.get("event") == "RULING_APPLIED"
+                             and event.get("ruling_id") == "r-retry-cycle" for event in events), 1)
+
+    def test_terminal_retry_reconcile_accepts_retry_already_delivered(self):
+        self.make_failed()
+        original_record = self.audit.record
+        failed_once = {"value": False}
+
+        def fail_applied(event):
+            if event.get("event") == "RULING_APPLIED" and not failed_once["value"]:
+                failed_once["value"] = True
+                raise OSError("simulated crash after retry processing")
+            return original_record(event)
+
+        self.audit.record = fail_applied
+        with self.assertRaisesRegex(OSError, "simulated crash"):
+            self.resolve("retry", ruling_id="r-terminal-retry", retry_msg_id="0000000000000002-abcdef")
+        self.audit.record = original_record
+
+        ruling = next(event for event in self.audit.read()
+                      if event.get("event") == "OPERATOR_RULING"
+                      and event.get("ruling_id") == "r-terminal-retry")
+        retry_id = ruling["retry_msg_id"]
+        retry = self.spool.get(retry_id)
+        self.spool.update(retry_id, state=DISPATCHING, detail="sent")
+        self.spool.update(retry_id, state=DELIVERED, detail="observed working")
+        self.assertTrue(self.spool.slot_released("sw_uart", self.message.queue_seq))
+
+        self.assertEqual(RulingManager(self.broker).recover_pending(), 1)
+        self.assertEqual(self.spool.get(retry_id).state, DELIVERED)
+        self.assertEqual(sum(event.get("event") == "RULING_APPLIED"
+                             and event.get("ruling_id") == "r-terminal-retry"
+                             for event in self.audit.read()), 1)
+
     def test_void_stops_pending_replay_without_reverting_persisted_effects(self):
         self.make_uncertain()
         ruling = self.audit.record({"event": "OPERATOR_RULING", "ruling_id": "r-void",

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import logging
+import secrets
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -113,6 +114,8 @@ class DeliveryBroker:
         self._monotonic = monotonic
         self.lock_dir = spool.root / "broker-locks"
         self.dispatch_guard: Callable[[], bool] = lambda: True
+        self.stop_requested: Callable[[], bool] = lambda: False
+        self.wait_for_stop: Callable[[float], bool] = lambda delay: (self._sleep(delay), False)[1]
 
     def process_target(self, dst: str) -> Optional[DeliveryResult]:
         """串行处理 dst 的队列头；返回 None 表示无待处理槽位。"""
@@ -170,6 +173,10 @@ class DeliveryBroker:
         last_query_error = ""
 
         while True:
+            if self.stop_requested():
+                current = self.spool.get(message.msg_id)
+                return DeliveryResult(current.msg_id, current.dst, current.state,
+                                      "Broker 正在优雅停机，保留未投递消息")
             if self._monotonic() >= deadline:
                 current = self.spool.get(message.msg_id)
                 updated = self._transition(current, TIMEOUT, "等待目标 READY 或重试超过总等待时限")
@@ -196,7 +203,10 @@ class DeliveryBroker:
                                                f"目标状态连续查询失败 {state_failures} 次: {last_query_error}")
                     self._pause(updated)
                     return DeliveryResult(updated.msg_id, updated.dst, updated.state, updated.detail)
-                self._sleep(min(self.state_poll_s * (2 ** (state_failures - 1)), 30.0))
+                if self.wait_for_stop(min(self.state_poll_s * (2 ** (state_failures - 1)), 30.0)):
+                    current = self.spool.get(message.msg_id)
+                    return DeliveryResult(current.msg_id, current.dst, current.state,
+                                          "Broker 正在优雅停机，保留未投递消息")
                 continue
 
             if status == "blocked":
@@ -205,7 +215,10 @@ class DeliveryBroker:
                 current = self.spool.get(message.msg_id)
                 if current.state in {QUEUED, RETRYING}:
                     self._transition(current, WAITING_TARGET, f"目标状态为 {status}，等待 idle/done")
-                self._sleep(min(self.state_poll_s, max(0.0, deadline - self._monotonic())))
+                if self.wait_for_stop(min(self.state_poll_s, max(0.0, deadline - self._monotonic()))):
+                    current = self.spool.get(message.msg_id)
+                    return DeliveryResult(current.msg_id, current.dst, current.state,
+                                          "Broker 正在优雅停机，保留未投递消息")
                 continue
 
             # 再次复核 READY，复核失败时绝不先写 DISPATCHING。
@@ -223,7 +236,10 @@ class DeliveryBroker:
                                                f"目标 READY 复核连续失败 {state_failures} 次")
                     self._pause(updated)
                     return DeliveryResult(updated.msg_id, updated.dst, updated.state, updated.detail)
-                self._sleep(min(self.state_poll_s * (2 ** (state_failures - 1)), 30.0))
+                if self.wait_for_stop(min(self.state_poll_s * (2 ** (state_failures - 1)), 30.0)):
+                    current = self.spool.get(message.msg_id)
+                    return DeliveryResult(current.msg_id, current.dst, current.state,
+                                          "Broker 正在优雅停机，保留未投递消息")
                 continue
             if confirmed.status not in self.READY:
                 continue
@@ -239,6 +255,10 @@ class DeliveryBroker:
             if current.state != DISPATCHING:
                 current = self._transition(current, DISPATCHING, "目标复核为 READY，准备调用 agent prompt",
                                            attempts=current.attempts + 1)
+            if self.stop_requested():
+                current = self._transition(self.spool.get(message.msg_id), RETRYING,
+                                           "Broker 在 prompt 提交前优雅停机；已确认未调用 Herdr")
+                return DeliveryResult(current.msg_id, current.dst, current.state, current.detail)
             try:
                 self.herdr.send_prompt(pane_id, message.text, wait=False)
                 disposition = classify_prompt_result(None, herdr_version=self.herdr_version)
@@ -250,7 +270,10 @@ class DeliveryBroker:
                     retry_attempt += 1
                     delay = min(self.retry_backoff_s * (2 ** (retry_attempt - 1)),
                                 self.retry_backoff_max_s, max(0.0, deadline - self._monotonic()))
-                    self._sleep(delay)
+                    if self.wait_for_stop(delay):
+                        current = self.spool.get(message.msg_id)
+                        return DeliveryResult(current.msg_id, current.dst, current.state,
+                                              "Broker 正在优雅停机，保留重试消息")
                     continue
                 if disposition == PromptDisposition.TARGET_BLOCKED:
                     return self._finish(message, TARGET_BLOCKED, f"Herdr 拒绝: {exc}")
@@ -267,6 +290,8 @@ class DeliveryBroker:
     def _observe(self, message: Message) -> DeliveryResult:
         deadline = self._monotonic() + self.observation_window_s
         while True:
+            # Prompt 已被 Herdr 接受后，必须完成这个有界观察窗口；否则常规停机
+            # 会把很快开始处理的消息误判为不确定并暂停队列。窗口有硬上限。
             try:
                 agent = self._get_agent(message)
             except Exception as exc:
@@ -290,7 +315,13 @@ class DeliveryBroker:
 
     def _get_agent(self, message: Message):
         record = self._target_record(message)
-        return self.herdr.get_agent(record.pane_id)
+        agent = self.herdr.get_agent(record.agent_name)
+        if agent.pane_id != record.pane_id:
+            raise AgentNotRegisteredError(
+                f"登记 agent {record.agent_name} 当前映射到 pane {agent.pane_id}，"
+                f"预期 {record.pane_id}"
+            )
+        return agent
 
     def _target_record(self, message: Message):
         record = self.registry.get(message.dst)
@@ -302,7 +333,8 @@ class DeliveryBroker:
         return record
 
     def _pane_id(self, message: Message) -> str:
-        return self._target_record(message).pane_id
+        # 按稳定登记名称投递，避免 pane 被其他 agent 复用时把消息发错对象。
+        return self._target_record(message).agent_name
 
     def _transition(self, current: Message, state: str, detail: str, *,
                     attempts: Optional[int] = None, evidence: Optional[str] = None,
@@ -315,40 +347,52 @@ class DeliveryBroker:
             event["evidence"] = evidence
         if ruling_id is not None:
             event["ruling_id"] = ruling_id
-        # Write-ahead audit; Broker startup recovery must reconcile an intent whose spool update
-        # was interrupted. Avoid duplicating the same intent if an operator restarts manually.
-        if not any(item.get("event") == "STATE_TRANSITION"
-                   and item.get("msg_id") == current.msg_id
-                   and item.get("previous_state") == current.state
-                   and item.get("state") == state
-                   and item.get("detail") == detail
-                   and item.get("ruling_id") == ruling_id for item in self.audit.read(strict=True)):
+        events = self.audit.read(strict=True)
+        latest = next((item for item in reversed(events)
+                       if item.get("event") == "STATE_TRANSITION"
+                       and item.get("msg_id") == current.msg_id), None)
+        pending_replay = (latest is not None
+                          and latest.get("previous_state") == current.state
+                          and latest.get("state") == state
+                          and latest.get("detail") == detail
+                          and latest.get("ruling_id") == ruling_id)
+        if pending_replay:
+            transition_id = latest.get("transition_id") or secrets.token_hex(16)
+        else:
+            transition_id = secrets.token_hex(16)
+        event["transition_id"] = transition_id
+        # 只复用紧邻的未完成 WAL 意图；历史上相同状态/文案的不同投递周期必须分别审计。
+        if not pending_replay:
             self.audit.record(event)
         return self.spool.update(current.msg_id, state=state, detail=detail, attempts=attempts,
-                                 ruling_id=ruling_id)
+                                 ruling_id=ruling_id, transition_id=transition_id)
 
     def _finish(self, message: Message, state: str, detail: str, *,
                 evidence: Optional[str] = None) -> DeliveryResult:
         current = self.spool.get(message.msg_id)
         if current.state != state:
             current = self._transition(current, state, detail, evidence=evidence)
-        if state == DELIVERED or state in {TARGET_BLOCKED, TARGET_MISSING, TIMEOUT, FAILED}:
+        if state == DELIVERED or state in {
+            DELIVERY_UNCERTAIN, TARGET_BLOCKED, TARGET_MISSING, TIMEOUT, FAILED
+        }:
             if state != DELIVERED:
                 self._pause(current)
         return DeliveryResult(current.msg_id, current.dst, current.state, current.detail)
 
     def _pause(self, message: Message) -> None:
         events = self.audit.read(strict=True)
-        pause_key = next((event.get("ts") for event in reversed(events)
-                          if event.get("event") == "STATE_TRANSITION"
-                          and event.get("msg_id") == message.msg_id
-                          and event.get("state") == message.state), message.updated_at)
+        pause_key = message.transition_id or next((event.get("ts") for event in reversed(events)
+                                                   if event.get("event") == "STATE_TRANSITION"
+                                                   and event.get("msg_id") == message.msg_id
+                                                   and event.get("state") == message.state),
+                                                  message.updated_at)
         if any(event.get("event") == "QUEUE_PAUSED" and event.get("msg_id") == message.msg_id
                and event.get("pause_key") == pause_key for event in events):
             return
         self.audit.record({"event": "QUEUE_PAUSED", "msg_id": message.msg_id,
                            "dst": message.dst, "queue_seq": message.queue_seq,
                            "state": message.state, "pause_key": pause_key,
+                           "transition_id": message.transition_id,
                            "detail": f"队列头 {message.state}，等待操作员处理"})
         _LOG.warning("A2A 队列暂停: dst=%s msg_id=%s queue_seq=%s state=%s; 需操作员处理",
                      message.dst, message.msg_id, message.queue_seq, message.state)

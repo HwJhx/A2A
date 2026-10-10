@@ -23,7 +23,7 @@ from .messages import (
     Message,
     can_transition,
 )
-from .spool import MessageNotFoundError, Spool, SpoolError
+from .spool import MessageNotFoundError, QueueSequenceGapError, Spool, SpoolError
 from .audit import AuditLog
 from .router import Router, SendReceipt, SendRejected
 from .broker import DeliveryBroker, DeliveryResult, PromptDisposition, classify_prompt_result
@@ -37,7 +37,7 @@ __all__ = ["HerdrClient", "Agent", "ResourceRef", "LauncherError",
            "AmbiguousPaneError", "Registry", "RegistryError", "RuntimeAddressConflictError",
            "Message", "ALLOWED_TRANSITIONS", "ALL_STATES", "NON_TERMINAL_STATES",
            "TERMINAL_STATES", "DELIVERY_UNCERTAIN", "can_transition",
-           "MessageNotFoundError", "Spool", "SpoolError", "AuditLog",
+           "MessageNotFoundError", "QueueSequenceGapError", "Spool", "SpoolError", "AuditLog",
            "Router", "SendReceipt", "SendRejected", "HerdrPromptOutcomeUnknown",
            "HerdrAgentPromptFailed", "HerdrAgentNameTaken", "HerdrInvalidAgentName",
            "DeliveryBroker", "DeliveryResult", "PromptDisposition", "classify_prompt_result"]

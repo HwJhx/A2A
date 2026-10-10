@@ -28,6 +28,8 @@ from uuid import uuid4
 
 from a2a_codex import HerdrClient
 from a2a_codex.audit import AuditLog
+from a2a_codex.broker import PromptDisposition, classify_prompt_result
+from a2a_codex.errors import HerdrAgentBlocked
 from a2a_codex.identity import AgentIdentity
 from a2a_codex.messages import DELIVERY_UNCERTAIN, DELIVERED, DISPATCHING, QUEUED, Message, new_msg_id, now_iso
 from a2a_codex.registry import Registry
@@ -79,6 +81,25 @@ class TestHerdrIntegrationVM(unittest.TestCase):
         # This targets the fake pi process above, not a model-backed agent.
         accepted = self.client.send_prompt(pane_id, "A2A_HERDR_INTEGRATION_NO_MODEL")
         self.assertEqual(accepted.pane_id, pane_id)
+
+    def test_verified_herdr_version_classifies_blocked_without_model_or_prompt_write(self) -> None:
+        pane_id = self.workspace.pane_id
+        self.assertTrue(pane_id)
+        self.client.start_agent(pane_id, "bash -c 'exec -a pi sleep 120'")
+        self.client.wait_for_agent_detected(pane_id, timeout_s=30)
+        name = "a2a_blocked_%s" % uuid4().hex[:10]
+        self.client.rename_agent(pane_id, name)
+
+        version = self.client.version()
+        self.assertEqual(version, "0.9.3")
+        self.client._call("pane", "report-agent", pane_id,
+                           "--source", "a2a-blocked-%s" % uuid4().hex[:8],
+                           "--agent", "pi", "--state", "blocked", "--seq", "1")
+        with self.assertRaises(HerdrAgentBlocked) as caught:
+            # Herdr must reject before PTY submission; target is a fake `pi sleep`, never a model.
+            self.client.send_prompt(name, "A2A_TEST_BLOCKED_NO_MODEL")
+        self.assertEqual(classify_prompt_result(caught.exception, herdr_version=version),
+                         PromptDisposition.TARGET_BLOCKED)
 
     def test_cli_broker_delivers_fixed_edge_template_to_fake_pi_tty(self) -> None:
         workspace_id = self.workspace.workspace_id
@@ -920,7 +941,7 @@ os.execv(REAL_HERDR, [REAL_HERDR, *argv])
         self.assertEqual(intercept_record["parent_pid"], self.broker.pid,
                          "prompt wrapper 的父进程不是此测试启动的 Broker")
         self.assertEqual(intercept_record["argv"][2:4], ["agent", "prompt"])
-        self.assertEqual(intercept_record["argv"][4], target_pane)
+        self.assertEqual(intercept_record["argv"][4], target_name)
         self.assertEqual(intercept_record["argv"][5], "PREPROMPT_FIRST::uart::必须未送达")
         first_status = json.loads(self._run_a2a("status", first["msg_id"]))
         later_status = json.loads(self._run_a2a("status", later["msg_id"]))
@@ -1157,7 +1178,7 @@ os.execv(REAL_HERDR, [REAL_HERDR, *argv])
 '''
         for placeholder, value in (
             ("@REAL_HERDR@", repr(real_herdr)), ("@SESSION@", repr(SESSION)),
-            ("@TARGET@", repr(target_pane)), ("@EXPECTED_PID@", repr(str(expected_pid_file))),
+            ("@TARGET@", repr(target_name)), ("@EXPECTED_PID@", repr(str(expected_pid_file))),
             ("@AUTHORIZE@", repr(str(authorize_kill))), ("@MARKER@", repr(str(ready_marker))),
             ("@EVENTS@", repr(str(wrapper_events))),
         ):
@@ -1205,9 +1226,9 @@ os.execv(REAL_HERDR, [REAL_HERDR, *argv])
 
         marker = json.loads(ready_marker.read_text(encoding="utf-8"))
         self.assertEqual(marker["parent_pid"], crashed_broker.pid)
-        self.assertEqual(marker["target"], target_pane)
+        self.assertEqual(marker["target"], target_name)
         self.assertIn(marker["status"], {"idle", "done"})
-        self.assertEqual(marker["argv"][2:5], ["agent", "get", target_pane])
+        self.assertEqual(marker["argv"][2:5], ["agent", "get", target_name])
         first_status = json.loads(self._run_a2a("status", first["msg_id"]))
         later_status = json.loads(self._run_a2a("status", later["msg_id"]))
         queue_view = json.loads(self._run_a2a("queue", "sw_uart"))
@@ -1346,7 +1367,7 @@ os.execv(REAL_HERDR, [REAL_HERDR, *argv])
         if output is not None and not output.closed:
             output.close()
         if broker is not None:
-            self.assertEqual(broker.returncode, 130, "Broker 未按 SIGINT 优雅退出")
+            self.assertEqual(broker.returncode, 0, "Broker 未按 SIGINT 优雅退出")
 
     def _kill_broker_if_running(self) -> None:
         broker = getattr(self, "broker", None)
@@ -1428,7 +1449,7 @@ class TestRulingProcessRecoveryVM(unittest.TestCase):
         if process.poll() is None:
             process.send_signal(signal.SIGINT)
             process.wait(timeout=15)
-        self.assertEqual(process.returncode, 130, "Broker 未按 SIGINT 退出")
+        self.assertEqual(process.returncode, 0, "Broker 未按 SIGINT 优雅退出")
 
     def _cleanup_processes(self) -> None:
         for kind, process, output in reversed(self.processes):

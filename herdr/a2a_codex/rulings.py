@@ -193,7 +193,9 @@ class RulingManager:
         steps = []
 
         if action in {"delivered", "not_delivered_retry", "abandon"}:
-            if original.state == previous:
+            if original.ruling_id == ruling_id:
+                pass  # 该裁定迁移已与 ruling_id 原子写入；消息可已经过后续状态循环。
+            elif original.state == previous:
                 detail = "操作员裁定: " + str(event.get("reason", ""))
                 evidence = "operator_confirmed" if action == "delivered" else None
                 self.broker._transition(original, new_state, detail,

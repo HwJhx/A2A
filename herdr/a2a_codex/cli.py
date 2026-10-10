@@ -5,7 +5,9 @@ import argparse
 import getpass
 import json
 import os
+import signal
 import sys
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -40,8 +42,28 @@ def _router(args: argparse.Namespace, spool: Spool, audit: AuditLog) -> Router:
 
 def _runtime(args: argparse.Namespace, spool: Spool, audit: AuditLog) -> BrokerRuntime:
     session = args.session or session_from_env(os.environ)
-    broker = DeliveryBroker(HerdrClient(session), Registry(), spool, audit)
+    client = HerdrClient(session)
+    broker = DeliveryBroker(client, Registry(), spool, audit, herdr_version=client.version())
     return BrokerRuntime(broker)
+
+
+def _run_broker(runtime: BrokerRuntime) -> None:
+    """将 SIGINT/SIGTERM 转成可中断等待并安全收尾的 runtime.stop()。"""
+    previous = {}
+    stop_event = threading.Event()
+
+    def request_stop(_signum, _frame):
+        stop_event.set()
+        runtime.stop()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_stop)
+    try:
+        runtime.run(stop_event=stop_event)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def _actor(value: str | None) -> str:
@@ -166,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             _json(rows)
             return 0
         if args.command == "broker" and args.broker_command == "run":
-            _runtime(args, spool, audit).run()
+            _run_broker(_runtime(args, spool, audit))
             return 0
         if args.command == "resolve":
             runtime = _runtime(args, spool, audit)

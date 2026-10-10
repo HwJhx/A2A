@@ -73,7 +73,21 @@ class BrokerRuntime:
         external_stop = stop_event or threading.Event()
         self._stop.clear()
         self._fatal_error = None
-        self.broker.dispatch_guard = lambda: not self._stop.is_set()
+        def stop_requested() -> bool:
+            return self._stop.is_set() or external_stop.is_set()
+
+        def wait_for_stop(delay: float) -> bool:
+            deadline = time.monotonic() + max(0.0, delay)
+            while not stop_requested():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._stop.wait(min(0.1, remaining))
+            return True
+
+        self.broker.stop_requested = stop_requested
+        self.broker.wait_for_stop = wait_for_stop
+        self.broker.dispatch_guard = lambda: not stop_requested()
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+b") as lock_file:
             try:
@@ -110,6 +124,9 @@ class BrokerRuntime:
                         break
                 if self._fatal_error is not None:
                     raise RuntimeError("Broker worker 遇到错误，fail-closed 停止全部派发") from self._fatal_error
+            except KeyboardInterrupt:
+                # Ctrl-C 是正常停机请求，不得制造需要人工 resume 的持久全局停止。
+                self._stop.set()
             except BaseException as exc:
                 failure = exc
                 self._stop.set()
@@ -209,7 +226,8 @@ class BrokerRuntime:
         """为仍占据队列头的 DELIVERY_UNCERTAIN 发出持久、幂等的定时告警。"""
         events = self.audit.read(strict=True)
         transitions: dict[str, dict] = {}
-        sent = {(event.get("msg_id"), event.get("cycle_started_at"), event.get("level"))
+        sent = {(event.get("msg_id"), event.get("transition_id") or event.get("cycle_started_at"),
+                 event.get("level"))
                 for event in events if event.get("event") == "QUEUE_ALERT"}
         for event in events:
             if event.get("event") == "STATE_TRANSITION" and event.get("state") == "DELIVERY_UNCERTAIN":
@@ -233,6 +251,7 @@ class BrokerRuntime:
                 continue
             elapsed = max(0.0, (now - started).total_seconds())
             cycle_started_at = str(started_text)
+            transition_id = head.transition_id or cycle_started_at
             queued = self.spool.pending(dst) + [message for message in self.spool.done()
                                                  if message.dst == dst]
             later_count = len({(message.queue_seq, message.msg_id) for message in queued
@@ -244,12 +263,13 @@ class BrokerRuntime:
             if elapsed >= self.alert_escalation_s:
                 levels.append(("escalation", "24 小时升级"))
             for level, label in levels:
-                key = (head.msg_id, cycle_started_at, level)
+                key = (head.msg_id, transition_id, level)
                 if key in sent:
                     continue
                 event = {"event": "QUEUE_ALERT", "msg_id": head.msg_id, "dst": dst,
                          "queue_seq": head.queue_seq,
                          "state": head.state, "cycle_started_at": cycle_started_at,
+                         "transition_id": head.transition_id,
                          "level": level, "paused_message_count": later_count,
                          "available_actions": ["delivered", "retry", "abandon"],
                          "detail": f"{label}: DELIVERY_UNCERTAIN 队列头仍未裁定；后续暂停 {later_count} 条"}

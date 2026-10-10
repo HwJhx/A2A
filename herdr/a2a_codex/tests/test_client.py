@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import subprocess
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -42,6 +43,14 @@ class Runner:
 
 
 class TestHerdrClient(unittest.TestCase):
+    def test_version_is_read_without_session_and_unknown_output_fails_closed(self) -> None:
+        runner = Runner(subprocess.CompletedProcess([], 0, "herdr 0.9.3\n", ""),
+                        subprocess.CompletedProcess([], 0, "unexpected version output", ""))
+        client = HerdrClient("test1", runner=runner)
+        self.assertEqual(client.version(), "0.9.3")
+        self.assertIsNone(client.version())
+        self.assertEqual(runner.calls, [["herdr", "--version"], ["herdr", "--version"]])
+
     def test_agent_name_errors_are_mapped(self) -> None:
         self.assertIsInstance(from_code("agent_name_taken", "taken"), HerdrAgentNameTaken)
         self.assertIsInstance(from_code("invalid_agent_name", "invalid"), HerdrInvalidAgentName)
@@ -249,13 +258,36 @@ class TestCli(unittest.TestCase):
                 mock.patch.object(cli_module, "HerdrClient") as client_cls, \
                 mock.patch.object(cli_module, "DeliveryBroker") as broker_cls, \
                 mock.patch.object(cli_module, "BrokerRuntime", return_value=runtime) as runtime_cls:
+            client_cls.return_value.version.return_value = "0.9.3"
             self.assertEqual(cli_module.main(["broker", "run"]), 0)
 
         registry_cls.assert_called_once_with()
         client_cls.assert_called_once()
+        client_cls.return_value.version.assert_called_once_with()
         broker_cls.assert_called_once()
+        self.assertEqual(broker_cls.call_args.kwargs["herdr_version"], "0.9.3")
         runtime_cls.assert_called_once_with(broker_cls.return_value)
-        runtime.run.assert_called_once_with()
+        runtime.run.assert_called_once()
+        self.assertIsInstance(runtime.run.call_args.kwargs["stop_event"], threading.Event)
+
+    def test_broker_run_translates_sigterm_to_graceful_stop(self) -> None:
+        runtime = mock.Mock()
+        handlers = {}
+        previous = object()
+
+        def set_signal(signum, handler):
+            handlers[signum] = handler
+            return previous
+
+        def run(*, stop_event):
+            handlers[cli_module.signal.SIGTERM](cli_module.signal.SIGTERM, None)
+            self.assertTrue(stop_event.is_set())
+
+        runtime.run.side_effect = run
+        with mock.patch.object(cli_module.signal, "getsignal", return_value=previous), \
+                mock.patch.object(cli_module.signal, "signal", side_effect=set_signal):
+            cli_module._run_broker(runtime)
+        runtime.stop.assert_called_once_with()
 
     def test_read_agent_diagnostic_command_remains_available(self) -> None:
         captured = {}

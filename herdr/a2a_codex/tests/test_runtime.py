@@ -166,6 +166,20 @@ class BrokerRuntimeTests(unittest.TestCase):
         self.assertTrue(any(event.get("event") == "DISPATCH_HALTED"
                             for event in broker.audit.events))
 
+    def test_keyboard_interrupt_is_graceful_and_does_not_persist_dispatch_halt(self):
+        spool = FakeSpool(self.root)
+        broker = FakeBroker(spool, lambda _dst: None)
+        runtime = BrokerRuntime(broker, poll_interval_s=0.01)
+
+        def interrupt():
+            raise KeyboardInterrupt()
+
+        runtime._schedule_workers = interrupt
+        runtime.run()
+        self.assertFalse(spool.control["halted"])
+        self.assertFalse(any(event.get("event") == "DISPATCH_HALTED"
+                             for event in broker.audit.events))
+
 
 class QueueAlertTests(unittest.TestCase):
     def setUp(self):
@@ -237,6 +251,21 @@ class QueueAlertTests(unittest.TestCase):
         self.assertEqual([event["level"] for event in self.queue_alerts()],
                          ["reminder", "escalation"])
         self.assert_uncertain_slot_unchanged()
+
+    def test_new_uncertain_cycle_gets_a_new_alert_window(self):
+        runtime = self.make_runtime()
+        self.assertEqual(runtime._emit_due_alerts(
+            self.cycle_started + timedelta(seconds=3600)), 1)
+
+        next_cycle = self.cycle_started + timedelta(seconds=7200)
+        self.audit.record({"event": "STATE_TRANSITION", "msg_id": self.message.msg_id,
+                           "state": DELIVERY_UNCERTAIN, "transition_id": "cycle-two",
+                           "ts": next_cycle.isoformat()})
+        self.spool.update(self.message.msg_id, detail="second uncertain attempt",
+                          transition_id="cycle-two")
+        self.assertEqual(runtime._emit_due_alerts(next_cycle + timedelta(seconds=3600)), 1)
+        self.assertEqual([event.get("transition_id") for event in self.queue_alerts()],
+                         [None, "cycle-two"])
 
 
 if __name__ == "__main__":

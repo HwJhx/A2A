@@ -46,7 +46,8 @@ class Clock:
 class FakeRegistry:
     def get(self, _agent_id: str):
         return SimpleNamespace(agent_id="sw_uart", project_id="soc_a", ip_id="uart",
-                               session="test1", pane_id="w1:p2", lifecycle="running")
+                               session="test1", pane_id="w1:p2", agent_name="sw_uart",
+                               lifecycle="running")
 
 
 class FakeHerdr:
@@ -56,23 +57,26 @@ class FakeHerdr:
         self.status_errors = list(status_errors)
         self.on_prompt = on_prompt
         self.prompt_calls = []
+        self.reported_pane = "w1:p2"
+        self.get_calls = []
 
-    def get_agent(self, pane_id):
+    def get_agent(self, target):
+        self.get_calls.append(target)
         if self.status_errors:
             raise self.status_errors.pop(0)
-        return Agent(raw={"pane_id": pane_id, "agent_status": self.status},
-                     pane_id=pane_id, status=self.status)
+        return Agent(raw={"pane_id": self.reported_pane, "agent_status": self.status},
+                     pane_id=self.reported_pane, status=self.status)
 
-    def send_prompt(self, pane_id, prompt, *, wait=False):
-        self.prompt_calls.append((pane_id, prompt, wait))
+    def send_prompt(self, target, prompt, *, wait=False):
+        self.prompt_calls.append((target, prompt, wait))
         if self.prompt_errors:
             error = self.prompt_errors.pop(0)
             if error:
                 raise error
         if self.on_prompt:
             self.on_prompt(self)
-        return Agent(raw={"pane_id": pane_id, "agent_status": self.status},
-                     pane_id=pane_id, status=self.status)
+        return Agent(raw={"pane_id": self.reported_pane, "agent_status": self.status},
+                     pane_id=self.reported_pane, status=self.status)
 
 
 class BrokerTests(unittest.TestCase):
@@ -126,7 +130,8 @@ class BrokerTests(unittest.TestCase):
         herdr = FakeHerdr(on_prompt=lambda client: setattr(client, "status", "working"))
         result = self.broker(herdr).process_target("sw_uart")
         self.assertEqual(result.state, DELIVERED)
-        self.assertEqual(herdr.prompt_calls, [("w1:p2", "uart 已验证", False)])
+        self.assertEqual(herdr.prompt_calls, [("sw_uart", "uart 已验证", False)])
+        self.assertEqual(herdr.get_calls[0], "sw_uart")
         self.assertTrue(self.spool.slot_released("sw_uart", self.message.queue_seq))
         events = self.audit.read()
         delivered = next(event for event in events if event.get("state") == DELIVERED)
@@ -139,18 +144,36 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(len(herdr.prompt_calls), 1)
         self.assertFalse(self.spool.slot_released("sw_uart", self.message.queue_seq))
 
+    def test_stop_during_observation_finishes_bounded_window_and_delivers_if_working(self):
+        herdr = FakeHerdr(status="idle")
+        broker = self.broker(herdr)
+        stopped = {"value": False}
+        broker.stop_requested = lambda: stopped["value"]
+        original_sleep = broker._sleep
+
+        def stop_while_observing(seconds):
+            original_sleep(seconds)
+            if herdr.prompt_calls:
+                stopped["value"] = True
+                herdr.status = "working"
+
+        broker._sleep = stop_while_observing
+        result = broker.process_target("sw_uart")
+
+        self.assertTrue(stopped["value"])
+        self.assertEqual(result.state, DELIVERED)
+        self.assertEqual(len(herdr.prompt_calls), 1)
+        self.assertTrue(self.spool.slot_released("sw_uart", self.message.queue_seq))
+
     def test_paused_queue_head_emits_warning_and_queue_paused_audit(self):
         herdr = FakeHerdr(status="idle")
         broker = self.broker(herdr)
-        result = broker.process_target("sw_uart")
-        self.assertEqual(result.state, DELIVERY_UNCERTAIN)
-
-        # Processing the newly uncertain queue head pauses it and emits the
-        # operator-facing warning/audit without releasing its queue slot.
         with self.assertLogs("a2a_codex.broker", level="WARNING") as captured:
-            paused_result = broker.process_target("sw_uart")
+            # Entering DELIVERY_UNCERTAIN pauses immediately; a later scheduler
+            # pass must not be needed to produce the operator-facing warning.
+            result = broker.process_target("sw_uart")
 
-        self.assertEqual(paused_result.state, DELIVERY_UNCERTAIN)
+        self.assertEqual(result.state, DELIVERY_UNCERTAIN)
         self.assertTrue(any("A2A 队列暂停" in line for line in captured.output))
         paused = [event for event in self.audit.read()
                   if event.get("event") == "QUEUE_PAUSED"
@@ -176,6 +199,50 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(result.state, DELIVERY_UNCERTAIN)
         self.assertEqual(len(herdr.prompt_calls), 1)
         self.assertFalse(self.spool.slot_released("sw_uart", self.message.queue_seq))
+
+    def test_registered_name_mapped_to_another_pane_is_never_prompted(self):
+        herdr = FakeHerdr(status="idle")
+        herdr.reported_pane = "w1:p99"
+        result = self.broker(herdr).process_target("sw_uart")
+        self.assertEqual(result.state, "TARGET_MISSING")
+        self.assertEqual(herdr.get_calls, ["sw_uart"])
+        self.assertEqual(herdr.prompt_calls, [])
+
+    def test_graceful_stop_during_ready_wait_preserves_message_without_timeout(self):
+        herdr = FakeHerdr(status="working")
+        broker = self.broker(herdr)
+        stop = {"requested": False}
+        broker.stop_requested = lambda: stop["requested"]
+
+        def interruptible_wait(_delay):
+            stop["requested"] = True
+            return True
+
+        broker.wait_for_stop = interruptible_wait
+        result = broker.process_target("sw_uart")
+        self.assertEqual(result.state, "WAITING_TARGET")
+        self.assertEqual(herdr.prompt_calls, [])
+        self.assertFalse(self.spool.slot_released("sw_uart", self.message.queue_seq))
+
+    def test_repeated_uncertain_cycle_has_distinct_transition_and_pause_records(self):
+        herdr = FakeHerdr(status="idle")
+        broker = self.broker(herdr)
+        first = broker.process_target("sw_uart")
+        self.assertEqual(first.state, DELIVERY_UNCERTAIN)
+        broker.resolve(self.message.msg_id, "retry", actor="jhx", reason="confirmed not delivered",
+                       ruling_id="r-cycle-one")
+        second = broker.process_target("sw_uart")
+        self.assertEqual(second.state, DELIVERY_UNCERTAIN)
+
+        events = self.audit.read()
+        uncertain = [event for event in events if event.get("event") == "STATE_TRANSITION"
+                     and event.get("msg_id") == self.message.msg_id
+                     and event.get("state") == DELIVERY_UNCERTAIN]
+        pauses = [event for event in events if event.get("event") == "QUEUE_PAUSED"
+                  and event.get("msg_id") == self.message.msg_id]
+        self.assertEqual(len(uncertain), 2)
+        self.assertEqual(len({event.get("transition_id") for event in uncertain}), 2)
+        self.assertEqual(len(pauses), 2)
 
     def test_restart_recovers_dispatching_as_uncertain_without_resending(self):
         self.spool.update(self.message.msg_id, state="DISPATCHING",
