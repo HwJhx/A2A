@@ -5,6 +5,7 @@ import io
 import subprocess
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from typing import Any, Optional, Sequence
 from unittest import mock
 
@@ -20,6 +21,8 @@ from a2a_codex.errors import (
     from_code,
 )
 from a2a_codex.launcher import build_launch_command
+from a2a_codex.messages import Message
+from a2a_codex.router import SendReceipt
 
 
 def response(result: Any) -> subprocess.CompletedProcess[str]:
@@ -130,6 +133,12 @@ class TestHerdrClient(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_a2a_entry_point_keeps_a2a_herdr_compatibility_alias(self) -> None:
+        project_config = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        scripts = project_config.read_text(encoding="utf-8")
+        self.assertIn('a2a = "a2a_codex.cli:main"', scripts)
+        self.assertIn('a2a-herdr = "a2a_codex.cli:main"', scripts)
+
     def test_wait_until_explicit_value_replaces_default(self) -> None:
         captured = {}
 
@@ -150,6 +159,231 @@ class TestCli(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             cli_module.main(["send-prompt", "w1:p1", "arbitrary text"])
         self.assertEqual(caught.exception.code, 2)
+
+    def test_send_rejects_free_text_and_only_passes_edge_id_to_router(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            cli_module.main(["send", "dv_done", "arbitrary text"])
+        self.assertEqual(caught.exception.code, 2)
+
+        receipt = SendReceipt(
+            msg_id="0000000000000001-abcdef", edge_id="dv_done", src="dv_uart",
+            dst="sw_uart", text="fixed template", state="QUEUED",
+            topology_revision="r1",
+        )
+        router = mock.Mock()
+        router.send.return_value = receipt
+        output = io.StringIO()
+        with mock.patch.object(cli_module, "_state_components", return_value=(object(), object())), \
+                mock.patch.object(cli_module, "_router", return_value=router), \
+                redirect_stdout(output):
+            self.assertEqual(cli_module.main(["send", "dv_done"]), 0)
+
+        router.send.assert_called_once_with("dv_done")
+        self.assertEqual(json.loads(output.getvalue()), {
+            "msg_id": receipt.msg_id, "edge_id": receipt.edge_id,
+            "src": receipt.src, "dst": receipt.dst, "text": receipt.text,
+            "state": receipt.state, "topology_revision": receipt.topology_revision,
+        })
+
+    def test_status_and_queue_print_message_and_queue_state(self) -> None:
+        head = Message(
+            msg_id="0000000000000001-abcdef", created_at="t0", edge_id="dv_done",
+            src="dv_uart", dst="sw_uart", project_id="soc_a", ip_id="uart",
+            session="test1", text="fixed template", state="DELIVERY_UNCERTAIN",
+            topology_revision="r1", updated_at="t1", queue_seq=1,
+        )
+        later = Message(
+            msg_id="0000000000000002-abcdef", created_at="t0", edge_id="dv_done",
+            src="dv_uart", dst="sw_uart", project_id="soc_a", ip_id="uart",
+            session="test1", text="fixed template", state="QUEUED",
+            topology_revision="r1", updated_at="t1", queue_seq=2,
+        )
+
+        class StubSpool:
+            def get(self, msg_id):
+                self.requested_msg_id = msg_id
+                return head
+
+            def queue_targets(self):
+                return ["sw_uart"]
+
+            def queue_head(self, dst):
+                self.requested_dst = dst
+                return head if dst == "sw_uart" else None
+
+            def pending(self, _dst):
+                return [head, later]
+
+            def done(self):
+                return []
+
+            def slot_released(self, _dst, _queue_seq):
+                return False
+
+        spool = StubSpool()
+        patch_components = mock.patch.object(
+            cli_module, "_state_components", return_value=(spool, object()))
+
+        status_output = io.StringIO()
+        with patch_components, redirect_stdout(status_output):
+            self.assertEqual(cli_module.main(["status", head.msg_id]), 0)
+        self.assertEqual(json.loads(status_output.getvalue())["msg_id"], head.msg_id)
+        self.assertEqual(spool.requested_msg_id, head.msg_id)
+
+        queue_output = io.StringIO()
+        with mock.patch.object(cli_module, "_state_components", return_value=(spool, object())), \
+                redirect_stdout(queue_output):
+            self.assertEqual(cli_module.main(["queue", "sw_uart"]), 0)
+        rows = json.loads(queue_output.getvalue())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["dst"], "sw_uart")
+        self.assertEqual(rows[0]["head"]["msg_id"], head.msg_id)
+        self.assertTrue(rows[0]["paused"])
+        self.assertEqual(rows[0]["paused_message_count"], 1)
+        self.assertFalse(rows[0]["slot_released"])
+
+    def test_broker_run_constructs_runtime_and_starts_scheduler(self) -> None:
+        runtime = mock.Mock()
+        with mock.patch.object(cli_module, "_state_components", return_value=(object(), object())), \
+                mock.patch.object(cli_module, "Registry") as registry_cls, \
+                mock.patch.object(cli_module, "HerdrClient") as client_cls, \
+                mock.patch.object(cli_module, "DeliveryBroker") as broker_cls, \
+                mock.patch.object(cli_module, "BrokerRuntime", return_value=runtime) as runtime_cls:
+            self.assertEqual(cli_module.main(["broker", "run"]), 0)
+
+        registry_cls.assert_called_once_with()
+        client_cls.assert_called_once()
+        broker_cls.assert_called_once()
+        runtime_cls.assert_called_once_with(broker_cls.return_value)
+        runtime.run.assert_called_once_with()
+
+    def test_read_agent_diagnostic_command_remains_available(self) -> None:
+        captured = {}
+
+        class StubClient:
+            def __init__(self, session):
+                captured["session"] = session
+
+            def read_agent(self, target, *, source, lines):
+                captured.update(target=target, source=source, lines=lines)
+                return "diagnostic output\n"
+
+        output = io.StringIO()
+        with mock.patch.object(cli_module, "HerdrClient", StubClient), \
+                redirect_stdout(output):
+            self.assertEqual(cli_module.main([
+                "--session", "test1", "read-agent", "w1:p1",
+                "--source", "recent", "--lines", "12",
+            ]), 0)
+        self.assertEqual(output.getvalue(), "diagnostic output\n")
+        self.assertEqual(captured, {
+            "session": "test1", "target": "w1:p1", "source": "recent", "lines": 12,
+        })
+
+    def test_resolve_actions_map_to_broker_api_with_reason_and_actor(self) -> None:
+        expected_actions = {
+            "delivered": "delivered",
+            "retry": "retry",
+            "abandon": "abandon",
+            "abandon-and-continue": "abandon_and_continue",
+        }
+        spool, audit = object(), object()
+        with mock.patch.object(cli_module, "_state_components", return_value=(spool, audit)), \
+                mock.patch.object(cli_module, "_runtime") as runtime_factory, \
+                mock.patch.object(cli_module.getpass, "getuser", return_value="test-operator"):
+            runtime = runtime_factory.return_value
+            runtime.broker.resolve.return_value = {"ok": True}
+            for cli_action, api_action in expected_actions.items():
+                with self.subTest(action=cli_action), redirect_stdout(io.StringIO()):
+                    self.assertEqual(cli_module.main([
+                        "resolve", "msg-123", cli_action, "--reason", "verified",
+                    ]), 0)
+                runtime.broker.resolve.assert_called_with(
+                    "msg-123", api_action, actor="test-operator", reason="verified")
+
+    def test_actor_is_audit_label_without_authentication(self) -> None:
+        runtime = mock.Mock()
+        runtime.broker.resolve.return_value = {"ok": True}
+        with mock.patch.object(cli_module, "_state_components", return_value=(object(), object())), \
+                mock.patch.object(cli_module, "_runtime", return_value=runtime), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(cli_module.main([
+                "resolve", "msg-123", "abandon", "--reason", "reviewed",
+                "--actor", "claimed-auditor-label",
+            ]), 0)
+        runtime.broker.resolve.assert_called_once_with(
+            "msg-123", "abandon", actor="claimed-auditor-label", reason="reviewed")
+
+    def test_ruling_void_requires_json_object_and_passes_effects_to_api(self) -> None:
+        runtime = mock.Mock()
+        runtime.broker.void_ruling.return_value = {"voided": True}
+        base_args = ["ruling", "void", "ruling-123", "--reason", "superseded"]
+        with mock.patch.object(cli_module, "_state_components", return_value=(object(), object())), \
+                mock.patch.object(cli_module, "_runtime", return_value=runtime), \
+                mock.patch.object(cli_module.getpass, "getuser", return_value="default-operator"):
+            for non_object in ("null", "[]", '"text"', "17"):
+                stderr = io.StringIO()
+                with self.subTest(verified_effects=non_object), redirect_stderr(stderr):
+                    self.assertEqual(cli_module.main([
+                        *base_args, "--verified-effects", non_object,
+                    ]), 2)
+                self.assertIn("JSON object", stderr.getvalue())
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                self.assertEqual(cli_module.main([
+                    *base_args, "--verified-effects", "not-json",
+                ]), 2)
+            self.assertIn("有效 JSON", stderr.getvalue())
+            runtime.broker.void_ruling.assert_not_called()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(cli_module.main([
+                    *base_args, "--verified-effects", '{"slot_released": false}',
+                ]), 0)
+        runtime.broker.void_ruling.assert_called_once_with(
+            "ruling-123", actor="default-operator", reason="superseded",
+            verified_effects={"slot_released": False})
+        self.assertEqual(json.loads(output.getvalue()), {"voided": True})
+
+    def test_dispatch_resume_forwards_operator_inputs(self) -> None:
+        runtime = mock.Mock()
+        runtime.resume_dispatch.return_value = {"resumed": True}
+        with mock.patch.object(cli_module, "_state_components", return_value=(object(), object())), \
+                mock.patch.object(cli_module, "_runtime", return_value=runtime), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(cli_module.main([
+                "dispatch", "resume", "--reason", "incident verified",
+                "--quarantine-location", "none", "--actor", "operator-label",
+            ]), 0)
+        runtime.resume_dispatch.assert_called_once_with(
+            actor="operator-label", reason="incident verified", quarantine_location="none")
+
+    def test_spool_quarantine_list_and_repair_call_their_apis(self) -> None:
+        incidents = [{"incident_id": "incident-1"}]
+        spool = mock.Mock()
+        spool.quarantine_incidents.return_value = incidents
+        output = io.StringIO()
+        with mock.patch.object(cli_module, "_state_components", return_value=(spool, object())), \
+                redirect_stdout(output):
+            self.assertEqual(cli_module.main(["spool", "quarantine", "list"]), 0)
+        spool.quarantine_incidents.assert_called_once_with()
+        self.assertEqual(json.loads(output.getvalue()), incidents)
+
+        runtime = mock.Mock()
+        runtime.resolve_spool_corruption.return_value = {"resolved": True}
+        output = io.StringIO()
+        with mock.patch.object(cli_module, "_state_components", return_value=(spool, object())), \
+                mock.patch.object(cli_module, "_runtime", return_value=runtime), \
+                redirect_stdout(output):
+            self.assertEqual(cli_module.main([
+                "spool", "repair", "incident-1", "--reason", "restored from backup",
+                "--verification", "hash and schema checked", "--actor", "ops",
+            ]), 0)
+        runtime.resolve_spool_corruption.assert_called_once_with(
+            "incident-1", actor="ops", reason="restored from backup",
+            verification="hash and schema checked")
+        self.assertEqual(json.loads(output.getvalue()), {"resolved": True})
 
 
 if __name__ == "__main__":

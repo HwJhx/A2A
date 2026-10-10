@@ -1,6 +1,6 @@
 # a2a_codex：HerdrClient、动态拓扑与 Router
 
-这是 A2A 项目的独立主线：Herdr CLI Python 封装、动态拓扑、稳定业务身份、持久 Registry，以及 Router / 固定模板 / 持久队列 / 审计。Broker 尚未实现；同时包含 fnx 所需的 `exec -a pi` 启动器和 agent 重命名流程。
+这是 A2A 项目的独立主线：Herdr CLI Python 封装、动态拓扑、稳定业务身份、持久 Registry，以及 Router / 固定模板 / 持久队列 / 审计。当前包含单消息投递引擎、常驻 Broker Runtime、队列告警与基础业务 CLI；同时包含 fnx 所需的 `exec -a pi` 启动器和 agent 重命名流程。
 
 ## 本地测试
 
@@ -27,6 +27,22 @@ print(client.read_agent("dv_uart", lines=60))
 ```
 
 `HerdrClient.send_prompt()` 是 Broker 使用的底层控制接口，不是 agent 的通信入口；agent 的业务发送必须经 `Router.send(edge_id)` 鉴权和模板渲染。`a2a-herdr` 命令行也不提供任意文本 prompt 子命令。
+
+安装本项目后可使用 `a2a`（`a2a-herdr` 仍作为兼容入口）：
+
+```bash
+a2a --topology /absolute/path/topology.yaml send dv_done
+a2a --session soc_a broker run
+a2a status <msg_id>
+a2a queue [<dst_agent_id>]
+a2a resolve <msg_id> retry --reason "核实后重试"
+a2a ruling void <ruling_id> --reason "核实效果后作废" --verified-effects '{"state":"unchanged"}'
+a2a dispatch resume --reason "数据已修复并核验" --quarantine-location none
+a2a spool quarantine list
+a2a spool repair <incident_id> --reason "从备份恢复" --verification "消息状态和 queue_seq 已核对"
+```
+
+`send` 只接受拓扑中已配置的 `edge_id`，发送文本由该边的固定模板生成；没有自由文本 prompt 命令。拓扑路径依次可由 `--topology` 或 `A2A_TOPOLOGY` 指定，未指定时使用包内示例配置。`broker run` 以持久 Spool / AuditLog 启动单实例调度器；`status` 与 `queue` 以 JSON 输出当前消息或目标队列头。`DELIVERY_UNCERTAIN` 队列头会在暂停时写 warning 和审计，1 小时提醒、24 小时升级只产生告警，不改状态、不放行。`resolve`、`ruling void`、`dispatch resume` 都需要 `--reason` 并写审计；`--actor` 默认取当前系统用户名，只作审计署名、不作为认证。Spool 损坏文件从备份恢复到原路径后，先用 `spool repair` 核验并审计，再显式 `dispatch resume`。
 
 `send_prompt(wait=True)` 必须指定 `timeout_ms`。如果收到 `HerdrPromptOutcomeUnknown`（包括 Herdr 的 `agent_prompt_stalled` 和调用进程超时），prompt 可能已经送达；先检查目标 agent，再决定后续动作，不能直接重试。
 
@@ -89,6 +105,6 @@ receipt = router.send("dv_done")  # 读取当前进程的 A2A_* / HERDR_* 环境
 print(receipt.msg_id, receipt.dst, receipt.text)
 ```
 
-队列和审计默认位于 Registry 的状态目录下（`spool/`、`audit.jsonl`），也可以分别传入绝对路径。Router 不调用 Herdr、不等待目标空闲、不发送 prompt；目标状态等待、串行投递、重试和去重由后续 Broker 阶段实现。
+队列和审计默认位于 Registry 的状态目录下（`spool/`、`audit.jsonl`），也可以分别传入绝对路径。Router 不调用 Herdr、不等待目标空闲、不发送 prompt；`DeliveryBroker` 负责单条消息投递，`BrokerRuntime` 提供单实例调度和每目标串行 worker。Runtime 启动时先恢复 Spool、将遗留 `DISPATCHING` 转为 `DELIVERY_UNCERTAIN` 并补做未完成裁定；队列头暂停时不会忙轮询，调度故障会持久 fail-closed 停止全部派发。Python API 和 CLI 均支持操作员裁定、作废未完成裁定、Spool 损坏隔离与恢复、告警及显式恢复派发。基础 CLI 已提供业务发送、状态/队列查询、常驻运行及操作员动作；端到端入口仍在后续阶段。
 
-Spool 在重新打开时会清理原子写入留下的临时文件，并在终态归档已写入但 pending 删除前进程退出时，以有效 done 记录为准消除重复 pending。AuditLog 在读写时会截断最后一条不完整 JSONL 尾记录。故障注入测试覆盖进程中断窗口，不等同于断电或底层存储设备故障测试。
+Spool 在重新打开时会清理原子写入留下的临时文件，并在终态归档已写入但 pending 删除前进程退出时，以有效 done 记录为准消除重复 pending。无法读取的 Spool 文件会保留到 `spool/corrupt/` 并持久停止派发；操作员从备份恢复到原路径后，经 `BrokerRuntime.resolve_spool_corruption()` 核验和审计，再显式恢复派发。AuditLog 会把崩溃留下的不完整尾行保留到 `audit.jsonl.corrupt` 并写入 `AUDIT_REPAIRED`；中间坏行通过 `CORRUPT_LINE` 暴露，安全敏感恢复读取会 fail-closed。故障注入测试覆盖进程中断窗口，不等同于断电或底层存储设备故障测试。

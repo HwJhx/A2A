@@ -26,6 +26,9 @@ from .messages import (
 from .spool import MessageNotFoundError, Spool, SpoolError
 from .audit import AuditLog
 from .router import Router, SendReceipt, SendRejected
+from .broker import DeliveryBroker, DeliveryResult, PromptDisposition, classify_prompt_result
+from .runtime import BrokerAlreadyRunningError, BrokerRuntime, DispatchHaltedError
+from .rulings import RulingError, RulingManager
 
 __all__ = ["HerdrClient", "Agent", "ResourceRef", "LauncherError",
            "build_launch_command", "preflight_launcher", "Edge", "RoleSpec", "Topology",
@@ -36,4 +39,7 @@ __all__ = ["HerdrClient", "Agent", "ResourceRef", "LauncherError",
            "TERMINAL_STATES", "DELIVERY_UNCERTAIN", "can_transition",
            "MessageNotFoundError", "Spool", "SpoolError", "AuditLog",
            "Router", "SendReceipt", "SendRejected", "HerdrPromptOutcomeUnknown",
-           "HerdrAgentPromptFailed", "HerdrAgentNameTaken", "HerdrInvalidAgentName"]
+           "HerdrAgentPromptFailed", "HerdrAgentNameTaken", "HerdrInvalidAgentName",
+           "DeliveryBroker", "DeliveryResult", "PromptDisposition", "classify_prompt_result"]
+__all__ += ["BrokerRuntime", "BrokerAlreadyRunningError", "DispatchHaltedError"]
+__all__ += ["RulingManager", "RulingError"]

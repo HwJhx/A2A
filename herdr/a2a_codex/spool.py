@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import secrets
 from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional
@@ -28,6 +30,14 @@ class SpoolError(RuntimeError):
     pass
 
 
+class SpoolCorruptionError(SpoolError):
+    """Spool 持久化文件损坏；path 指向可供隔离和人工恢复的原文件。"""
+
+    def __init__(self, path: Path, detail: str) -> None:
+        self.path = path
+        super().__init__(f"无法读取 Spool 文件 {path}: {detail}")
+
+
 class MessageNotFoundError(SpoolError):
     pass
 
@@ -43,8 +53,63 @@ class Spool:
         self.done_dir = path / "done"
         self.lock_path = path / ".lock"
         self.queue_meta_path = path / "queue-meta.json"
+        self.dispatch_control_path = path / "dispatch-control.json"
         with exclusive_lock(self.lock_path):
-            self._recover_unlocked()
+            try:
+                self._recover_unlocked()
+            except SpoolCorruptionError as exc:
+                self._quarantine_unlocked(exc.path, str(exc))
+                self._halt_unlocked("Spool 数据损坏，等待操作员恢复")
+                raise
+
+    def recover(self) -> None:
+        """显式执行启动恢复；Broker 必须在调度任何目标之前调用。"""
+        with exclusive_lock(self.lock_path):
+            try:
+                self._recover_unlocked()
+            except SpoolCorruptionError as exc:
+                self._quarantine_unlocked(exc.path, str(exc))
+                self._halt_unlocked("Spool 数据损坏，等待操作员恢复")
+                raise
+
+    def dispatch_control(self) -> dict:
+        with exclusive_lock(self.lock_path):
+            try:
+                return dict(self._load_dispatch_control_unlocked())
+            except SpoolCorruptionError as exc:
+                self._quarantine_unlocked(exc.path, str(exc))
+                return dict(self._halt_unlocked("dispatch-control 损坏，等待操作员恢复"))
+
+    def halt_dispatch(self, reason: str, *, incident_id: Optional[str] = None) -> dict:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("全局停止原因必须为非空字符串")
+        with exclusive_lock(self.lock_path):
+            try:
+                current = self._load_dispatch_control_unlocked()
+            except SpoolCorruptionError as exc:
+                self._quarantine_unlocked(exc.path, str(exc))
+                current = {"halted": False}
+            if current["halted"]:
+                return dict(current)
+            value = {"version": 1, "halted": True,
+                     "incident_id": incident_id or ("halt-" + secrets.token_hex(12)),
+                     "reason": reason.strip(), "updated_at": now_iso()}
+            self._save_dispatch_control_unlocked(value)
+            return dict(value)
+
+    def clear_dispatch_halt(self, incident_id: str) -> bool:
+        if not isinstance(incident_id, str) or not incident_id:
+            raise ValueError("incident_id 必须为非空字符串")
+        with exclusive_lock(self.lock_path):
+            current = self._load_dispatch_control_unlocked()
+            if not current["halted"]:
+                return False
+            if current["incident_id"] != incident_id:
+                raise SpoolError("DISPATCH_RESUMED incident_id 与当前停止事件不匹配")
+            self._save_dispatch_control_unlocked({"version": 1, "halted": False,
+                                                  "incident_id": None, "reason": "",
+                                                  "updated_at": now_iso()})
+            return True
 
     def _recover_unlocked(self) -> None:
         """清理崩溃遗留临时文件，并以合法终态归档消除 pending/done 双份。"""
@@ -53,7 +118,7 @@ class Spool:
         if self.done_dir.is_dir():
             for path in self.done_dir.glob("*.json"):
                 # 终态记录决定是否仍有未放行槽位；损坏时不能静默忽略并误放后续消息。
-                message = self._load(path)
+                message = self._load_checked(path)
                 if message.state in TERMINAL_STATES:
                     valid_done_ids.add(message.msg_id)
                     messages.append(message)
@@ -66,7 +131,7 @@ class Spool:
                 if path.stem in valid_done_ids:
                     path.unlink(missing_ok=True)
                     continue
-                messages.append(self._load(path))
+                messages.append(self._load_checked(path))
             for path in self.pending_dir.rglob("*.tmp"):
                 path.unlink(missing_ok=True)
         if self.done_dir.is_dir():
@@ -79,7 +144,10 @@ class Spool:
             minimum_next[message.dst] = max(minimum_next.get(message.dst, 1), message.queue_seq + 1)
         for dst, minimum in minimum_next.items():
             if int(meta["next_seq"].get(dst, 0)) < minimum:
-                raise SpoolError(f"queue metadata 的 {dst} next_seq 小于已持久化 queue_seq，拒绝重排")
+                raise SpoolCorruptionError(
+                    self.queue_meta_path,
+                    f"{dst} next_seq 小于已持久化 queue_seq，拒绝重排"
+                )
 
     def _pending_path(self, dst: str, msg_id: str) -> Path:
         self._validate_ids(dst, msg_id)
@@ -116,7 +184,133 @@ class Spool:
                 raise ValueError("retry_of 格式非法")
             return message
         except (OSError, ValueError, TypeError) as exc:
-            raise SpoolError(f"无法读取消息文件 {path}: {exc}") from exc
+            raise SpoolCorruptionError(path, str(exc)) from exc
+
+    def quarantine_incidents(self, *, unresolved_only: bool = False) -> list[dict]:
+        """列出隔离记录；不修改消息状态，也不解除全局停止。"""
+        root = self.root / "corrupt"
+        if not root.is_dir():
+            return []
+        incidents = []
+        with exclusive_lock(self.lock_path):
+            for manifest_path in sorted(root.glob("*/manifest.json")):
+                try:
+                    incident = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if not isinstance(incident, dict) or not isinstance(incident.get("incident_id"), str):
+                        raise ValueError("manifest schema 错误")
+                except (OSError, ValueError, TypeError) as exc:
+                    raise SpoolError(f"无法读取隔离记录 {manifest_path}: {exc}") from exc
+                if not unresolved_only or incident.get("resolved") is not True:
+                    incidents.append(incident)
+        return incidents
+
+    def verify_quarantine_restored(self, incident_id: str) -> dict:
+        """确认操作员已在原位置恢复有效数据；只验证，不记账或解除暂停。"""
+        incident = self._quarantine_manifest(incident_id)
+        if incident.get("resolved") is True:
+            return incident
+        relative_original = Path(incident.get("original_path", ""))
+        if relative_original.is_absolute() or ".." in relative_original.parts:
+            raise SpoolError("隔离记录中的原始路径非法")
+        original = self.root / relative_original
+        if not original.is_file():
+            raise SpoolError(f"损坏文件尚未恢复到原位置: {original}")
+        kind = incident.get("kind")
+        with exclusive_lock(self.lock_path):
+            if kind == "message":
+                self._load_checked(original)
+            elif kind == "queue_meta":
+                self._load_queue_meta_unlocked()
+            elif kind == "dispatch_control":
+                self._load_dispatch_control_unlocked()
+            else:
+                raise SpoolError(f"不支持的隔离文件类型: {kind!r}")
+            self._recover_unlocked()
+        return incident
+
+    def mark_quarantine_resolved(self, incident_id: str) -> dict:
+        """在外层已写入操作员审计后，持久标记隔离项已核验恢复。"""
+        incident = self.verify_quarantine_restored(incident_id)
+        if incident.get("resolved") is True:
+            return incident
+        incident["resolved"] = True
+        incident["resolved_at"] = now_iso()
+        manifest_path = self._quarantine_manifest_path(incident_id)
+        with exclusive_lock(self.lock_path):
+            atomic_write_text(manifest_path, json.dumps(incident, ensure_ascii=False,
+                                                         sort_keys=True, indent=2) + "\n")
+        return incident
+
+    def _load_checked(self, path: Path) -> Message:
+        return self._load(path)
+
+    def _quarantine_manifest_path(self, incident_id: str) -> Path:
+        if not isinstance(incident_id, str) or not re.fullmatch(r"[a-f0-9]{24}", incident_id):
+            raise SpoolError("隔离 incident_id 格式非法")
+        return self.root / "corrupt" / incident_id / "manifest.json"
+
+    def _quarantine_manifest(self, incident_id: str) -> dict:
+        path = self._quarantine_manifest_path(incident_id)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or value.get("incident_id") != incident_id:
+                raise ValueError("manifest schema 错误")
+            return value
+        except (OSError, ValueError, TypeError) as exc:
+            raise SpoolError(f"无法读取隔离记录 {path}: {exc}") from exc
+
+    def _quarantine_unlocked(self, path: Path, reason: str) -> dict:
+        try:
+            relative = path.resolve().relative_to(self.root.resolve())
+        except ValueError as exc:
+            raise SpoolError(f"拒绝隔离 Spool 根目录之外的文件: {path}") from exc
+        incident_id = secrets.token_hex(12)
+        directory = self.root / "corrupt" / incident_id
+        stored = directory / "data" / relative
+        original_exists = path.is_file()
+        if original_exists:
+            stored.parent.mkdir(parents=True, exist_ok=True)
+        if relative.parts and relative.parts[0] in ("pending", "done") and relative.suffix == ".json":
+            kind = "message"
+        elif relative.name == "queue-meta.json":
+            kind = "queue_meta"
+        elif relative.name == "dispatch-control.json":
+            kind = "dispatch_control"
+        else:
+            kind = "unknown"
+        incident = {"version": 1, "incident_id": incident_id, "kind": kind,
+                    "original_path": str(relative),
+                    "quarantine_path": str(stored.relative_to(self.root)) if original_exists else None,
+                    "missing_original": not original_exists,
+                    "reason": reason, "resolved": False, "created_at": now_iso()}
+        if kind == "message" and relative.parts[0] == "pending":
+            incident["target_hint"] = relative.parts[1]
+            incident["msg_id_hint"] = Path(relative.name).stem
+        manifest_path = directory / "manifest.json"
+        # 先落隔离索引，再移动原件；崩溃后即使停在两步之间也能定位并修复。
+        atomic_write_text(manifest_path,
+                          json.dumps(incident, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+        if original_exists:
+            os.replace(path, stored)
+            incident["quarantined"] = True
+            atomic_write_text(manifest_path,
+                              json.dumps(incident, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+        return incident
+
+    def _halt_unlocked(self, reason: str) -> dict:
+        try:
+            current = self._load_dispatch_control_unlocked()
+        except SpoolCorruptionError as exc:
+            # 停止门闩本身损坏时先保留原始文件，再以新的 fail-closed 门闩替代。
+            if exc.path.exists():
+                self._quarantine_unlocked(exc.path, str(exc))
+            current = {"halted": False}
+        if current.get("halted"):
+            return current
+        value = {"version": 1, "halted": True, "incident_id": "halt-" + secrets.token_hex(12),
+                 "reason": reason, "updated_at": now_iso()}
+        self._save_dispatch_control_unlocked(value)
+        return value
 
     def enqueue(self, message: Message) -> Message:
         self._validate_ids(message.dst, message.msg_id)
@@ -168,7 +362,7 @@ class Spool:
             return message
 
     def update(self, msg_id: str, *, state: Optional[str] = None, detail: Optional[str] = None,
-               attempts: Optional[int] = None) -> Message:
+               attempts: Optional[int] = None, ruling_id: Optional[str] = None) -> Message:
         self._validate_ids("agent", msg_id)
         with exclusive_lock(self.lock_path):
             path = self._locate(msg_id)
@@ -198,7 +392,8 @@ class Spool:
                 atomic_write_text(self._done_path(msg_id), self._dump(updated))
                 path.unlink(missing_ok=True)
                 if updated.state == DELIVERED:
-                    self._release_slot_unlocked(updated.dst, updated.queue_seq, reason="DELIVERED")
+                    self._release_slot_unlocked(updated.dst, updated.queue_seq, reason="DELIVERED",
+                                                ruling_id=ruling_id)
             else:
                 atomic_write_text(path, self._dump(updated))
             return updated
@@ -296,6 +491,10 @@ class Spool:
                 existing = records[key]
                 if ruling_id and existing.get("ruling_id") not in (None, ruling_id):
                     raise SpoolError("槽位已由另一 ruling_id 放行")
+                if ruling_id and existing.get("ruling_id") is None:
+                    existing["ruling_id"] = ruling_id
+                    self._save_queue_meta_unlocked(meta)
+                    return True
                 return False
             records[key] = {"reason": reason, "ruling_id": ruling_id}
             self._save_queue_meta_unlocked(meta)
@@ -346,22 +545,50 @@ class Spool:
                     raise ValueError("queue metadata released entry 非法")
             return value
         except (OSError, ValueError, TypeError) as exc:
-            raise SpoolError(f"无法读取 queue metadata {self.queue_meta_path}: {exc}") from exc
+            raise SpoolCorruptionError(self.queue_meta_path, f"queue metadata schema/data 错误: {exc}") from exc
 
     def _save_queue_meta_unlocked(self, meta: dict) -> None:
         atomic_write_text(self.queue_meta_path,
                           json.dumps(meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
 
+    def _load_dispatch_control_unlocked(self) -> dict:
+        if not self.dispatch_control_path.exists():
+            return {"version": 1, "halted": False, "incident_id": None,
+                    "reason": "", "updated_at": ""}
+        try:
+            value = json.loads(self.dispatch_control_path.read_text(encoding="utf-8"))
+            if (not isinstance(value, dict) or value.get("version") != 1
+                    or not isinstance(value.get("halted"), bool)
+                    or (value["halted"] and (not isinstance(value.get("incident_id"), str)
+                                             or not value["incident_id"]))):
+                raise ValueError("dispatch control schema 错误")
+            return value
+        except (OSError, ValueError, TypeError) as exc:
+            raise SpoolCorruptionError(self.dispatch_control_path,
+                                       f"dispatch-control schema/data 错误: {exc}") from exc
+
+    def _save_dispatch_control_unlocked(self, value: dict) -> None:
+        atomic_write_text(self.dispatch_control_path,
+                          json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+
     def _slot_released_unlocked(self, dst: str, queue_seq: int) -> bool:
         meta = self._load_queue_meta_unlocked()
         return str(queue_seq) in meta["released"].get(dst, {})
 
-    def _release_slot_unlocked(self, dst: str, queue_seq: int, *, reason: str) -> bool:
+    def _release_slot_unlocked(self, dst: str, queue_seq: int, *, reason: str,
+                               ruling_id: Optional[str] = None) -> bool:
         meta = self._load_queue_meta_unlocked()
         records = meta["released"].setdefault(dst, {})
         key = str(queue_seq)
         if key in records:
+            existing = records[key]
+            if ruling_id and existing.get("ruling_id") is None:
+                existing["ruling_id"] = ruling_id
+                self._save_queue_meta_unlocked(meta)
+                return True
+            if ruling_id and existing.get("ruling_id") != ruling_id:
+                raise SpoolError("槽位已由另一 ruling_id 放行")
             return False
-        records[key] = {"reason": reason, "ruling_id": None}
+        records[key] = {"reason": reason, "ruling_id": ruling_id}
         self._save_queue_meta_unlocked(meta)
         return True

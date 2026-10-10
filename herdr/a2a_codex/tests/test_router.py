@@ -9,6 +9,7 @@ from pathlib import Path
 
 import yaml
 
+from a2a_codex.audit import AuditLogCorruptionError
 from a2a_codex import (
     AgentIdentity,
     AuditLog,
@@ -404,10 +405,48 @@ class SpoolAuditTests(unittest.TestCase):
         self.assertFalse(process.is_alive())
         self.assertEqual(process.exitcode, 73)
 
-        self.assertEqual([event["event_id"] for event in self.audit.read()], ["before"])
+        records = self.audit.read()
+        self.assertEqual([event["event_id"] for event in records if "event_id" in event], ["before"])
+        self.assertIn("AUDIT_REPAIRED", [event.get("event") for event in records])
         self.assertTrue(self.audit.path.read_bytes().endswith(b"\n"))
         self.audit.record({"event_id": "after", "state": "TEST"})
-        self.assertEqual([event["event_id"] for event in self.audit.read()], ["before", "after"])
+        records = self.audit.read()
+        self.assertEqual([event["event_id"] for event in records if "event_id" in event],
+                         ["before", "after"])
+        self.assertIn("AUDIT_REPAIRED", [event.get("event") for event in records])
+
+    def test_audit_quarantines_corrupt_tail_bytes_and_records_repair(self):
+        self.audit.record({"event_id": "before"})
+        damaged_tail = b"\xff\x00incomplete-tail"
+        with self.audit.path.open("ab") as stream:
+            stream.write(damaged_tail)
+
+        records = self.audit.read()
+
+        self.assertEqual([event["event_id"] for event in records if "event_id" in event],
+                         ["before"])
+        self.assertEqual([event["event"] for event in records if event.get("event") == "AUDIT_REPAIRED"],
+                         ["AUDIT_REPAIRED"])
+        corrupt_path = self.audit.path.with_name(self.audit.path.name + ".corrupt")
+        self.assertEqual(corrupt_path.read_bytes(), damaged_tail + b"\n")
+        self.assertTrue(self.audit.path.read_bytes().endswith(b"\n"))
+
+    def test_audit_middle_corrupt_line_is_diagnostic_and_strict_read_fails_closed(self):
+        valid_before = b'{"event_id":"before"}\n'
+        invalid_middle = b"{middle is corrupt}\n"
+        valid_after = b'{"event_id":"after"}\n'
+        original = valid_before + invalid_middle + valid_after
+        self.audit.path.write_bytes(original)
+
+        records = self.audit.read()
+
+        self.assertEqual(records[0]["event_id"], "before")
+        self.assertEqual(records[1]["event"], "CORRUPT_LINE")
+        self.assertEqual(records[1]["line"], 2)
+        self.assertEqual(records[2]["event_id"], "after")
+        with self.assertRaises(AuditLogCorruptionError):
+            self.audit.read(strict=True)
+        self.assertEqual(self.audit.path.read_bytes(), original)
 
     def test_audit_keeps_valid_final_record_without_newline(self):
         self.audit.record({"event_id": "first"})

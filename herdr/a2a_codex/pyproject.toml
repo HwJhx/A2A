@@ -10,5 +10,9 @@ requires-python = ">=3.9"
 dependencies = ["PyYAML>=5.4"]
 
 [project.scripts]
+a2a = "a2a_codex.cli:main"
 a2a-herdr = "a2a_codex.cli:main"
+
+[tool.setuptools.package-data]
+a2a_codex = ["config/*.yaml"]
 
