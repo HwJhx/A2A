@@ -21,6 +21,7 @@ from __future__ import annotations
 import getpass
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -65,7 +66,8 @@ class Lifecycle:
             raise ValueError("生命周期操作必须指定 herdr 会话")
         self.client, self.topology, self.registry, self.audit = client, topology, registry, audit
         self.session = client.session
-        self.lock_dir = Path(state_dir) / "lifecycle"
+        self.state_dir = Path(state_dir)
+        self.lock_dir = self.state_dir / "lifecycle"
         self.detect_timeout_s, self.ready_timeout_s, self.stop_timeout_s = detect_timeout_s, ready_timeout_s, stop_timeout_s
         self._kill, self._sleep = kill, sleep
 
@@ -163,7 +165,7 @@ class Lifecycle:
     def _new_pane(self, identity: AgentIdentity, cwd: Optional[str]) -> Dict[str, str]:
         """按布局为 agent 建一个新 pane,注入身份环境变量。"""
         topology = self.topology.current()
-        env = identity_env(identity.project_id, identity.role, identity.ip_id)
+        env = self._agent_env(identity)
         cwd = cwd or os.path.expanduser("~")
         role_label = topology.roles[identity.role].label or identity.role
         workspace = next((w for w in self.client.workspace_list() if w.get("label") == topology.workspace_label), None)
@@ -177,6 +179,17 @@ class Lifecycle:
         if tab is None or not panes:
             return self._where(self.client.tab_create(workspace_id=workspace_id, label=role_label, cwd=cwd, env=env))
         return self._where(self.client.pane_split(panes[-1]["pane_id"], direction="down", cwd=cwd, env=env))
+
+    def _agent_env(self, identity: AgentIdentity) -> Dict[str, str]:
+        """注入新 pane 的环境变量:身份,加上 pi 插件调用 `a2a send` 所需的位置信息。
+
+        插件在 agent 进程里用 A2A_PYTHON -m a2a.cli 调用 Router(PYTHONPATH=A2A_SRC),
+        与 broker 共用同一个状态目录和拓扑文件;这样不需要把 a2a 安装进系统。
+        """
+        env = identity_env(identity.project_id, identity.role, identity.ip_id)
+        env.update({"A2A_STATE_DIR": str(self.state_dir), "A2A_TOPOLOGY": str(self.topology.path),
+                    "A2A_PYTHON": sys.executable, "A2A_SRC": str(Path(__file__).resolve().parents[1])})
+        return env
 
     @staticmethod
     def _where(created) -> Dict[str, str]:
@@ -201,7 +214,8 @@ class Lifecycle:
 
     def _launch(self, pane_id: str, identity: AgentIdentity, launcher: str) -> str:
         self.client.pane_rename(pane_id, identity.agent_id)  # 显示名,不影响寻址
-        self.client.pane_run(pane_id, build_launch_command(launcher))
+        launch_args = self.topology.current().roles[identity.role].launch_args
+        self.client.pane_run(pane_id, build_launch_command(launcher, launch_args))
         self.client.wait_for_agent_detected(pane_id, timeout_s=self.detect_timeout_s)
         try:
             self.client.agent_wait(pane_id, until=READY_STATUSES, timeout_ms=int(self.ready_timeout_s * 1000))

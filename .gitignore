@@ -1,1 +1,4 @@
 *.openscreen
+*.mp4
+.DS_Store
+gsc_debug/

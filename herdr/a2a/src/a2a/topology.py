@@ -52,6 +52,8 @@ class RoleSpec:
     label: str
     kind: str = "pi"
     launcher: Optional[str] = None
+    # 追加给启动脚本的参数,例如测试时用 ["--no-builtin-tools"] 让模型只剩 a2a_send
+    launch_args: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,7 +124,10 @@ class Topology:
                 raise TopologyError(f"roles.{role_id}.kind 必须是非空字符串")
             if launcher is not None and (not isinstance(launcher, str) or not launcher.startswith("/")):
                 raise TopologyError(f"roles.{role_id}.launcher 必须为空或绝对路径")
-            roles[role_id] = RoleSpec(role_id, label, kind, launcher)
+            launch_args = config.get("launch_args") or []
+            if not isinstance(launch_args, list) or not all(isinstance(a, str) and a for a in launch_args):
+                raise TopologyError(f"roles.{role_id}.launch_args 必须是非空字符串的列表")
+            roles[role_id] = RoleSpec(role_id, label, kind, launcher, tuple(launch_args))
 
         ip_data = data.get("ips", [])
         if ip_data is None:
@@ -200,7 +205,8 @@ class Topology:
             "project_id": self.project_id,
             "workspace_label": self.workspace_label,
             "roles": {
-                role.role_id: {"label": role.label, "kind": role.kind, "launcher": role.launcher}
+                role.role_id: dict({"label": role.label, "kind": role.kind, "launcher": role.launcher},
+                                   **({"launch_args": list(role.launch_args)} if role.launch_args else {}))
                 for role in self.roles.values()
             },
             "ips": list(self.ips),

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from .audit import AuditLog
 from .identity import (
@@ -28,6 +28,7 @@ from .identity import (
     ENV_PANE,
     ENV_PROJECT,
     ENV_ROLE,
+    AgentIdentity,
     IdentityError,
     resolve_sender,
 )
@@ -196,6 +197,25 @@ class Router:
         })
         return SendReceipt(msg_id, edge_id, message.src, message.dst, text, QUEUED, revision,
                            stored.queue_seq)
+
+    def edges(self, env: Optional[Mapping[str, str]] = None) -> List[Dict[str, str]]:
+        """env 所声称的角色可以使用的边,以及每条边按其 IP 渲染后的完整文字。
+
+        只读,不入队、不写审计;供 pi 插件生成 a2a_send 的取值与说明。插件在 agent 启动时加载,
+        那时 spawn 还没登记注册表,所以这里只要求环境变量里的 (项目, 角色, IP) 在当前拓扑里,
+        **不**核实注册表与 pane。真正发送时 send() 仍做完整的身份核实,列表本身不授予任何权限。
+        目标节点不在拓扑里的边不列出(发了也会被拒绝)。身份不在拓扑里抛 SendRejected。
+        """
+        env = os.environ if env is None else env
+        topology, _ = self._topology()
+        try:
+            identity = AgentIdentity.from_environment(env, topology)
+        except IdentityError as exc:
+            raise SendRejected(REJECT_IDENTITY, f"{type(exc).__name__}: {exc}", msg_id="", cause=exc) from exc
+        return [{"edge_id": edge.edge_id, "dst": f"{edge.target_role}_{identity.ip_id}",
+                 "text": edge.template.format(ip=identity.ip_id)}
+                for edge in topology.edges_from(identity.role)
+                if topology.has_node(edge.target_role, identity.ip_id)]
 
     def _check_text(self, text: str) -> Optional[str]:
         if not text.strip():

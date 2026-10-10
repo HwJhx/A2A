@@ -297,21 +297,52 @@
 其他:
 
 - [ ] 升级 herdr 后重跑 `review-probes/probe_herdr_errors.py`
-- [ ] 真实 `fnx_dv → fnx_sw` 端到端归入阶段 7(会调用模型,须用户同意)
+- [x] 真实 `fnx_dv → fnx_sw` 端到端:经用户同意并入阶段 6,已跑通(见下)
 
-## 阶段 6:pi 侧接入
+## 阶段 6:pi 侧接入 + 真实模型链路(2026-10-10,测试方案 `10-stage6-test-plan.md`,插件说明 `11-pi-extension-explained.md`)
 
-- [ ] 在 `AGENTS.md` 中写明:什么时候用 `a2a send`、不要直接执行 `herdr` 写入类命令
-- [ ] pi 扩展:`pi.registerTool()` 注册 `a2a_send`,只接受边 id
-- [ ] pi 扩展:`tool_call` 钩子,拦截 `herdr agent prompt` / `herdr pane send-*` / `herdr pane run`
-- [ ] 让 `fnx_sw` 收到固定句式后真的开始驱动与 HAL 开发(提示词或技能)
-- [ ] 让 `fnx_dv` 在 UVM 验证完成时调用 `a2a send dv_done`
+pi 侧接入(不调用模型):
+
+- [x] spawn 支持启动参数:拓扑角色新增 `launch_args`(测试时 `--no-builtin-tools`,模型只剩 `a2a_send`)
+- [x] spawn 向 pane 额外注入 `A2A_STATE_DIR` / `A2A_TOPOLOGY` / `A2A_PYTHON` / `A2A_SRC`,插件与 broker 用同一状态目录,VM 不需安装 a2a
+- [x] 新命令 `a2a edges`:列出当前身份可用的边及填好 IP 的文字;只读拓扑、不核对注册表(插件加载早于登记),不授予权限,`send` 仍完整鉴权
+- [x] pi 扩展 `pi-extension/a2a.ts`:`pi.registerTool()` 注册 `a2a_send`,参数只有 `edge_id`(enum 限定为本角色出边),执行时 `execFile` 调 `python -m a2a.cli send`,不经 shell;被拒时把原因作为工具错误返回
+- [x] pi 扩展:`tool_call` 钩子,拦截 bash 中的 `herdr agent prompt` / `herdr pane send-text/send-keys/run`;读状态命令不拦
+- [x] 实测 fnx(pi 0.79.10)从 `agent/extensions/` 自动加载扩展、`--no-builtin-tools` 后只剩扩展工具
+- [x] `AGENTS.md`:不需要。测试约束("不要真的去做"等)直接写进模板,工具说明里写明用 `a2a_send`、不要直接调 herdr
+- [ ] 将来考虑:插件目前是每个 agent 目录一份副本,可改为软链接到仓库同一文件;另外 3 个 pi 智能体待实测能否加载
+
+测试:Mac 单元 439 个通过(跳过 32:31 个集成 + 1 个需本机装 fnx 的启动脚本预检);插件单元测试 8 个(Mac 用 node 加载,覆盖 插件 → 命令行 → Router → 队列);VM 全套 439 个通过、跳过 8 个(插件单元测试,VM 无 node);其中**真实 herdr 集成测试 31 个全部通过**(含真实 fnx 4 个:插件加载、只剩 `a2a_send`、enum 与说明文字正确,不发提示词)。
+
+真实模型链路(经用户同意调用模型,uart,会话 `a2a_s6`):
+
+- [x] 唯一人工输入:`herdr agent prompt` 给 fnx_dv"假设你已经完成了 uart ip 的 UVM 验证,请用 a2a_send 工具通知软件智能体。"
+- [x] fnx_dv 模型自己调用 `a2a_send(dv_done)` → broker 投递给 sw_uart
+- [x] fnx_sw 模型调用 `a2a_send(sw_test_pass)`(二选一选了"测试成功")→ broker 投递给 dv_uart
+- [x] fnx_dv 回复"收到",没有调用工具
+- [x] 审计:两次投递各一次(QUEUED → DISPATCHING → DELIVERED → QUEUE_RELEASED),文字与模板填入 uart 后逐字一致;全程约 6 秒;broker 日志无错误
+- [x] 模型证据:两边 TUI 状态栏 `(SophNet) DeepSeek-Flash`;fnx 会话文件每条 assistant 消息记录 provider=sophnet、model=DeepSeek-Flash 和 token 用量
+- [x] 临时工作目录保持为空
+- [ ] 观察:两边调用 `a2a_send` 后都多输出了一段"已发送"总结,不影响通信;正式使用时可在模板里加约束
+- [ ] `sw_test_fail` 未被真实模型覆盖(该边的鉴权、填模板、投递由不调用模型的测试覆盖);是否补跑由用户决定
+- [ ] 正式使用:让 `fnx_sw` 收到固定句式后真的开始驱动与 HAL 开发、让 `fnx_dv` 在 UVM 验证完成时调用 `a2a_send(dv_done)`(模板换成真实工作指令)
+
+### 阶段 6 审核修复(Codex 审核未提交的阶段 6)
+
+- [x] 插件发送结果分三类(Codex 应修:入队后报错会让模型重试、重复投递)✅ 只有"退出码 4 + Router 拒绝 JSON"报"已拒绝,消息没有发送"(工具错误);超时、python 出错、回执看不懂、入队后写审计失败都报"发送结果未知"(不是工具错误),要求不要再次调用、停止自动流程、告诉用户,并给出核查方式;取消信号不再传给发送子进程(Esc 不能取消已开始的发送);工具说明加"每次通知只调用一次"。修复方案先经 Codex 审核。测试:插件单元新增 5 个(崩溃、超时、回执看不懂、入队后审计失败、说明文字),变异检查(未知改回按拒绝处理)4 个失败
+- [x] 成功回执严格校验(Codex 复核应修)✅ `msg_id`/`dst`/`text` 非空、`state` 为 QUEUED、`queue_seq` 为非负整数才算发送成功,否则归为结果未知。测试:10 种畸形回执 + 1 个合法回执;变异检查(改回只查 msg_id)8 个子用例失败
+- [x] 真实 fnx 集成测试不再删除已常驻安装的插件(结束时还原原内容)
+- [ ] 将来考虑:机制级防重复需要稳定的业务事件 ID 幂等;toolCallId 不行(模型重试是新的调用、新的 ID)
+- [ ] 将来考虑:`HERDR_WRITE` 正则可能误拦文档 / 搜索命令,也能被变量、别名绕过;它是软限制,不是安全边界
+- [ ] 将来考虑:插件加载时缓存可用的边,拓扑新增边要重启 agent 才可见,删除的边仍显示但会被 Router 拒绝;留到动态拓扑阶段
+
+修复后测试:Mac 单元 445 个通过(跳过 32:31 个集成 + 1 个需本机 fnx);插件单元 14 个在 Mac 通过;VM 全套 445 个通过、跳过 14 个(插件单元测试,VM 无 node),其中真实 herdr 集成测试 31 个全部通过。已常驻安装的插件更新为修复后的版本(运行中的 `a2a_s6` 两个 agent 仍是旧版,重启后才加载新版)。
 
 ## 阶段 7:全链路
 
-- [ ] 跑通 `dv_uart` → `sw_uart`
+- [x] 跑通 `dv_uart` → `sw_uart`(已在阶段 6 用真实模型跑通双向)
 - [ ] 回退通信(如验证 → RTL)按拓扑配置跑通
-- [ ] 审计日志里能看到完整一次链路
+- [x] 审计日志里能看到完整一次链路(阶段 6 真实链路)
 
 ## 阶段 8:规模化
 

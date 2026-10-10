@@ -86,6 +86,18 @@ def cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_edges(args: argparse.Namespace) -> int:
+    """当前 pane 身份可以使用的边及渲染后的文字(只读;pi 插件用它生成 a2a_send 的说明)。"""
+    router = Router(TopologyStore(), Registry(default_registry_path()), _spool(), _audit())
+    try:
+        edges = router.edges()
+    except SendRejected as exc:
+        print(json.dumps({"rejected": exc.code, "reason": exc.reason}, ensure_ascii=False), file=sys.stderr)
+        return EXIT_REJECTED
+    _out({"edges": edges})
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     try:
         _out(_spool().get(args.msg_id).to_dict())
@@ -298,6 +310,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("send", help="发送一条固定句式消息(在 agent 的 pane 里运行)")
     p.add_argument("edge_id")
     p.set_defaults(func=cmd_send)
+
+    p = sub.add_parser("edges", help="列出当前 pane 身份可用的通信边及渲染后的文字(只读)")
+    p.set_defaults(func=cmd_edges)
 
     p = sub.add_parser("status", help="查询一条消息")
     p.add_argument("msg_id")

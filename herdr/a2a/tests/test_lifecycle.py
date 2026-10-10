@@ -117,7 +117,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        d = Path(temp.name)
+        d = self.dir = Path(temp.name)
         self.launcher = d / "fnx_fake"
         self.launcher.write_text("#!/bin/bash\nexport X=1\nexec /bin/sleep 100 \"$@\"\n")
         self.store = TopologyStore.create(d / "topology.yaml", {
@@ -147,8 +147,14 @@ class Spawn(Base):
         self.assertEqual(kinds, ["workspace_create", "pane_split"])  # 同一角色第二个 IP 在同一 tab 里拆分
         self.assertEqual(uart.tab_id, gpio.tab_id)
         self.assertEqual(self.herdr.tabs[0]["label"], "验证智能体")
-        self.assertEqual(self.herdr.panes[gpio.pane_id]["env"],
+        env = self.herdr.panes[gpio.pane_id]["env"]
+        self.assertEqual({k: env[k] for k in ("A2A_PROJECT_ID", "A2A_ROLE", "A2A_IP")},
                          {"A2A_PROJECT_ID": "soc_a", "A2A_ROLE": "dv", "A2A_IP": "gpio"})
+        # pi 插件调用 `a2a send` 需要的位置:与 broker 同一个状态目录与拓扑,以及运行 a2a 的 Python
+        self.assertEqual(env["A2A_STATE_DIR"], str(self.dir))
+        self.assertEqual(env["A2A_TOPOLOGY"], str(self.dir / "topology.yaml"))
+        self.assertTrue(Path(env["A2A_PYTHON"]).exists())
+        self.assertTrue((Path(env["A2A_SRC"]) / "a2a" / "cli.py").exists())
         self.assertEqual((uart.lifecycle, uart.agent_name), ("running", "dv_uart"))
         self.assertEqual(len(self.events("AGENT_SPAWNED")), 2)
 
@@ -158,6 +164,12 @@ class Spawn(Base):
         self.assertLess(names.index("pane_run"), names.index("agent_rename"))
         run = next(c for c in self.herdr.calls if c[0] == "pane_run")
         self.assertIn("exec -a pi", run[2])  # 覆盖 exec 的启动命令
+
+    def test_launch_args_from_topology_are_passed_to_the_launcher(self):
+        self.store.update(lambda data: data["roles"]["dv"].update(launch_args=["--no-builtin-tools"]))
+        self.life.spawn("dv", "uart")
+        run = next(c for c in self.herdr.calls if c[0] == "pane_run")
+        self.assertTrue(run[2].endswith(" _ --no-builtin-tools"), run[2])
 
     def test_refuses_before_touching_herdr(self):
         for role, ip, error in (("dv", "spi", LifecycleError), ("sw", "uart", LifecycleError)):

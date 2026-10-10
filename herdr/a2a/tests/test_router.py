@@ -129,6 +129,33 @@ class TestAccepted(RouterBase):
         self.assertEqual(receipt.topology_revision, "static")
 
 
+class TestEdgesListing(RouterBase):
+    """阶段 6:pi 插件用 Router.edges() 生成 a2a_send 的取值和说明。"""
+
+    def test_lists_only_the_senders_edges_rendered_with_its_own_ip(self):
+        self.assertEqual(self.router.edges(env_of("dv", "gpio")), [
+            {"edge_id": "dv_done", "dst": "sw_gpio", "text": "gpio已完成UVM验证,请开发驱动。"},
+            {"edge_id": "dv_rtl_fix", "dst": "rtl_gpio", "text": "gpio验证发现RTL问题。"},
+        ])
+        self.assertEqual(self.router.edges(env_of("sw", "uart")), [])  # sw 没有出边
+
+    def test_is_read_only(self):
+        self.router.edges(env_of("dv", "uart"))
+        self.assertEqual((self.spool.pending(), self.audit.read()), ([], []))
+
+    def test_identity_outside_the_topology_is_rejected(self):
+        for env in (env_of("dv", "uart", A2A_IP="spi"), env_of("dv", "uart", A2A_ROLE=None)):
+            with self.assertRaises(SendRejected) as ctx:
+                self.router.edges(env)
+            self.assertEqual(ctx.exception.code, "identity")
+
+    def test_works_before_registration_but_send_still_verifies(self):
+        # 插件在 agent 登记前加载:列出边不查注册表;冒充者能看到列表,但发送仍被拒绝
+        fake = env_of("dv", "uart", HERDR_PANE_ID="w1:p9")
+        self.assertEqual([e["edge_id"] for e in self.router.edges(fake)], ["dv_done", "dv_rtl_fix"])
+        self.assertRejected("identity", "dv_done", fake)
+
+
 class TestRejectedIdentity(RouterBase):
     def test_missing_environment_variables(self):
         for name in ("HERDR_PANE_ID", "A2A_PROJECT_ID", "A2A_ROLE", "A2A_IP"):

@@ -225,5 +225,92 @@ class RealFnxLifecycle(_Base):
             self.assertTrue(self.wait_gone(f"{role}_uart"))
 
 
+PLUGIN = HERE.parent / "pi-extension" / "a2a.ts"
+INSPECT = HERE / "pi-ext" / "a2a-inspect.ts"
+STAGE6_EDGES = [
+    {"id": "dv_done", "from": "dv", "to": "sw",
+     "template": "{ip} ip 我已经完成了uvm验证，你需要对这个{ip} ip进行 驱动程序开发和HAL框架开发。"
+                 "不要真的去做，直接用 a2a_send 回复测试成功或测试失败（二选一）"},
+    {"id": "sw_test_pass", "from": "sw", "to": "dv",
+     "template": "我已经完成了{ip} ip的驱动程序开发，测试成功。你只回复收到即可，不要真的去做"},
+    {"id": "sw_test_fail", "from": "sw", "to": "dv",
+     "template": "我已经完成了{ip} ip的驱动程序开发，测试失败。你只回复收到即可，不要真的去做"},
+]
+
+
+@unittest.skipUnless(ENABLED and FNX_ENABLED and HAVE_TOOLS and all(os.path.exists(p) for p in FNX.values()),
+                     "设置 A2A_INTEGRATION=1 与 A2A_INTEGRATION_FNX=1,并安装 fnx_dv / fnx_sw")
+class RealFnxPlugin(_Base):
+    """阶段 6:真实 fnx 加载 a2a 插件。**不发任何提示词,不调用模型。**
+
+    插件与检查扩展临时复制进 fnx 的 agent/extensions/,结束时移除(目录原本不存在则一并删除)。
+    """
+
+    def make_launchers(self):
+        return dict(FNX)
+
+    def setUp(self):
+        super().setUp()
+
+        def stage6(data):
+            data["edges"] = STAGE6_EDGES
+            for role in ("dv", "sw"):
+                data["roles"][role]["launch_args"] = ["--no-builtin-tools"]
+        self.store.update(stage6)
+        (self.state / "inspect.enabled").touch()
+        self.work = self.state / "work"  # agent 的工作目录:测试结束时必须仍为空
+        self.work.mkdir()
+        for role in ("dv", "sw"):
+            ext = Path(FNX[role]).parents[1] / "agent" / "extensions"
+            if not ext.exists():
+                self.addCleanup(self._rmdir_if_empty, ext)  # 逆序执行:在删完下面的文件之后
+            ext.mkdir(exist_ok=True)
+            for src in (PLUGIN, INSPECT):
+                dest = ext / src.name
+                if dest.exists():  # 已常驻安装的插件:测试结束时还原原内容
+                    self.addCleanup(dest.write_bytes, dest.read_bytes())
+                else:
+                    self.addCleanup(dest.unlink, missing_ok=True)
+                shutil.copy(src, dest)
+            # fnx 按工作目录在 agent/sessions/ 下建会话目录;没有发提示词,应当是空的
+            sessions = Path(FNX[role]).parents[1] / "agent" / "sessions"
+            self.addCleanup(self._rmdir_if_empty, sessions / ("-" + str(self.work).replace("/", "-") + "--"))
+        # 清理按注册的逆序执行:先停掉 agent,再移除扩展文件和空目录
+        self.addCleanup(self.purge_all)
+
+    @staticmethod
+    def _rmdir_if_empty(path):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+    def inspect(self, agent_id, timeout=30):
+        path = self.state / f"inspect-{agent_id}.json"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not path.exists():
+            time.sleep(0.3)
+        self.assertTrue(path.exists(), f"{agent_id} 的 fnx 没有写出检查结果(插件没加载?)")
+        return json.loads(path.read_text())
+
+    def test_fnx_loads_the_plugin_and_only_a2a_send_is_active(self):
+        expected = {"dv": {"dv_done": STAGE6_EDGES[0]}, "sw": {"sw_test_pass": STAGE6_EDGES[1],
+                                                                "sw_test_fail": STAGE6_EDGES[2]}}
+        for role in ("dv", "sw"):
+            self.a2a("agent", "spawn", role, "uart", "--cwd", str(self.work))
+            seen = self.inspect(f"{role}_uart")
+            self.assertEqual(seen["active"], ["a2a_send"])  # --no-builtin-tools:没有 read/write/edit/bash
+            self.assertEqual(seen["cwd"], str(self.work))
+            send = seen["a2a_send"]
+            self.assertEqual(send["parameters"]["properties"]["edge_id"]["enum"], list(expected[role]))
+            for edge_id, edge in expected[role].items():
+                text = edge["template"].format(ip="uart")
+                self.assertIn(f"{edge_id}:发给 {edge['to']}_uart,内容是「{text}」", send["description"])
+            environ = self.environ_of_agent(self.registry.get(f"{role}_uart").pane_id)
+            self.assertEqual(environ["A2A_STATE_DIR"], str(self.state))
+        self.assertEqual(sorted(p.name for p in self.work.iterdir()), [])
+        self.assertEqual(self.registry.get("sw_uart").lifecycle, "running")
+
+
 if __name__ == "__main__":
     unittest.main()
