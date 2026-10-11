@@ -280,6 +280,18 @@ def cmd_agent(args: argparse.Namespace) -> int:
         if args.op == "list":
             _out(life.list())
             return 0
+        if args.op == "recover":
+            from .recovery import BrokerRunning, Recovery
+            topology = life.topology.current()
+            recovery = Recovery(lifecycle=life, registry=life.registry, spool=_spool(), audit=_audit(),
+                                client=life.client, state_dir=state_dir(), session=session,
+                                role_order=list(topology.roles))
+            try:
+                result = recovery.recover(ip=args.ip, dry_run=args.dry_run, include_stopped=args.include_stopped)
+            except BrokerRunning as exc:
+                return _err(str(exc), EXIT_RUNNING)
+            _out(result)
+            return EXIT_INVALID if result.get("problems") else 0
         if args.op in ("spawn", "restore"):
             record = getattr(life, args.op)(args.role, args.ip, cwd=args.cwd)
         else:
@@ -423,6 +435,12 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("spawn", "restore"):
             p.add_argument("--cwd", help="agent 的工作目录(默认家目录)")
         p.set_defaults(func=cmd_agent)
+    p = agent.add_parser("recover", help="会话重启后恢复本会话应在运行的 agent(先停 broker)")
+    p.add_argument("--session", required=True)
+    p.add_argument("--ip", help="只处理这个 IP")
+    p.add_argument("--dry-run", action="store_true", help="只输出分类,不改动(结果只是此刻的快照)")
+    p.add_argument("--include-stopped", action="store_true", help="同时恢复 stopped 的记录(仍先核验 pane)")
+    p.set_defaults(func=cmd_agent)
     p = agent.add_parser("list", help="注册表 + herdr 实时状态")
     p.add_argument("--session")
     p.set_defaults(func=cmd_agent)

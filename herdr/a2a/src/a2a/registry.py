@@ -63,6 +63,8 @@ class AgentRecord:
     lifecycle: str
     registered_at: str
     updated_at: str
+    # agent 的工作目录(18 号方案 Codex 审核):pane 丢失后新建 pane 时用;旧记录没有这个字段
+    cwd: Optional[str] = None
 
     @property
     def identity(self) -> AgentIdentity:
@@ -171,6 +173,7 @@ class Registry:
         agent_name: Optional[str] = None,
         status: str = "unknown",
         lifecycle: str = "running",
+        cwd: Optional[str] = None,
     ) -> AgentRecord:
         for value, name in (
             (identity.project_id, "project_id"), (identity.ip_id, "ip_id"), (identity.role, "role"),
@@ -193,7 +196,7 @@ class Registry:
             now = _now()
             record = AgentRecord(
                 identity.project_id, identity.ip_id, identity.role, identity.agent_id, session,
-                workspace_id, tab_id, pane_id, name, status, lifecycle, now, now,
+                workspace_id, tab_id, pane_id, name, status, lifecycle, now, now, cwd,
             )
             self._assert_unique_runtime(records, record)
             records[identity.agent_id] = record
@@ -211,6 +214,7 @@ class Registry:
         agent_name: Optional[str] = None,
         status: Optional[str] = None,
         lifecycle: Optional[str] = None,
+        cwd: Optional[str] = None,
     ) -> AgentRecord:
         """更新运行时地址或状态。业务身份不可改。pane 重建后调用它。"""
         with self._thread_lock, exclusive_lock(self.lock_path):
@@ -222,11 +226,11 @@ class Registry:
             for key, value in (
                 ("session", session), ("workspace_id", workspace_id), ("tab_id", tab_id),
                 ("pane_id", pane_id), ("agent_name", agent_name), ("status", status),
-                ("lifecycle", lifecycle),
+                ("lifecycle", lifecycle), ("cwd", cwd),
             ):
                 if value is not None:
                     changes[key] = value
-            for key in ("session", "workspace_id", "tab_id", "pane_id", "agent_name"):
+            for key in ("session", "workspace_id", "tab_id", "pane_id", "agent_name", "cwd"):
                 if key in changes:
                     _text(changes[key], key)
             if len(changes.get("agent_name", old.agent_name)) > 32:

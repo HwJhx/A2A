@@ -377,7 +377,7 @@ pi 侧接入(不调用模型):
   - Codex 第四轮复核(阻断 1)已修:删除前对所有将被关闭的 pane 检查前台进程,只有前台只剩 shell、或前台正是登记的 running agent 才放行(stopped 记录、herdr 认不出的前台进程都拒绝,--force 不跳过)。新增 2 个测试,2 处变异各自被发现。Mac 单元 501 通过(跳过 40);VM 全套 501 通过、0 跳过
   - Codex 第五轮复核(阻断 1)已修:"前台只有 shell"改为字段齐全、相互一致才成立(依据 herdr 实测),否则拒绝删除。新增 1 个测试(4 种不完整 / 矛盾情况),变异"改回宽松判断"被发现。Mac 单元 502 通过(跳过 40);VM 全套 502 通过、0 跳过
   - Codex 第六轮复核:没有问题(2026-10-11)
-- [ ] registry 自动恢复
+- [x] registry 自动恢复 ✅ 方案 `18-stage8-registry-recovery-plan.md`(Codex 审核 2 轮)。探测:会话重启后 pane 与 pane ID 保留、进程退出只剩 shell、agent 名字丢失;RESUME_ARG 会被 herdr 执行(不采用)。`a2a agent recover`:只处理本会话、持 broker 单实例锁、按严格 pane 判定分类、逐个 restore、附队列提示。实现中发现并修复:会话重启后 pane 的新 shell 不带身份变量,改为启动命令自带身份。Codex 实现审核应修 3 条已修(注册表登记 cwd,pane 丢失无 cwd 归为不确定;分类出错只影响单个 agent;集成测试按真实锁状态等待)。Mac 单元 527 通过(跳过 42);VM 全套 527 通过、0 跳过
 - [x] 多 IP 并发 ✅ 阶段 7 用屏障验证 uart/gpio 同时发送隔离;阶段 8 压测 30 个 IP 同时投递无串 IP
 - [x] 150 个 agent 的资源压测 ✅ 假 agent 150 个跑通;真实 fnx 60 个测内存线性度(每个约 98 MB);用户决定同时活跃不超过约 20 个 IP,超过时加内存
 - [ ] 视情况引入 socket 事件订阅:150 个假 agent 的压测未显示必须改 socket 的证据(并发约 30 个 herdr 子进程,开销小),暂不做;socket 仍未实测

@@ -20,6 +20,7 @@ from . import ipdrain
 from .audit import AuditLog
 from .errors import HerdrNotFound
 from .messages import DISPATCHING
+from .lifecycle import pane_shell_only as _shell_only
 from .registry import AgentRecord, Registry
 from .spool import Spool, SpoolError
 from .topology import TopologyStore
@@ -38,20 +39,6 @@ def _actor() -> str:
         return getpass.getuser()
     except Exception:  # noqa: BLE001
         return "unknown"
-
-
-def _shell_only(info: Dict[str, Any]) -> Optional[bool]:
-    """pane 是否只剩 shell。herdr 0.9.3 实测:只剩 shell 时 foreground_process_group_id == shell_pid,
-    foreground_processes 只有 shell 自己(pid == shell_pid)。字段缺失、类型不对或彼此矛盾返回 None(调用方 fail-closed)。"""
-    pgid, shell, foreground = (info.get("foreground_process_group_id"), info.get("shell_pid"),
-                               info.get("foreground_processes"))
-    if not (isinstance(pgid, int) and isinstance(shell, int) and isinstance(foreground, list) and foreground
-            and all(isinstance(p, dict) and isinstance(p.get("pid"), int) for p in foreground)):
-        return None
-    pids = {p["pid"] for p in foreground}
-    if pgid == shell:
-        return True if pids == {shell} else None     # 进程组是 shell,列表里却有别的进程:矛盾
-    return False if shell not in pids else None      # 前台是别的进程组;列表里还出现 shell 也算矛盾
 
 
 class IpOps:

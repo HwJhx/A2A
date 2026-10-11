@@ -1,6 +1,8 @@
 """阶段 5f:生命周期的决策逻辑(假 herdr,内存里模拟 workspace / tab / pane / agent)。真实行为见集成测试。"""
 from __future__ import annotations
 
+import json
+import os
 import signal
 import tempfile
 import unittest
@@ -31,9 +33,9 @@ class FakeHerdr:
         self.n += 1
         return f"w1:{prefix}{self.n}"
 
-    def _pane(self, tab_id, env):
+    def _pane(self, tab_id, env, cwd):
         pid = self._id("p")
-        self.panes[pid] = {"pane_id": pid, "tab_id": tab_id, "env": env}
+        self.panes[pid] = {"pane_id": pid, "tab_id": tab_id, "env": env, "cwd": cwd}
         return pid
 
     def workspace_list(self):
@@ -44,7 +46,7 @@ class FakeHerdr:
         self.workspaces.append({"workspace_id": "w1", "label": label})
         tab = {"tab_id": self._id("t"), "label": label, "workspace_id": "w1"}
         self.tabs.append(tab)
-        pid = self._pane(tab["tab_id"], env)
+        pid = self._pane(tab["tab_id"], env, cwd)
         return Created({}, "w1", tab["tab_id"], pid)
 
     def tab_rename(self, tab_id, label):
@@ -57,7 +59,7 @@ class FakeHerdr:
         self.calls.append(("tab_create", label))
         tab = {"tab_id": self._id("t"), "label": label, "workspace_id": workspace_id}
         self.tabs.append(tab)
-        return Created({}, workspace_id, tab["tab_id"], self._pane(tab["tab_id"], env))
+        return Created({}, workspace_id, tab["tab_id"], self._pane(tab["tab_id"], env, cwd))
 
     def pane_list(self, workspace_id=None):
         return list(self.panes.values())
@@ -65,7 +67,7 @@ class FakeHerdr:
     def pane_split(self, pane_id, *, direction, cwd, env):
         self.calls.append(("pane_split", pane_id))
         tab_id = self.panes[pane_id]["tab_id"]
-        return Created({}, "w1", tab_id, self._pane(tab_id, env))
+        return Created({}, "w1", tab_id, self._pane(tab_id, env, cwd))
 
     def pane_get(self, pane_id):
         if pane_id not in self.panes:
@@ -90,7 +92,11 @@ class FakeHerdr:
         self.agents.pop(pane_id, None)
 
     def pane_process_info(self, pane_id):
-        return self.process[pane_id]
+        if pane_id not in self.panes:
+            raise HerdrNotFound("x", code="pane_not_found")
+        # 没有前台进程(从未启动或已退出)的 pane:只剩 shell(与 herdr 实测一致)
+        return self.process.get(pane_id) or {"foreground_process_group_id": 4000, "shell_pid": 4000,
+                                             "foreground_processes": [{"argv": ["bash"], "pid": 4000}]}
 
     def wait_for_agent_detected(self, pane_id, *, timeout_s):
         if pane_id not in self.agents:
@@ -130,13 +136,81 @@ class Base(unittest.TestCase):
         self.herdr = FakeHerdr()
         self.killed = []
         self.life = Lifecycle(client=self.herdr, topology=self.store, registry=self.registry, audit=self.audit,
-                              state_dir=d, kill=lambda pgid, sig: self.killed.append((pgid, sig)) or
-                              self.herdr.agents.pop(next(p for p, i in self.herdr.process.items()
-                                                         if i["foreground_process_group_id"] == pgid), None),
-                              sleep=lambda s: None)
+                              state_dir=d, kill=self.fake_kill, sleep=lambda s: None)
+
+    def fake_kill(self, pgid, sig):
+        """信号结束 agent:agent 从 herdr 消失,pane 里只剩 shell。"""
+        self.killed.append((pgid, sig))
+        pane = next(p for p, i in self.herdr.process.items() if i and i["foreground_process_group_id"] == pgid)
+        self.herdr.agents.pop(pane, None)
+        self.herdr.process[pane] = None
 
     def events(self, state):
         return [e for e in self.audit.read() if e.get("state") == state]
+
+
+class WorkingDirectory(Base):
+    """18 号方案 Codex 审核:pane 丢失后新建 pane 要用登记的工作目录,不在家目录里猜着启动。"""
+
+    def test_spawn_records_the_absolute_cwd(self):
+        rec = self.life.spawn("dv", "uart", cwd=str(self.dir / "work"))
+        self.assertEqual(rec.cwd, str(self.dir / "work"))
+        self.assertEqual(self.herdr.panes[rec.pane_id]["cwd"], rec.cwd)
+        self.assertEqual(self.life.spawn("dv", "gpio").cwd, os.path.expanduser("~"))   # 默认家目录,也登记
+
+    def test_restore_into_a_new_pane_uses_the_recorded_cwd(self):
+        rec = self.life.spawn("dv", "uart", cwd=str(self.dir / "work"))
+        self.life.close("dv", "uart")
+        restored = self.life.restore("dv", "uart")
+        self.assertNotEqual(restored.pane_id, rec.pane_id)
+        self.assertEqual(self.herdr.panes[restored.pane_id]["cwd"], str(self.dir / "work"))
+        self.assertEqual(restored.cwd, str(self.dir / "work"))
+
+    def test_explicit_cwd_overrides_and_is_recorded(self):
+        self.life.spawn("dv", "uart", cwd=str(self.dir / "a"))
+        self.life.close("dv", "uart")
+        restored = self.life.restore("dv", "uart", cwd=str(self.dir / "b"))
+        self.assertEqual(self.herdr.panes[restored.pane_id]["cwd"], str(self.dir / "b"))
+        self.assertEqual(self.registry.get("dv_uart").cwd, str(self.dir / "b"))
+
+    def test_legacy_record_without_cwd_refuses_a_new_pane(self):
+        rec = self.life.spawn("dv", "uart")
+        self.life.close("dv", "uart")
+        # 模拟旧注册表:记录里没有 cwd
+        data = json.loads(self.registry.path.read_text())
+        del data["agents"]["dv_uart"]["cwd"]
+        self.registry.path.write_text(json.dumps(data))
+        self.assertIsNone(self.registry.get("dv_uart").cwd)
+        panes = set(self.herdr.panes)
+        with self.assertRaises(LifecycleError):
+            self.life.restore("dv", "uart")
+        self.assertEqual(set(self.herdr.panes), panes)                       # 没有新建 pane
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "closed")   # 也没有改成 failed
+        restored = self.life.restore("dv", "uart", cwd=str(self.dir))       # 显式 --cwd 可以
+        self.assertNotEqual(restored.pane_id, rec.pane_id)
+
+    def test_restart_in_the_original_pane_keeps_the_recorded_cwd(self):
+        rec = self.life.spawn("dv", "uart", cwd=str(self.dir / "work"))
+        self.life.stop("dv", "uart")
+        self.assertEqual(self.life.restore("dv", "uart").cwd, rec.cwd)
+
+
+class RestoreGuard(Base):
+    def test_restore_refuses_an_original_pane_occupied_by_another_process(self):
+        # 18 号方案 §4.1:原 pane 前台不是只剩 shell 时,不往里写启动命令
+        rec = self.life.spawn("dv", "uart")
+        self.life.stop("dv", "uart")
+        for info in ({"foreground_process_group_id": 5555, "shell_pid": 4000,
+                      "foreground_processes": [{"argv": ["vim"], "pid": 5555}]},
+                     {"foreground_process_group_id": 4000, "shell_pid": 4000}):          # 不完整
+            with self.subTest(info=info):
+                self.herdr.process[rec.pane_id] = info
+                runs = len([c for c in self.herdr.calls if c[0] == "pane_run"])
+                with self.assertRaises(LifecycleError):
+                    self.life.restore("dv", "uart")
+                self.assertEqual(len([c for c in self.herdr.calls if c[0] == "pane_run"]), runs)
+        self.herdr.process[rec.pane_id] = None
+        self.assertEqual(self.life.restore("dv", "uart").pane_id, rec.pane_id)   # 只剩 shell 时原 pane 重启
 
 
 class Spawn(Base):
@@ -165,6 +239,17 @@ class Spawn(Base):
         self.assertLess(names.index("pane_run"), names.index("agent_rename"))
         run = next(c for c in self.herdr.calls if c[0] == "pane_run")
         self.assertIn("exec -a pi", run[2])  # 覆盖 exec 的启动命令
+
+    def test_launch_command_carries_the_identity_env_itself(self):
+        # 18 号方案实测:herdr 会话重启后 pane 的新 shell 不带创建时注入的变量;启动命令必须自带身份
+        import shlex
+        self.life.spawn("dv", "uart")
+        run = next(c for c in self.herdr.calls if c[0] == "pane_run")
+        words = shlex.split(run[2])
+        env = dict(w.split("=", 1) for w in words[:words.index("bash")])
+        self.assertEqual((env["A2A_PROJECT_ID"], env["A2A_ROLE"], env["A2A_IP"]), ("soc_a", "dv", "uart"))
+        self.assertEqual(env["A2A_STATE_DIR"], str(self.dir))
+        self.assertIn("A2A_HERDR_BIN", env)
 
     def test_launch_args_from_topology_are_passed_to_the_launcher(self):
         self.store.update(lambda data: data["roles"]["dv"].update(launch_args=["--no-builtin-tools"]))

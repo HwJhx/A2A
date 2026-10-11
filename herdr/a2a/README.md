@@ -185,6 +185,21 @@ a2a ip undrain gpio --session <会话>                                          
 - `remove`:先写"排空中"标记(该 IP 不再入队、不再开始新投递),等在途投递与 agent 工作结束,再检查队列。队列里还有未处理的消息时**撤销排空、恢复正常**并列出 msg_id,先用 `a2a resolve` 处理;等待超时时**保留排空**(IP 保持隔离),稍后再执行 `ip remove` 继续或 `ip undrain` 放弃。`--force` 只跳过"等 agent 空闲";删除前会检查每个将被关闭的 pane:前台只有 shell,或前台正是登记的 agent,才会关闭;否则拒绝(保留排空,等人工确认),`--force` 也不跳过这一项。任何一步中断后再执行都会从断点继续。
 - 设计与竞态分析见 `herdr/claude/17-stage8-ip-add-remove-plan.md`(Router 的"检查标记 + 入队"、broker 的"检查 + 写 DISPATCHING"与写标记由 IP 排空锁互斥)。
 
+## 会话重启后恢复 agent(`a2a agent recover`,阶段 8)
+
+VM 或 herdr 会话重启后:先重新 attach 会话,**先恢复 agent、再启动 broker**。
+
+```bash
+a2a agent recover --session <会话> --dry-run     # 只看分类
+a2a agent recover --session <会话> [--ip gpio] [--include-stopped]
+```
+
+- 只处理本会话的记录;broker 在运行时拒绝(退出码 3)。herdr 会保留 pane 与 pane ID,agent 在原 pane 里重启,布局不变。
+- 分类:ok / restore / uncertain(pane 被别的进程占用、pane 不在且注册表没有工作目录等,人工处理)/ classification_failed(查询 herdr 出错,只影响这一个)/ kept_stopped / kept_closed / failed_record / skipped_draining / other_session;原因见输出的 `notes`。有失败或不确定时退出码 6。
+- pane 不在时会新建 pane,工作目录用 spawn 时登记的(注册表 `cwd`);旧记录没有登记的,用 `a2a agent restore <role> <ip> --cwd <目录>` 手工恢复。
+- 输出附带这些 agent 队列里 TARGET_MISSING / DELIVERY_UNCERTAIN 的队列头与建议的 `a2a resolve` 命令(不自动裁定)。
+- 恢复的 fnx 是新会话(不保留对话上下文);消息与队列在 a2a 里,不受影响。
+
 ## pi 插件(`pi-extension/a2a.ts`)
 
 在 a2a 管理的 fnx pane 里生效(由 `a2a agent spawn` 注入的 `A2A_*` 环境变量判断),普通使用 fnx 时什么都不做。测试或运行时临时复制到 `~/.forenyx/fnx_<x>/agent/extensions/`,用完删除。
@@ -212,6 +227,7 @@ a2a ip undrain gpio --session <会话>                                          
 | `agent prompt` 对 `blocked` 的 agent 拒绝发送;超时或 `agent_prompt_stalled` 不代表没发出去 | 抛 `HerdrAgentBlocked` / `HerdrPromptStalled`;重试前先读状态和输出 |
 | 同时发两条给忙碌的 agent,都会被接受,按两轮依次处理,但顺序不确定 | 保证顺序要靠上层的队列,不是 herdr |
 | 虚拟机里 pane 默认工作目录是 Mac 的共享路径 | 创建 tab / pane 时用 `cwd=` 明确指定 |
+| 会话 `stop` 后重新 attach:pane 与 pane ID 保留,进程退出,agent 名字丢失;**pane 的新 shell 不再带创建时注入的环境变量** | 启动命令自带身份变量(`Lifecycle._launch`);会话重启后用 `a2a agent recover` |
 
 ## 还没做 / 没验证
 

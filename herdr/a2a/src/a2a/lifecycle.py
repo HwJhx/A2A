@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import shlex
 import shutil
 import signal
 import sys
@@ -37,6 +38,21 @@ from .identity import AgentIdentity, IdentityError, identity_env
 from .launcher import build_launch_command, preflight_launcher
 from .registry import AgentNotRegisteredError, AgentRecord, Registry
 from .topology import TopologyStore
+
+
+def pane_shell_only(info: Dict[str, Any]) -> Optional[bool]:
+    """pane 是否只剩 shell(17 号方案 §10)。herdr 0.9.3 实测:只剩 shell 时 foreground_process_group_id == shell_pid,
+    foreground_processes 只有 shell 自己(pid == shell_pid);会话重启后的 pane 也是这样(18 号方案 §3.1)。
+    字段缺失、类型不对或彼此矛盾返回 None,调用方必须 fail-closed。"""
+    pgid, shell, foreground = (info.get("foreground_process_group_id"), info.get("shell_pid"),
+                               info.get("foreground_processes"))
+    if not (isinstance(pgid, int) and isinstance(shell, int) and isinstance(foreground, list) and foreground
+            and all(isinstance(p, dict) and isinstance(p.get("pid"), int) for p in foreground)):
+        return None
+    pids = {p["pid"] for p in foreground}
+    if pgid == shell:
+        return True if pids == {shell} else None     # 进程组是 shell,列表里却有别的进程:矛盾
+    return False if shell not in pids else None      # 前台是别的进程组;列表里还出现 shell 也算矛盾
 
 
 class LifecycleError(RuntimeError):
@@ -90,6 +106,7 @@ class Lifecycle:
             if existing is not None:
                 raise LifecycleError(f"{identity.agent_id} 已登记(lifecycle={existing.lifecycle});"
                                      f"已停止或已关闭的请用 restore,要彻底删除请用 purge")
+            cwd = os.path.abspath(os.path.expanduser(cwd or "~"))
             created = self._new_pane(identity, cwd)
             try:
                 agent_name = self._launch(created["pane_id"], identity, launcher)
@@ -98,7 +115,7 @@ class Lifecycle:
                 raise
             record = self.registry.register(identity, session=self.session, workspace_id=created["workspace_id"],
                                             tab_id=created["tab_id"], pane_id=created["pane_id"],
-                                            agent_name=agent_name, status="idle", lifecycle="running")
+                                            agent_name=agent_name, status="idle", lifecycle="running", cwd=cwd)
             self._audit("AGENT_SPAWNED", record, f"在 {record.pane_id} 启动")
             return record
 
@@ -147,8 +164,19 @@ class Lifecycle:
                 raise LifecycleError(f"{identity.agent_id} 正在运行,不需要恢复")
             pane_alive = record.lifecycle != "closed" and self._pane_exists(record.pane_id)
             if pane_alive:
+                # 在原 pane 里重启之前确认它明确只剩 shell:否则启动命令会写进被别的进程占用的 pane
+                shell_only = pane_shell_only(self.client.pane_process_info(record.pane_id))
+                if shell_only is not True:
+                    raise LifecycleError(f"{identity.agent_id} 的原 pane {record.pane_id} "
+                                         f"{'进程信息不完整或自相矛盾' if shell_only is None else '前台有别的进程'},"
+                                         f"不在原 pane 重启;请人工确认(关闭该 pane 后再 restore 会新建 pane)")
                 where = {"workspace_id": record.workspace_id, "tab_id": record.tab_id, "pane_id": record.pane_id}
             else:
+                # 新建 pane 必须知道工作目录:优先 --cwd,其次注册表登记的;都没有就拒绝,不在家目录里猜着启动
+                if cwd is None and record.cwd is None:
+                    raise LifecycleError(f"{identity.agent_id} 的 pane 已不在,注册表也没有登记工作目录(旧记录);"
+                                         f"请用 --cwd 指定")
+                cwd = os.path.abspath(os.path.expanduser(cwd)) if cwd is not None else record.cwd
                 where = self._new_pane(identity, cwd)
             try:
                 agent_name = self._launch(where["pane_id"], identity, launcher)
@@ -159,7 +187,8 @@ class Lifecycle:
                 raise
             updated = self.registry.update_runtime(identity.agent_id, workspace_id=where["workspace_id"],
                                                    tab_id=where["tab_id"], pane_id=where["pane_id"],
-                                                   agent_name=agent_name, status="idle", lifecycle="running")
+                                                   agent_name=agent_name, status="idle", lifecycle="running",
+                                                   cwd=None if pane_alive else cwd)
             self._audit("AGENT_RESTORED", updated, "原 pane 重启" if pane_alive else f"新建 pane {updated.pane_id}")
             return updated
 
@@ -174,11 +203,10 @@ class Lifecycle:
         return rows
 
     # ---- 布局 ------------------------------------------------------------
-    def _new_pane(self, identity: AgentIdentity, cwd: Optional[str]) -> Dict[str, str]:
+    def _new_pane(self, identity: AgentIdentity, cwd: str) -> Dict[str, str]:
         """按布局为 agent 建一个新 pane,注入身份环境变量。"""
         topology = self.topology.current()
         env = self._agent_env(identity)
-        cwd = cwd or os.path.expanduser("~")
         role_label = topology.roles[identity.role].label or identity.role
         workspace = next((w for w in self.client.workspace_list() if w.get("label") == topology.workspace_label), None)
         if workspace is None:
@@ -243,7 +271,10 @@ class Lifecycle:
     def _launch(self, pane_id: str, identity: AgentIdentity, launcher: str) -> str:
         self.client.pane_rename(pane_id, identity.agent_id)  # 显示名,不影响寻址
         launch_args = self.topology.current().roles[identity.role].launch_args
-        self.client.pane_run(pane_id, build_launch_command(launcher, launch_args))
+        # 身份与插件所需的变量直接写在启动命令前面,不依赖 pane 的环境:herdr 会话重启后,持久化 pane 里
+        # 新起的 shell 不再带创建 pane 时注入的变量(18 号方案实测),在原 pane 恢复的 agent 会丢失身份
+        assignments = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(self._agent_env(identity).items()))
+        self.client.pane_run(pane_id, f"{assignments} {build_launch_command(launcher, launch_args)}")
         self.client.wait_for_agent_detected(pane_id, timeout_s=self.detect_timeout_s)
         try:
             self.client.agent_wait(pane_id, until=READY_STATUSES, timeout_ms=int(self.ready_timeout_s * 1000))
