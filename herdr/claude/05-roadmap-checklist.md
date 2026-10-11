@@ -40,7 +40,7 @@
 - [x] 探测 2:`--env` 注入的变量能否被 pane 内子进程继承 ✅(`tab create --env` 注入的 `A2A_ROLE` / `A2A_IP` 被 pane 里的 shell 读到;`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_ENV=1` 也都在)
 - [x] 探测 3:`done` 的行为 ✅ **结论:`done` 不会自己变回 `idle`**(20 秒后仍是 `done`)。`agent wait --until idle` 在 `done` 状态下**超时失败**(rc 1);`--until done` 或 `--until idle --until done` 立刻返回。对 `done` 的 agent 发 prompt 能成功。聚焦(`agent focus`)之后 `done` 变 `idle`。所以**必须把 `done` 视为 READY**,等待时必须同时带 `--until idle --until done`
 - [x] 探测 4:同一目标并发投递 ✅ **结论:不会文字交织**。两条 prompt 同时发给 `working` 的 agent,herdr 都返回成功,pi 把它们当作两轮依次处理,但**顺序不确定**(先发的 A 反而排在 B 之后)。所以 broker 的串行投递不是为了防止乱码,而是为了**保证顺序、避免在对方忙时发送**
-- [ ] 探测 5:`blocked` 时 `agent prompt` 是否真的拒绝并返回 `agent_blocked`(**未测**:需要让 agent 停在审批界面,pi 默认没有审批,没找到触发办法)
+- [x] 探测 5:`blocked` 时 `agent prompt` 是否真的拒绝并返回 `agent_blocked` ✅ 2026-10-09 已实测(09 号文档、08 §5),本行当时漏回填。2026-10-11 用 `report-agent --state blocked` 再测(herdr 0.9.3,假 agent):`agent get` 为 blocked;`agent prompt` 返回 `agent_blocked`,**没有写入**;`HerdrClient` 映射为 `HerdrAgentBlocked`,分类为 BLOCKED;`wait --until idle --until done` 超时,`--until blocked` 立即返回;改报 idle 后恢复。**新发现**:herdr 对 pi 的识别规则(`~/.local/state/herdr/agent-detection/remote/pi.toml`,2026.10.01.1,Mac 与 VM 相同)只有两条 working 规则、没有 blocked 规则,我们的插件也不上报 blocked,所以实际运行中 pi 不会进入 blocked;`TARGET_BLOCKED` 分支只在有人主动上报 blocked 时出现。可用 `herdr agent explain --file <屏幕文本> --agent pi` 查看任意屏幕会被判成什么
 - [x] 记录 herdr 命令的真实参数 ✅(`agent` / `pane` / `tab` / `workspace` / `session` 已读取;`api schema` 未读)
 - [x] 清理:停止并删除命名会话、关闭 tmux、删除临时文件和符号链接 ✅(默认会话未触碰)
 
@@ -49,8 +49,8 @@
 - [x] 探测 6:`fnx_dv` 能否被 herdr 识别为 `pi` ✅ **结论:不能自动识别**。前台进程名是 `forenyx-cli`(`~/.forenyx/fnx_dv/libexec/forenyx-cli`),`agent list` 为空。用 `herdr pane report-agent <pane> --source <id> --agent pi --state idle --seq N` 手动上报后,被识别为 `pi`、状态 `idle`,可按 pane ID 寻址。需要让 fnx 自己上报,见下方「新增事项」
 - [x] 探测 7:pi 的 `bash` 能否拿到 `A2A_ROLE` / `A2A_IP` / `HERDR_PANE_ID` ✅(用 `!` 前缀在 fnx_dv 里执行,读到 `ROLE=dv IP=uart PANE=w1:p2 ENV=1`;注意这是用户侧 `!` 命令,不是模型调用的 bash 工具,模型侧仍需再确认)
 - [ ] 探测 8:pi 二开版的 `bash` 工具是否会弹人工批准
-- [ ] 确认 `fnx-sw` 的 pi 版本与 `pi-custom` 一致(我只读了 `pi-custom`)
-- [ ] 把 §10.3 中 6 条未验证事实逐条标为"已验证"或"不成立,已改"
+- [x] 确认 `fnx-sw` 的 pi 版本与 `pi-custom` 一致(我只读了 `pi-custom`)✅ 已被实测取代(2026-10-11 路线图清理):之后都直接在安装好的 fnx_dv / fnx_sw(pi 0.79.10)上实测,插件加载、事件、工具注册、重试与压缩设置均以实测为准(阶段 6、8);只剩模型侧 bash 是否弹批准未验证,见探测 8
+- [x] 把 §10.3 中 6 条未验证事实逐条标为"已验证"或"不成立,已改" ✅(2026-10-11 路线图清理) 04 号 §10.3 已更新:#3 跨 tab 投递已验证(阶段 6–8 broker 按名字向别的 tab 投递);#6 L4 不做(按 E4 先 L1 + L2);#7 blocked、#8 模型侧 bash 批准仍未验证(下方合并跟踪);#9 另外三个智能体暂不接入
 
 ### 1.4 探测中发现的新事项
 
@@ -71,12 +71,12 @@
 待办:
 
 - [x] 确定正式的启动方式 ✅ 采用办法二(覆盖 `exec`),拓扑配置里每个智能体只记录**启动脚本路径**,框架不关心各智能体安装目录和环境变量差异
-- [ ] 框架启动前做预检:启动脚本只有一处 `exec`、不使用 `$0`/`BASH_SOURCE`;启动后用 `pane process-info` 与 `agent list` 确认已被识别为 `pi`,否则报错
-- [ ] 在另外三个智能体(Spec/架构/RTL)的机器上验证办法二的前提成立
+- [x] 框架启动前做预检:启动脚本只有一处 `exec`、不使用 `$0`/`BASH_SOURCE`;启动后用 `pane process-info` 与 `agent list` 确认已被识别为 `pi`,否则报错 ✅(2026-10-11 路线图清理) 阶段 2/5 已实现:`launcher.preflight_launcher`(spawn / restore 前预检,不通过拒绝)+ `wait_for_agent_detected` 与等到可投递后才登记
+- [ ] 在另外三个智能体(Spec/架构/RTL)的机器上验证办法二的前提成立(用户 2026-10-10 决定先不装;接入时 spawn 的预检会自动检查前提)
 - [x] 办法二已对 `fnx_dv`、`fnx_sw` 各验证启动、识别、`agent prompt`、环境变量 ✅(授权检查等深层功能仍只测了一句对话)
-- [ ] `agent start --kind pi` 会执行名为 `pi` 的命令;若上面链接放在 PATH 里,可以直接用 `agent start`,框架就无需自己拼 `pane run`
-- [ ] 虚拟机里 pane 的默认工作目录是 Mac 的共享路径,建 pane 时要用 `--cwd` 明确指定
-- [ ] `blocked` 与模型侧 bash 工具的批准弹窗仍未验证
+- [x] `agent start --kind pi` 会执行名为 `pi` 的命令;若上面链接放在 PATH 里,可以直接用 `agent start`,框架就无需自己拼 `pane run` ✅ 不采用(2026-10-11 路线图清理):采用办法二(`pane run` + 覆盖 `exec`),不需要往 PATH 放链接;启动命令还要自带身份变量(18 号方案)
+- [x] 虚拟机里 pane 的默认工作目录是 Mac 的共享路径,建 pane 时要用 `--cwd` 明确指定 ✅(2026-10-11 路线图清理) spawn / restore 新建 pane 都显式传 cwd(默认家目录),并登记在注册表(18 号方案)
+- 〔合并〕`blocked` 与模型侧 bash 工具的批准弹窗:见 §1.2 探测 5、§1.3 探测 8
 
 ### 1.5 其他已完成的验证
 
@@ -84,8 +84,8 @@
 - [x] `agent rename` 实测 ✅:改名成功;按名字 `get` / `prompt` / `wait` / `read` 都成功;重名报 `agent_name_taken`,非法名报 `invalid_agent_name`;agent 退出后名字失效,重启后不自动恢复,需重新改名
 - [x] 已确认 `agent prompt` 不携带发送方信息,发送方身份只能由框架记录在审计日志里(D11:接收方先不验证来源)✅
 - [x] 设计文档 `04` 已按实测结果更新(§2.1.1、§2.3、§10.3)✅
-- [ ] 另外三个智能体(Spec / 架构 / RTL)的启动脚本验证
-- [ ] `blocked` 状态与模型侧 bash 批准弹窗验证
+- 〔合并〕另外三个智能体的启动脚本验证:见 §1.4(用户 2026-10-10 决定先不装)
+- 〔合并〕`blocked` 与模型侧 bash 批准弹窗:见 §1.2 探测 5、§1.3 探测 8
 
 ## 阶段 2:`HerdrClient`(已完成,代码在 `herdr/a2a/`)
 
@@ -112,8 +112,8 @@
 
 仍未验证:
 
-- [ ] `blocked` 状态下 `agent prompt` 的真实行为(代码按文档映射,未实测)
-- [ ] 文本以 `-` 开头的 `agent prompt` 是否被 herdr 当成选项
+- 〔合并〕`blocked` 状态下 `agent prompt` 的真实行为:见 §1.2 探测 5
+- [x] 文本以 `-` 开头的 `agent prompt` 是否被 herdr 当成选项 ✅ 不会(2026-10-11 路线图清理):VM 假 agent 实测 `-hello`、`--help`、`--until idle`、`-- x` 都原样送达(退出码 0)。目标 ID 以 `-` 开头由客户端拒绝
 
 ## 阶段 3:拓扑、身份、注册表(已完成,代码在 `herdr/a2a/`)
 
@@ -156,7 +156,7 @@
   - [x] 伪造 `A2A_IP` / `A2A_ROLE` / `A2A_PROJECT_ID`,或使用他人的 pane ✅ `identity`
   - [x] 缺环境变量、pane 未登记 / 已注销 / 重建后旧号、别的会话冒充、发送方非 running、节点已不在拓扑 ✅ `identity`
   - [x] 模板内容不合法 ✅ 拓扑加载时拒绝非法字段;渲染后超长 / 含控制字符 → `bad_message`
-  - [ ] 目标 `blocked`:立即得到 `TARGET_BLOCKED`,且不向其写入任何输入 —— **属于阶段 5**(要向 herdr 查实时状态,Router 不查)
+  - [x] 目标 `blocked`:立即得到 `TARGET_BLOCKED`,且不向其写入任何输入 —— **属于阶段 5**(要向 herdr 查实时状态,Router 不查)✅(2026-10-11 路线图清理) 阶段 5 投递引擎已实现,单元测试 `test_blocked_fails_immediately_without_prompt` 等;真实 herdr 的 blocked 未实测(探测 5)
 - [x] 多进程并发发送 ✅ 6 个进程并发发送 30 条,全部入队、ID 唯一、审计日志无交织
 - [x] 测试:214 个全部通过 ✅(Mac,Python 3.9.6;虚拟机,Python 3.10,含真实 herdr 与真实 fnx 的集成测试)
 
@@ -185,9 +185,9 @@
 
 另外:文件权限经查无问题(状态文件均为 0600)。以下是 Codex 复核意见里**我认可、但尚未处理**的项,留给阶段 5 或之后:
 
-- [ ] 客户端缺口:`rename_agent` 不能清除名字已有(`agent_rename(None)`);仍需补 `agent_prompt` 的客户端超时与 `agent_prompt_stalled` 一并映射为"结果不确定"(`HerdrPromptStalled` 已有,Broker 要据此进入 `DELIVERY_UNCERTAIN`)
+- [x] 客户端缺口:`rename_agent` 不能清除名字已有(`agent_rename(None)`);仍需补 `agent_prompt` 的客户端超时与 `agent_prompt_stalled` 一并映射为"结果不确定"(`HerdrPromptStalled` 已有,Broker 要据此进入 `DELIVERY_UNCERTAIN`)✅(2026-10-11 路线图清理) 阶段 5 已做:`agent_rename(None)` 用 `--clear`;`policy.py` 把 `agent_prompt_stalled`、`timeout`、`client_timeout` 都归为不确定 → DELIVERY_UNCERTAIN
 - [ ] `done/` 目录的保留期、归档与磁盘告警策略(不做无策略删除)
-- [ ] `Spool.recover()` 放在 Broker 启动时调用(已实现方法,待 Broker 接上)
+- [x] `Spool.recover()` 放在 Broker 启动时调用(已实现方法,待 Broker 接上)✅(2026-10-11 路线图清理) 阶段 5 已接上(`broker.py` 启动恢复第一步)
 
 新发现(已写进 04 号文档):
 
@@ -334,7 +334,7 @@ pi 侧接入(不调用模型):
 - [x] 成功回执严格校验(Codex 复核应修)✅ `msg_id`/`dst`/`text` 非空、`state` 为 QUEUED、`queue_seq` 为非负整数才算发送成功,否则归为结果未知。测试:10 种畸形回执 + 1 个合法回执;变异检查(改回只查 msg_id)8 个子用例失败
 - [x] 真实 fnx 集成测试不再删除已常驻安装的插件(结束时还原原内容)
 - [ ] 将来考虑:机制级防重复需要稳定的业务事件 ID 幂等;toolCallId 不行(模型重试是新的调用、新的 ID)
-- [ ] 将来考虑:`HERDR_WRITE` 正则可能误拦文档 / 搜索命令,也能被变量、别名绕过;它是软限制,不是安全边界
+- [x] 已知局限(不作为待办):`HERDR_WRITE` 正则可能误拦文档 / 搜索命令,也能被变量、别名绕过;它是软限制,不是安全边界 ✅ 已写进 README 插件一节的已知局限。真正的隔离需要 L4(另建 OS 用户或沙箱),按 E4 暂不做(2026-10-11)
 - [ ] 将来考虑:插件加载时缓存可用的边,拓扑新增边要重启 agent 才可见,删除的边仍显示但会被 Router 拒绝;留到动态拓扑阶段
 
 修复后测试:Mac 单元 445 个通过(跳过 32:31 个集成 + 1 个需本机 fnx);插件单元 14 个在 Mac 通过;VM 全套 445 个通过、跳过 14 个(插件单元测试,VM 无 node),其中真实 herdr 集成测试 31 个全部通过。已常驻安装的插件更新为修复后的版本(运行中的 `a2a_s6` 两个 agent 仍是旧版,重启后才加载新版)。

@@ -205,7 +205,7 @@ a2a agent recover --session <会话> [--ip gpio] [--include-stopped]
 在 a2a 管理的 fnx pane 里生效(由 `a2a agent spawn` 注入的 `A2A_*` 环境变量判断),普通使用 fnx 时什么都不做。测试或运行时临时复制到 `~/.forenyx/fnx_<x>/agent/extensions/`,用完删除。
 
 - `a2a_send(edge_id)`:调用 `a2a send`,鉴权、模板、目标都由 Router 决定。结果分三类:成功、明确拒绝(未入队)、结果未知(可能已入队,提示不要重试)。
-- 拦截 bash 里直接调用 herdr 写入类命令(软限制)。
+- 拦截 bash 里直接调用 herdr 写入类命令(软限制)。**已知局限**:按正则匹配命令文本,可能误拦提到这些命令的文档 / 搜索命令,也能被变量、别名、脚本文件绕过;它防的是模型误用,不是安全边界。真正的隔离需要让 agent 用别的 OS 用户运行(L4),目前不做。
 - 状态上报(阶段 8):pi 开始处理时上报 working;只在能确定 pi 已结束时上报 idle(`aborted`,或 `stop` 且上下文 token 低于压缩阈值的 90%;阈值按实际的 `compaction.reserveTokens` 设置计算),其他情况保持 working。设计与依据见 `herdr/claude/16-stage8-report-state-plan.md`。
 - **部署约束**:a2a 管理的 fnx 只加载本插件,不加载其他会在 `agent_end` 里排消息的扩展。
 - **卡在 working 时的恢复**:状态上报失败、模型出错后不再重试、或上下文接近压缩阈值时,目标会一直显示 working,broker 等待超时后暂停该队列并告警。恢复:重启这个 agent(`a2a agent stop <role> <ip>` 再 `a2a agent restore <role> <ip>`),再用 `a2a resolve` 处理被暂停的消息。不要手工 `report-agent` 补报(序号会与插件的计数脱节)。

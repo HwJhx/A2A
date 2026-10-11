@@ -815,13 +815,13 @@ herdr 文档里 pane 是真实终端,有最小尺寸。可选思路(都需实测
 | --- | --- | --- |
 | 1 | `fnx_dv` / `fnx_sw` 能否被 herdr 识别为 `pi` | **已验证**:不能自动识别;`report-agent` 不够(`agent prompt` 失败);按 §2.3 覆盖 `exec` 启动后可识别。另外三个智能体未验证 |
 | 2 | `--env` 注入的变量能否被 agent 继承 | **已验证**:pane 里的 shell 和 `fnx_dv` / `fnx_sw` 的 `!` 命令都能读到 |
-| 3 | 跨 tab 的 `agent prompt` | **基本验证**:从 pane 外的 shell 向非聚焦 tab 里的 agent 发送成功;严格的"从 dv 的 pane 内发往 sw 的 pane"未单独测 |
+| 3 | 跨 tab 的 `agent prompt` | **已验证**:从 pane 外的 shell 向非聚焦 tab 里的 agent 发送成功;正式设计里投递都由 broker 进程按名字发出(不从 agent 的 pane 内直接发),阶段 6–8 真实链路与 150 个 agent 压测中跨 tab 投递全部成功 |
 | 4 | `agent wait` 与 `done` | **已验证**:`done` 不一定自己变回 `idle`(无人看时可停 20 秒以上;有人查看时约十几秒后变 `idle`);`agent wait --until idle` 在 `done` 时会超时失败,`--until done` 或 `--until idle --until done` 立即返回;对 `done` 的 agent 发 prompt 成功。所以必须同时等 `idle` 和 `done` |
 | 5 | 同一目标并发投递 | **已验证**:两条同时发给 `working` 的 agent,都被接受,按两轮依次处理,无文字交织,但**顺序不确定**。broker 串行投递的目的是保证顺序、避免在对方忙时发送 |
-| 6 | 同一 OS 用户下能否阻止 agent 绕过 broker 直接调用 herdr(L4) | 未验证 |
-| 7 | `blocked` 状态下 `agent prompt` 的行为 | 未验证(pi 默认没有审批界面,未找到触发办法) |
+| 6 | 同一 OS 用户下能否阻止 agent 绕过 broker 直接调用 herdr(L4) | **不做**:按 E4 先用 L1 + L2(插件只给 `a2a_send`、拦截 bash 里的 herdr 写命令,是软限制);L4 需要另建 OS 用户或沙箱 |
+| 7 | `blocked` 状态下 `agent prompt` 的行为 | **已验证**(2026-10-09,09 号文档;2026-10-11 用 `report-agent --state blocked` 复测):返回 `agent_blocked`,不写入。herdr 的 pi 识别规则没有 blocked,pi 自身不会进入 blocked |
 | 8 | pi 模型侧 bash 工具是否弹批准 | 未验证(只验证了用户侧 `!` 命令) |
-| 9 | 办法 C 的前提(只有一处 `exec`、不用 `$0`)对另外三个智能体是否成立 | 未验证;框架启动前预检(§2.3.5) |
+| 9 | 办法 C 的前提(只有一处 `exec`、不用 `$0`)对另外三个智能体是否成立 | 未验证(用户决定暂不接入);spawn 前的预检(`preflight_launcher`)会自动检查,不满足即拒绝 |
 | 12 | pane 里注入的 herdr 环境变量 | **已验证(命名会话)**:`HERDR_ENV=1`、`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SESSION`(会话名)、`HERDR_SOCKET_PATH`、`HERDR_BIN_PATH`。默认会话未测 |
 | 14 | 队列与审计的崩溃恢复(复核后修复 P1~P7) | **已验证**(Mac 与虚拟机):归档两步之间强杀 → `pending()` 不再返回已送达消息,`recover()` 清理残留;审计写到一半强杀 → 下次追加前残片被隔离,新记录完整;ID 路径穿越、未知状态、终态回退、目标在另一会话均被拒绝 |
 | 13 | Router 的反向用例、多进程并发发送 | **已验证**(Mac 与虚拟机):见 `tests/test_router.py`;6 个进程并发发送 30 条,全部入队、ID 唯一、审计无交织 |
