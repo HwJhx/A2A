@@ -7,7 +7,9 @@ N 个 IP,每个 IP 一个真实 fnx_dv、一个真实 fnx_sw(--no-builtin-tools,
   框架正确性  每条已入队消息的发送方 / 目标 / 文字等于本 IP 模板,只送达一次,无异常状态,不串 IP;
               工具调用都是 a2a_send;工作目录为空。违例即框架失败,按 §7 停止。
   模型完成度  按 IP 记录链路是否走完、没走完的原因(模型侧),分开汇报。
-调用上限:每 IP 入队不超过 3 条;模型调用合计不超过 5×N×2。超过按 §7 停止,归为模型行为异常。
+调用上限:每 IP 入队不超过 3 条;模型请求(含出错)合计默认不超过 5×N×2。超过按 §7 停止,归为模型行为异常。
+  注意这些上限是**软阈值**:每 2 秒从会话记录统计一次已写入的 assistant 消息,在途的请求、provider SDK
+  内部的重试都不计入,所以实际请求数可能超过配置值(超出量取决于 2 秒内的并发);不能当作硬上限。
 
 必须同时设置 A2A_REAL_FNX=1 并给出 --ips N 才会运行:
   A2A_REAL_FNX=1 python3 tests/stress/real_fnx_scale.py --ips 5
@@ -24,6 +26,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -78,6 +81,16 @@ class Stop(Exception):
     def __init__(self, kind: str, reason: str):
         super().__init__(reason)
         self.kind = kind
+
+
+_RATE_LIMITED = re.compile(r"^\s*429\b")
+
+
+def is_rate_limited(error_message: str) -> bool:
+    """模型接口限流。pi 的错误记录没有单独的状态码字段,errorMessage 来自 OpenAI SDK,格式为
+    "<状态码> status code (no body)" 或 "<状态码> <说明>"(B1 实测 128 条全是 "429 status code (no body)")。
+    只认以状态码 429 开头的,避免说明文字里偶然出现 429 被误判。"""
+    return bool(_RATE_LIMITED.match(error_message or ""))
 
 
 def iso_to_epoch(value: str) -> float:
@@ -382,7 +395,7 @@ class Run:
             now_wall = time.time()
             errors = [c for v in calls.values() for c in v if c["stop"] not in ("toolUse", "stop")
                       and c["end"] and now_wall - c["end"] < 60
-                      and not (self.ignore_429 and "429" in c["error"])]
+                      and not (self.ignore_429 and is_rate_limited(c["error"]))]
             if len(errors) > API_ERRORS_PER_MIN:
                 raise Stop("model", f"最近 1 分钟模型接口出错 {len(errors)} 次:{[e['stop'] for e in errors[:5]]}")
             pending = {m.dst for m in self.spool.pending()}
@@ -512,10 +525,12 @@ class Run:
         for c in calls:
             if c["stop"] == "error":
                 errs[c["error"][:60]] = errs.get(c["error"][:60], 0) + 1
+        rate_limited = sum(1 for c in calls if c["stop"] == "error" and is_rate_limited(c["error"]))
         ok = [c for c in calls if c["stop"] in ("toolUse", "stop")]
         ok_lat = [c["latency_s"] for c in ok if c["latency_s"] is not None]
+        # 计数口径:会话记录里的 assistant 消息条数,不含 provider SDK 内部重试,不等于底层 HTTP 请求数
         return {"calls": len(calls), "successful": len(ok), "request_cap": self.request_cap,
-                "success_cap": self.success_cap, "errors_by_message": errs,
+                "success_cap": self.success_cap, "errors_by_message": errs, "rate_limited_429": rate_limited,
                 "successful_latency_s": stress.summary(ok_lat),
                 "providers": sorted({f"{c['provider']}/{c['model']}" for c in calls}),
                 "stop_reasons": {s: sum(1 for c in calls if c["stop"] == s) for s in {c["stop"] for c in calls}},
@@ -649,7 +664,8 @@ def main() -> int:
     parser.add_argument("--ignore-429", action="store_true",
                         help="验证重试用:HTTP 429 不计入'最近 1 分钟出错次数'的停止条件(其他错误照常计入)")
     parser.add_argument("--success-cap", type=int, help="成功的模型调用上限(默认不单独限制)")
-    parser.add_argument("--request-cap", type=int, help="全部模型请求(含出错)上限(默认 5 × N × 2)")
+    parser.add_argument("--request-cap", type=int,
+                        help="全部模型请求(含出错)上限(默认 5 × N × 2;软阈值,每 2 秒按会话记录统计,实际可能超出)")
     parser.add_argument("--simulate-stop", action="store_true",
                         help="测试保留现场的路径:spawn 并启动 broker 后模拟一次框架失败(不调用模型)")
     args = parser.parse_args()
@@ -692,6 +708,13 @@ def main() -> int:
         status = 1
         if run.kicked_off:
             preserve_for = Stop("unexpected", str(exc))
+    if run.kicked_off and "model" not in run.report:
+        try:   # 停止路径也记录已发生的模型调用与错误分类,便于事后核对
+            # 这是停止时的快照:agent 仍在运行,之后可能继续完成或重试模型调用,不一定是最终计数
+            run.report["model"] = dict(run.model_stats(), snapshot_at=datetime.now().astimezone().isoformat(),
+                                       note="停止时已记录的统计(会话记录条数),agent 之后可能继续调用,不是最终计数")
+        except Exception as exc:
+            run.report["model"] = {"unavailable": f"{type(exc).__name__}: {exc}"}
     run.report["memory"] = run.fnx_pss
     if run.sampler.rows:
         run.report["mem_available_mb_min"] = min(r["mem_available_mb"] for r in run.sampler.rows)
