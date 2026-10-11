@@ -30,7 +30,7 @@ from .audit import AuditLog
 from .delivery import DeliveryEngine, HerdrLike
 from .messages import DELIVERED, DELIVERY_UNCERTAIN, DISPATCHING, Message
 from .policy import BrokerConfig
-from . import rulings
+from . import ipdrain, rulings
 from .registry import Registry
 from .spool import QueueHead, QueueStateError, Spool, SpoolError
 
@@ -91,7 +91,10 @@ class Broker:
         self.engine = DeliveryEngine(spool, registry, audit, client, config=self.config,
                                      semantics_verified=semantics_verified, sleep=engine_sleep,
                                      monotonic=monotonic,
-                                     stopping=lambda: self.stop_event.is_set() or self.halted() is not None)
+                                     stopping=lambda: self.stop_event.is_set() or self.halted() is not None,
+                                     # 目标所在 IP 正在排空(ip remove)时不开始新投递;"检查 + 写 DISPATCHING"持 IP 排空锁(共享)
+                                     skip=lambda m: ipdrain.is_draining(self.state_dir, m.ip_id),
+                                     dispatch_guard=lambda m: ipdrain.drain_shared(self.state_dir, m.ip_id))
         self._lock_handle: Any = None
         self._state_lock = threading.Lock()
         self._paused: Dict[str, Tuple[int, str, str]] = {}       # dst -> (queue_seq, msg_id, state)
@@ -182,6 +185,18 @@ class Broker:
             log.error("全局停止投递:%s(处理后执行 a2a dispatch resume)", reason)
 
     # ---- 一个目标的串行处理 -------------------------------------------------
+    def _target_draining(self, dst: str) -> bool:
+        try:
+            head = self.spool.head(dst)
+        except SpoolError:
+            return False   # 队列读不出:交给 worker 按已有规则 fail-closed
+        return head is not None and self._draining(head)
+
+    def _draining(self, head: QueueHead) -> bool:
+        """队列头还要投递(active)且其 IP 正在排空。已到终态的队列头照常处理(放行 / 暂停),
+        否则排空期间完成的 DELIVERED 槽位不会被放行,ip remove 会误判队列未清空。"""
+        return head.active is not None and ipdrain.is_draining(self.state_dir, head.active.ip_id)
+
     def process_target(self, dst: str) -> str:
         """处理一个目标,直到队列空、暂停或该目标不归本 broker。返回结束原因。"""
         while not self.stop_event.is_set():
@@ -195,6 +210,8 @@ class Broker:
             if head is None:
                 self._unpause(dst)
                 return "empty"
+            if self._draining(head):
+                return "draining"   # 退出 worker,不原地重试;撤销排空后下一次扫描重新启动
             if head.active is not None:
                 message = head.active
                 if message.session != self.session:
@@ -246,6 +263,8 @@ class Broker:
             return results
         now = self._monotonic()
         for dst in targets:
+            if self._target_draining(dst):
+                continue   # 目标所在 IP 正在排空:不启动 worker(17 号方案 §3.2)
             with self._state_lock:
                 if self._cooldown.get(dst, 0) > now:
                     continue

@@ -25,7 +25,8 @@ DeliveryEngine.deliver(msg_id) 把一条处于 QUEUED / WAITING_TARGET / RETRYIN
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Dict, Iterator, Optional, Protocol
+from contextlib import nullcontext
+from typing import Any, Callable, ContextManager, Dict, Iterator, Optional, Protocol
 
 from .audit import AuditLog
 from .errors import HerdrError, HerdrNotFound, HerdrTimeout
@@ -75,6 +76,8 @@ class DeliveryEngine:
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         stopping: Callable[[], bool] = lambda: False,
+        skip: Callable[[Message], bool] = lambda message: False,
+        dispatch_guard: Callable[[Message], ContextManager[Any]] = lambda message: nullcontext(),
     ) -> None:
         self.spool = spool
         self.registry = registry
@@ -87,6 +90,11 @@ class DeliveryEngine:
         # 停机请求:在调用 prompt 之前的任何等待处收到,消息保持当前状态返回(重启后继续);
         # 已经调用了 prompt 的,等它返回、分类完再结束,不在半途判不确定
         self._stopping = stopping
+        # 按消息的停止条件(例如目标所在 IP 正在排空):与 stopping 一样在三个检查点生效
+        self._skip = skip
+        # 包住"写 DISPATCHING 前最后一次检查 + 写 DISPATCHING"的上下文(broker 用它持 IP 排空锁的共享锁),
+        # 使这两步与排空标记的写入不会交错;发 prompt、等结果在它外面
+        self._dispatch_guard = dispatch_guard
 
     # ------------------------------------------------------------------
     def deliver(self, msg_id: str) -> Message:
@@ -176,8 +184,9 @@ class DeliveryEngine:
 
     # ---- 第 3、4 步:写前标记 + 调用 herdr + 分类 --------------------------
     def _dispatch(self, message: Message, target: str, deadline: float, retry_delays: Iterator[float]) -> Message:
-        self._stop_if_requested(message)  # 写 DISPATCHING 之前最后一次检查;之后就要等 prompt 返回
-        message = self._move(message, DISPATCHING, f"复核通过,向 {target} 发出 prompt", attempts=message.attempts + 1)
+        with self._dispatch_guard(message):
+            self._stop_if_requested(message)  # 写 DISPATCHING 之前最后一次检查;之后就要等 prompt 返回
+            message = self._move(message, DISPATCHING, f"复核通过,向 {target} 发出 prompt", attempts=message.attempts + 1)
         error: Optional[BaseException] = None
         result: Dict[str, Any] = {}
         try:
@@ -207,7 +216,7 @@ class DeliveryEngine:
         return message  # 回到 deliver() 的循环:RETRYING -> 复核 -> ...
 
     def _stop_if_requested(self, message: Message) -> None:
-        if self._stopping():
+        if self._stopping() or self._skip(message):
             raise _Finished(message)
 
     # ---- 状态与审计 ------------------------------------------------------

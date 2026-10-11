@@ -258,6 +258,91 @@ class GracefulStop(Base):
         self.assertEqual(self.spool.get(m.msg_id).state, WAITING_TARGET)
 
 
+class DrainingIp(Base):
+    def test_worker_exits_without_busy_looping_and_resumes_after_undrain(self):
+        # 17 号方案 §3.2:worker 已在等目标空闲时该 IP 开始排空 -> 不发 prompt、worker 退出、不忙循环;
+        # 撤销排空后下一次扫描重新投递
+        from a2a import ipdrain
+
+        class CountingHerdr(BlockingWaitHerdr):
+            waits = 0
+
+            def agent_wait(self, target, *, until=None, timeout_ms=None):
+                type(self).waits += 1
+                return super().agent_wait(target, until=until, timeout_ms=min(timeout_ms or 0, 200))
+
+        herdr = CountingHerdr()
+        herdr.add("sw_uart", "w1:p2", status="working")
+        m = self.send()
+        broker = Broker(spool=self.spool, registry=self.registry, audit=self.audit, client=herdr,
+                        session=SESSION, state_dir=self.dir, semantics_verified=True,
+                        config=BrokerConfig(scan_interval_s=0.05))
+        runner = threading.Thread(target=broker.run_forever)
+        runner.start()
+
+        def stop():
+            broker.stop_event.set()
+            herdr.release.set()
+            runner.join(timeout=10)
+        self.addCleanup(stop)
+        self.assertTrue(herdr.waiting.wait(10))
+        with ipdrain.drain_exclusive(self.dir, "uart"):
+            ipdrain.write_marker(self.dir, "uart", "op1", "测试")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(t.name == "a2a-sw_uart" and t.is_alive() for t in threading.enumerate()):
+            time.sleep(0.05)
+        self.assertFalse(any(t.name == "a2a-sw_uart" and t.is_alive() for t in threading.enumerate()),
+                         "排空后 worker 没有退出")
+        waits = CountingHerdr.waits
+        time.sleep(0.5)                                     # 排空期间:不再查询目标(不忙循环),也不重新启动 worker
+        self.assertEqual(CountingHerdr.waits, waits)
+        self.assertEqual((self.spool.get(m.msg_id).state, herdr.prompts), (WAITING_TARGET, []))
+        herdr.status["sw_uart"] = "idle"
+        with ipdrain.drain_exclusive(self.dir, "uart"):
+            ipdrain.clear_marker(self.dir, "uart")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.spool.get(m.msg_id).state != DELIVERED:
+            time.sleep(0.05)
+        self.assertEqual(self.spool.get(m.msg_id).state, DELIVERED)
+
+
+class DrainingIpPromptInFlight(Base):
+    def test_prompt_finishing_during_drain_is_released(self):
+        # Codex 审核:prompt 已发出、排空期间才完成为 DELIVERED,该槽位要照常放行(否则 ip remove 误判队列未清空)
+        from a2a import ipdrain
+        herdr = StatefulHerdr()
+        herdr.add("sw_uart", "w1:p2", status="idle")
+        in_prompt, release = threading.Event(), threading.Event()
+        original = herdr.agent_prompt
+
+        def slow_prompt(*args, **kwargs):
+            in_prompt.set()
+            release.wait(5)
+            return original(*args, **kwargs)
+        herdr.agent_prompt = slow_prompt
+        m = self.send()
+        broker = Broker(spool=self.spool, registry=self.registry, audit=self.audit, client=herdr,
+                        session=SESSION, state_dir=self.dir, semantics_verified=True,
+                        config=BrokerConfig(scan_interval_s=0.05))
+        runner = threading.Thread(target=broker.run_forever)
+        runner.start()
+
+        def stop():
+            release.set()
+            broker.stop_event.set()
+            runner.join(timeout=10)
+        self.addCleanup(stop)
+        self.assertTrue(in_prompt.wait(10))
+        with ipdrain.drain_exclusive(self.dir, "uart"):       # prompt 在锁外进行,标记可以写入
+            ipdrain.write_marker(self.dir, "uart", "op1", "测试")
+        release.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "sw_uart" in self.spool.queue_targets():
+            time.sleep(0.05)
+        self.assertEqual(self.spool.get(m.msg_id).state, DELIVERED)
+        self.assertNotIn("sw_uart", self.spool.queue_targets())   # 槽位已放行
+
+
 class StartupRecovery(Base):
     def test_dispatching_becomes_uncertain_and_is_not_resent(self):
         m = self.send()

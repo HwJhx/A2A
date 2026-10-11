@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
+from . import ipdrain
 from .audit import AuditLog
 from .identity import (
     ENV_IP,
@@ -45,6 +47,7 @@ REJECT_TARGET_NOT_IN_TOPOLOGY = "target_not_in_topology"
 REJECT_TARGET_MISSING = "target_missing"
 REJECT_TARGET_NOT_RUNNING = "target_not_running"
 REJECT_BAD_MESSAGE = "bad_message"
+REJECT_IP_DRAINING = "ip_draining"
 
 MAX_MESSAGE_CHARS = 1000
 
@@ -93,8 +96,11 @@ class Router:
         *,
         session: Optional[str] = None,
         max_chars: int = MAX_MESSAGE_CHARS,
+        state_dir: "Optional[str | Path]" = None,
     ) -> None:
         self._topology_source = topology
+        # 排空标记与 IP 排空锁所在的状态目录;spool 固定在 <状态目录>/spool,默认取它的上一级
+        self.state_dir = Path(state_dir) if state_dir is not None else spool.root.parent
         self.registry = registry
         self.spool = spool
         self.audit = audit
@@ -189,7 +195,12 @@ class Router:
             project_id=sender.project_id, ip_id=sender.ip_id, session=session, text=text,
             state=QUEUED, topology_revision=revision, attempts=0, detail="", updated_at=now_iso(),
         )
-        stored = self.spool.enqueue(message)
+        # 检查排空标记与入队在 IP 排空锁(共享)里完成:标记写入方持独占锁,所以两者不会交错(17 号方案 §3.2)
+        with ipdrain.drain_shared(self.state_dir, sender.ip_id):
+            if ipdrain.is_draining(self.state_dir, sender.ip_id):
+                raise reject(REJECT_IP_DRAINING, f"IP {sender.ip_id} 正在排空(ip remove 进行中),暂不接受该 IP 的消息",
+                             src=sender.agent_id, dst=dst)
+            stored = self.spool.enqueue(message)
         self.audit.record({
             "msg_id": msg_id, "edge_id": edge_id, "src": message.src, "dst": message.dst,
             "state": QUEUED, "detail": "鉴权通过,已入队", "session": session,

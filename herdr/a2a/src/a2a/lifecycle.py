@@ -24,9 +24,11 @@ import shutil
 import signal
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from . import ipdrain
 from ._fsutil import exclusive_lock
 from .audit import AuditLog
 from .errors import HerdrError, HerdrNotFound, HerdrTimeout
@@ -74,7 +76,12 @@ class Lifecycle:
 
     # ---- 公共操作 --------------------------------------------------------
     def spawn(self, role: str, ip: str, *, cwd: Optional[str] = None) -> AgentRecord:
-        identity, launcher = self._identity_and_launcher(role, ip)
+        # 先拿 IP 门禁再读拓扑:否则可能基于删除前读到的拓扑,在 ip remove 完成后重新拉起 agent
+        with self._ip_gate(ip):
+            identity, launcher = self._identity_and_launcher(role, ip)
+            return self._spawn_locked(identity, launcher, cwd)
+
+    def _spawn_locked(self, identity: AgentIdentity, launcher: str, cwd: Optional[str]) -> AgentRecord:
         with self._lock(identity.agent_id):
             try:
                 existing = self.registry.get(identity.agent_id)
@@ -129,7 +136,11 @@ class Lifecycle:
             return removed
 
     def restore(self, role: str, ip: str, *, cwd: Optional[str] = None) -> AgentRecord:
-        identity, launcher = self._identity_and_launcher(role, ip)
+        with self._ip_gate(ip):   # 同 spawn:先拿门禁再读拓扑
+            identity, launcher = self._identity_and_launcher(role, ip)
+            return self._restore_locked(identity, launcher, cwd)
+
+    def _restore_locked(self, identity: AgentIdentity, launcher: str, cwd: Optional[str]) -> AgentRecord:
         with self._lock(identity.agent_id):
             record = self.registry.get(identity.agent_id)
             if record.lifecycle == "running" and self._agent_on(record) is not None:
@@ -193,6 +204,16 @@ class Lifecycle:
                     # 插件向 herdr 主动上报 working / idle 时用(不依赖 agent 进程的 PATH)
                     "A2A_HERDR_BIN": self._herdr_bin()})
         return env
+
+    @contextmanager
+    def _ip_gate(self, ip: str):
+        """启动 agent 时持 IP 排空锁的共享锁并检查排空标记(17 号方案):ip remove 写标记要等启动结束,
+        标记写入后的启动被拒,所以不会在删除过程中重新拉起该 IP 的 agent。"""
+        with ipdrain.drain_shared(self.state_dir, ip):
+            if ipdrain.is_draining(self.state_dir, ip):
+                raise LifecycleError(f"IP {ip} 正在排空(ip remove 未完成),不能启动它的 agent;"
+                                     f"先完成 ip remove,或执行 a2a ip undrain {ip}")
+            yield
 
     def _herdr_bin(self) -> str:
         name = getattr(self.client, "herdr_bin", "herdr")

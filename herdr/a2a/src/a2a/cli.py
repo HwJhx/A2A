@@ -233,6 +233,39 @@ def cmd_topology(args: argparse.Namespace) -> int:
         return _err(str(exc), EXIT_INVALID)
 
 
+# ---- 按 IP 增删(17 号方案)----------------------------------------------
+def cmd_ip(args: argparse.Namespace) -> int:
+    from .ipops import IpOpError, IpOps
+    from .lifecycle import Lifecycle, LifecycleError
+    from .policy import BrokerConfig
+
+    session = args.session or os.environ.get("HERDR_SESSION")
+    if not session:
+        return _err("需要 --session(或环境变量 HERDR_SESSION)", EXIT_USAGE)
+    client = HerdrClient(session)
+    topology, registry, audit = TopologyStore(), Registry(default_registry_path()), _audit()
+    life = Lifecycle(client=client, topology=topology, registry=registry, audit=audit, state_dir=state_dir())
+    ops = IpOps(lifecycle=life, topology=topology, registry=registry, spool=_spool(), audit=audit, client=client,
+                state_dir=state_dir(),
+                dispatch_timeout_s=getattr(args, "dispatch_timeout", None) or BrokerConfig().observe_window_s + 30,
+                idle_timeout_s=getattr(args, "idle_timeout", None) or 60.0)
+    try:
+        if args.op == "add":
+            roles = [r for r in (args.roles or "").split(",") if r] or None
+            _out(ops.add(args.ip, roles=roles, cwd=args.cwd))
+        elif args.op == "remove":
+            _out(ops.remove(args.ip, force=args.force))
+        else:
+            _out(ops.undrain(args.ip))
+        return 0
+    except IpOpError as exc:
+        print(json.dumps({"error": str(exc), **exc.detail}, ensure_ascii=False), file=sys.stderr)
+        return EXIT_INVALID
+    except (LifecycleError, TopologyError, HerdrError, ValueError) as exc:
+        # 例如 purge 失败:排空标记保留,修好后再执行 ip remove 继续
+        return _err(f"{type(exc).__name__}: {exc}", EXIT_INVALID)
+
+
 # ---- 生命周期 ----------------------------------------------------------
 def cmd_agent(args: argparse.Namespace) -> int:
     from .lifecycle import Lifecycle, LifecycleError
@@ -359,6 +392,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("edge_id")
     p.add_argument("template")
     p.set_defaults(func=cmd_topology)
+
+    ip = sub.add_parser("ip", help="按 IP 增删(连同各角色 agent)").add_subparsers(dest="op", required=True)
+    p = ip.add_parser("add", help="加入拓扑并启动该 IP 各角色的 agent(可重复执行补齐)")
+    p.add_argument("ip")
+    p.add_argument("--roles", help="只启动这些角色(逗号分隔);默认所有配置了启动脚本的角色")
+    p.add_argument("--cwd", help="agent 的工作目录,可用 {ip}、{role} 占位;不存在就创建")
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_ip)
+    p = ip.add_parser("remove", help="排空、清除该 IP 的 agent 并从拓扑删除(中断后再执行会继续)")
+    p.add_argument("ip")
+    p.add_argument("--force", action="store_true", help="不等 agent 空闲(仍等在途投递、仍检查队列)")
+    p.add_argument("--idle-timeout", type=float, help="等 agent 空闲的秒数(默认 60)")
+    p.add_argument("--dispatch-timeout", type=float, help="等在途投递结束的秒数(默认观察窗口 + 30)")
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_ip)
+    p = ip.add_parser("undrain", help="撤销排空标记、恢复正常(放弃一次删除)")
+    p.add_argument("ip")
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_ip)
 
     agent = sub.add_parser("agent", help="agent 生命周期").add_subparsers(dest="op", required=True)
     for name, help_text in (("spawn", "新建 pane 并启动 agent"), ("stop", "只停 agent 进程,保留 pane 与注册"),

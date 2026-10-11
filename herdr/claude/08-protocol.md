@@ -312,6 +312,7 @@ herdr 接受了但观察窗口内没看到目标开始处理 → **不记 `DELIV
 | `target_missing` | 目标没有登记;或登记在**另一个 herdr 会话**;或登记信息与发送方不属于同一 IP / 项目 |
 | `target_not_running` | 目标已登记,但 `lifecycle` 不是 `running` |
 | `bad_message` | 渲染后的消息为空、过长(默认 > 1000 字符)或含控制字符 |
+| `ip_draining` | 发送方所在 IP 正在排空(`a2a ip remove` 进行中);同 IP 铁律下也就是目标所在 IP。检查与入队在 IP 排空锁(共享)里完成,见 `17-stage8-ip-add-remove-plan.md` §3.2 |
 
 ## 10. 待确认与待验证
 

@@ -173,6 +173,18 @@ else:
 - 审计日志写到一半崩溃时,残片在下次追加前被隔离到 `audit.jsonl.corrupt`,并补记一条 `AUDIT_REPAIRED`;`read()` 容忍中间坏行,且不修改文件。
 - 新增状态 `DELIVERY_UNCERTAIN`:prompt 可能已送达(`agent_prompt_stalled` 或客户端超时),**核实前不得重发**。
 
+## 按 IP 增删(`a2a ip`,阶段 8)
+
+```bash
+a2a ip add gpio --session <会话> [--roles dv,sw] [--cwd /work/{ip}/{role}]   # 加入拓扑并启动各角色的 agent
+a2a ip remove gpio --session <会话> [--force]                                  # 排空、清除 agent、从拓扑删除
+a2a ip undrain gpio --session <会话>                                           # 放弃一次删除,恢复正常
+```
+
+- `add`:没有启动脚本的角色跳过;已 running 的跳过;已登记但停止 / 关闭的只报出(用 `a2a agent restore`);中途失败停下、不回滚,修好后再执行一次补齐。
+- `remove`:先写"排空中"标记(该 IP 不再入队、不再开始新投递),等在途投递与 agent 工作结束,再检查队列。队列里还有未处理的消息时**撤销排空、恢复正常**并列出 msg_id,先用 `a2a resolve` 处理;等待超时时**保留排空**(IP 保持隔离),稍后再执行 `ip remove` 继续或 `ip undrain` 放弃。`--force` 只跳过"等 agent 空闲";删除前会检查每个将被关闭的 pane:前台只有 shell,或前台正是登记的 agent,才会关闭;否则拒绝(保留排空,等人工确认),`--force` 也不跳过这一项。任何一步中断后再执行都会从断点继续。
+- 设计与竞态分析见 `herdr/claude/17-stage8-ip-add-remove-plan.md`(Router 的"检查标记 + 入队"、broker 的"检查 + 写 DISPATCHING"与写标记由 IP 排空锁互斥)。
+
 ## pi 插件(`pi-extension/a2a.ts`)
 
 在 a2a 管理的 fnx pane 里生效(由 `a2a agent spawn` 注入的 `A2A_*` 环境变量判断),普通使用 fnx 时什么都不做。测试或运行时临时复制到 `~/.forenyx/fnx_<x>/agent/extensions/`,用完删除。

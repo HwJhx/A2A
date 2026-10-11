@@ -370,7 +370,13 @@ pi 侧接入(不调用模型):
 - [x] 修复 broker:全局停止投递(dispatch.halted)挡不住已在途的 worker ✅ Codex 审核真实 fnx 规模测试脚本时发现:投递引擎的停止检查只看停机信号,已在等目标空闲的 worker 在写了 dispatch.halted 后仍会发 prompt。改为停机或全局停止都让引擎在等待循环每一轮、写 DISPATCHING 前、重试退避后停下,消息保持原状态。先补测试确认失败(halt 后目标空闲仍发出 prompt),修后通过。局限:检查与写 DISPATCHING 之间仍有极短窗口。测试:Mac 单元 451 通过(跳过 37);VM 全套 451 通过(跳过 14,插件单元),真实 herdr 集成 36 个全部通过
 - [x] 真实规模的内存方案 ✅ 用户决定(2026-10-10):同时活跃的 IP 不超过 20 个左右(约 100 个 agent,本 VM 空闲时放得下);超过时给服务器加内存。不做"只运行活跃 IP"或多 VM
 - [x] 批量创建 5 个 tab ✅ spawn 按角色建 tab、按 IP 拆 pane;5 tab × 30 pane 布局探测零失败
-- [ ] 按 IP 动态增删 pane / agent(`stop` / `close` / `purge` / `restore`)
+- [x] 按 IP 动态增删 ✅ 方案 `17-stage8-ip-add-remove-plan.md`(Codex 审核四轮:IP 操作锁、持久化排空标记、Router / broker 与写标记共用 IP 排空锁、超时 fail-closed、各步可续做)。`a2a ip add / remove / undrain`;Router 新增拒绝码 `ip_draining`(已写入 08 协议);投递引擎增加按消息的停止条件与"检查 + 写 DISPATCHING"的锁钩子,排空时 worker 退出、不忙循环。测试:单元 19 个(含用屏障卡住的两个临界窗口、三种队列情况、两种超时、三个中断点的续做、同 IP 并发串行)+ broker 1 个;变异检查 6 处都被发现;真实 herdr 集成 3 个(假 agent 增删与重新加入、排空拒绝与 undrain、真实 fnx 起停)。Mac 单元 489 通过(跳过 40);VM 全套 489 通过、0 跳过
+  - Codex 审核实现(阻断 2、应修 2)已修:remove 等 agent 空闲时,herdr 查不到的 agent 按忙处理(fail-closed,进程确已退出用 --force);`agent spawn` / `restore` 也持 IP 排空锁共享锁并在排空中拒绝(删除过程中不会被重新拉起);排空期间已到终态的队列头照常放行 / 暂停,只是不开始新投递(prompt 在排空后才完成为 DELIVERED 时槽位能放行);`ip add` 发现注册表 running 但 herdr 里没有该 agent 时报出,不当作已运行。新增 5 个测试,4 处变异各自被发现。Mac 单元 494 通过(跳过 40);VM 全套 494 通过、0 跳过
+  - Codex 第二轮复核(阻断 2、应修 1)已修:spawn / restore 拿到 IP 门禁后才读拓扑;排空标记检查失败按排空处理;ip add 按登记名字核对 agent。新增 3 个测试,3 处变异各自被发现。Mac 单元 497 通过(跳过 40);VM 全套 497 通过、0 跳过
+  - Codex 第三轮复核(阻断 1、应修 1)已修:ip remove 删除前核对 pane 上的 agent 就是登记的那个(对不上拒绝、标记保留;--force 不跳过);只有 HerdrNotFound 算 agent 不存在。新增 2 个测试,2 处变异各自被发现。Mac 单元 499 通过(跳过 40);VM 全套 499 通过、0 跳过
+  - Codex 第四轮复核(阻断 1)已修:删除前对所有将被关闭的 pane 检查前台进程,只有前台只剩 shell、或前台正是登记的 running agent 才放行(stopped 记录、herdr 认不出的前台进程都拒绝,--force 不跳过)。新增 2 个测试,2 处变异各自被发现。Mac 单元 501 通过(跳过 40);VM 全套 501 通过、0 跳过
+  - Codex 第五轮复核(阻断 1)已修:"前台只有 shell"改为字段齐全、相互一致才成立(依据 herdr 实测),否则拒绝删除。新增 1 个测试(4 种不完整 / 矛盾情况),变异"改回宽松判断"被发现。Mac 单元 502 通过(跳过 40);VM 全套 502 通过、0 跳过
+  - Codex 第六轮复核:没有问题(2026-10-11)
 - [ ] registry 自动恢复
 - [x] 多 IP 并发 ✅ 阶段 7 用屏障验证 uart/gpio 同时发送隔离;阶段 8 压测 30 个 IP 同时投递无串 IP
 - [x] 150 个 agent 的资源压测 ✅ 假 agent 150 个跑通;真实 fnx 60 个测内存线性度(每个约 98 MB);用户决定同时活跃不超过约 20 个 IP,超过时加内存
