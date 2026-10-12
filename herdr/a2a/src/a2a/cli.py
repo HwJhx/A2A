@@ -77,13 +77,16 @@ def _halt_path():
 def cmd_send(args: argparse.Namespace) -> int:
     router = Router(TopologyStore(), Registry(default_registry_path()), _spool(), _audit())
     try:
-        receipt = router.send(args.edge_id)
+        receipt = router.send(args.edge_id, idempotency_key=args.idempotency_key)
     except SendRejected as exc:
         print(json.dumps({"rejected": exc.code, "reason": exc.reason, "msg_id": exc.msg_id}, ensure_ascii=False),
               file=sys.stderr)
         return EXIT_REJECTED
-    _out({"msg_id": receipt.msg_id, "dst": receipt.dst, "state": receipt.state, "queue_seq": receipt.queue_seq,
-          "text": receipt.text})
+    out = {"msg_id": receipt.msg_id, "dst": receipt.dst, "state": receipt.state, "queue_seq": receipt.queue_seq,
+           "text": receipt.text}
+    if args.idempotency_key is not None:
+        out["duplicate"] = receipt.duplicate
+    _out(out)
     return 0
 
 
@@ -355,6 +358,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("send", help="发送一条固定句式消息(在 agent 的 pane 里运行)")
     p.add_argument("edge_id")
+    p.add_argument("--idempotency-key", help="幂等键 <UTC 秒>-<UUID>(pi 插件每次处理新输入时生成):"
+                                             "同一发送方、同一条边、同一个键只入队一次")
     p.set_defaults(func=cmd_send)
 
     p = sub.add_parser("edges", help="列出当前 pane 身份可用的通信边及渲染后的文字(只读)")

@@ -18,12 +18,17 @@ Router 是 agent 发消息的唯一入口,不碰 herdr(任何一步失败都**�
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from . import ipdrain
+from ._fsutil import atomic_write_text, exclusive_lock
 from .audit import AuditLog
 from .identity import (
     ENV_IP,
@@ -36,7 +41,7 @@ from .identity import (
 )
 from .messages import QUEUED, REJECTED, Message, new_msg_id, now_iso
 from .registry import Registry
-from .spool import Spool
+from .spool import MessageNotFoundError, Spool
 from .topology import Topology, TopologyStore
 
 # 拒绝原因代码
@@ -48,6 +53,16 @@ REJECT_TARGET_MISSING = "target_missing"
 REJECT_TARGET_NOT_RUNNING = "target_not_running"
 REJECT_BAD_MESSAGE = "bad_message"
 REJECT_IP_DRAINING = "ip_draining"
+REJECT_BAD_KEY = "bad_idempotency_key"
+REJECT_IDEMPOTENCY_EXPIRED = "idempotency_expired"
+REJECT_IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+
+# 幂等键(路线图 336):插件每次开始处理新输入时生成 `<UTC 秒>-<UUID>`。超过有效期的键被拒绝;
+# 幂等记录就是判重的"墓碑",只有键已过期的记录才可以清理(清理后同键再来会因过期被拒)
+IDEMPOTENCY_TTL_S = 7 * 24 * 3600
+_KEY = re.compile(r"^(\d{10})-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_KEY_FUTURE_SKEW_S = 300
+SEND_DEDUPLICATED = "SEND_DEDUPLICATED"
 
 MAX_MESSAGE_CHARS = 1000
 
@@ -75,6 +90,7 @@ class SendReceipt:
     state: str
     topology_revision: str
     queue_seq: int
+    duplicate: bool = False     # 同一幂等键的重复调用:没有入队,返回的是第一次的消息
 
 
 def session_from_env(env: Mapping[str, str]) -> str:
@@ -84,6 +100,37 @@ def session_from_env(env: Mapping[str, str]) -> str:
     没有该变量时按 "default" 处理。
     """
     return env.get("HERDR_SESSION") or "default"
+
+
+class _SendContext:
+    """一次 send 调用的上下文:拓扑快照、会话、msg_id,以及写拒绝审计的 reject()。"""
+
+    def __init__(self, router: "Router", edge_id: str, env: Mapping[str, str]) -> None:
+        self.router, self.edge_id, self.env = router, edge_id, env
+        self.msg_id = new_msg_id()
+        self.topology, self.revision = router._topology()
+        self.session = router._session or session_from_env(env)
+
+    def reject(self, code: str, reason: str, *, src: Optional[str] = None, dst: Optional[str] = None,
+               cause: Optional[BaseException] = None) -> SendRejected:
+        event: Dict[str, Any] = {
+            "msg_id": self.msg_id, "edge_id": self.edge_id, "state": REJECTED, "reject_code": code,
+            "detail": reason, "src": src, "dst": dst, "session": self.session,
+            "topology_revision": self.revision,
+        }
+        if src is None:
+            # 身份未核实时,记录它声称的身份(不可信,仅供排查)
+            event.update({"claimed_project": self.env.get(ENV_PROJECT), "claimed_role": self.env.get(ENV_ROLE),
+                          "claimed_ip": self.env.get(ENV_IP), "claimed_pane": self.env.get(ENV_PANE)})
+        self.router.audit.record(event)
+        return SendRejected(code, reason, msg_id=self.msg_id, cause=cause)
+
+    def resolve_sender(self) -> AgentIdentity:
+        """校验 1:发送方身份。"""
+        try:
+            return resolve_sender(self.env, self.router.registry, self.topology, session=self.session)
+        except IdentityError as exc:
+            raise self.reject(REJECT_IDENTITY, f"{type(exc).__name__}: {exc}", cause=exc) from exc
 
 
 class Router:
@@ -114,38 +161,28 @@ class Router:
             return self._topology_source.current(), self._topology_source.revision
         return self._topology_source, "static"
 
-    def send(self, edge_id: str, env: Optional[Mapping[str, str]] = None) -> SendReceipt:
+    def send(self, edge_id: str, env: Optional[Mapping[str, str]] = None, *,
+             idempotency_key: Optional[str] = None) -> SendReceipt:
         """发送一条固定句式消息。成功返回回执(已入队),失败抛 SendRejected。
 
         env 是发送方进程的环境变量(默认取 os.environ)。发送方身份只能从它推出,
         调用方无法指定"我是谁"或"发给谁"。
+
+        idempotency_key(路线图 336,pi 插件每次处理新输入时生成):同一发送方、同一条边、同一个键
+        只入队一次;重复调用返回第一次的 msg_id,duplicate=True。不带键时行为不变。
         """
         env = os.environ if env is None else env
-        msg_id = new_msg_id()
-        topology, revision = self._topology()
-        session = self._session or session_from_env(env)
-        claimed = {
-            "claimed_project": env.get(ENV_PROJECT), "claimed_role": env.get(ENV_ROLE),
-            "claimed_ip": env.get(ENV_IP), "claimed_pane": env.get(ENV_PANE),
-        }
+        ctx = _SendContext(self, edge_id, env)
+        sender = ctx.resolve_sender()
+        if idempotency_key is None:
+            dst, text = self._authorize(ctx, sender)
+            return self._enqueue(ctx, sender, ctx.msg_id, dst, text)
+        return self._send_idempotent(ctx, sender, idempotency_key)
 
-        def reject(code: str, reason: str, *, src: Optional[str] = None, dst: Optional[str] = None,
-                   cause: Optional[BaseException] = None) -> SendRejected:
-            event: Dict[str, Any] = {
-                "msg_id": msg_id, "edge_id": edge_id, "state": REJECTED, "reject_code": code,
-                "detail": reason, "src": src, "dst": dst, "session": session,
-                "topology_revision": revision,
-            }
-            if src is None:
-                event.update(claimed)  # 身份未核实时,记录它声称的身份(不可信,仅供排查)
-            self.audit.record(event)
-            return SendRejected(code, reason, msg_id=msg_id, cause=cause)
-
-        # 1. 发送方身份
-        try:
-            sender = resolve_sender(env, self.registry, topology, session=session)
-        except IdentityError as exc:
-            raise reject(REJECT_IDENTITY, f"{type(exc).__name__}: {exc}", cause=exc) from exc
+    # ---- 鉴权与入队 ------------------------------------------------------
+    def _authorize(self, ctx: "_SendContext", sender: AgentIdentity) -> "tuple[str, str]":
+        """校验 2–6(边、方向、目标、模板);返回 (dst, text)。失败写审计并抛 SendRejected。"""
+        topology, edge_id, reject = ctx.topology, ctx.edge_id, ctx.reject
 
         # 2. 边存在
         edge = topology.edges.get(edge_id)
@@ -171,10 +208,10 @@ class Router:
         target = self.registry.find(target_role, target_ip)
         if target is None:
             raise reject(REJECT_TARGET_MISSING, f"目标 {dst} 没有登记的 agent", src=sender.agent_id, dst=dst)
-        if target.session != session:
+        if target.session != ctx.session:
             # 目标登记在另一个 herdr 会话里:broker 只在一个会话内工作,消息投递不到那里。拒绝比入队后失败更早暴露问题
             raise reject(REJECT_TARGET_MISSING,
-                         f"目标 {dst} 登记在会话 {target.session!r},与发送方所在会话 {session!r} 不同",
+                         f"目标 {dst} 登记在会话 {target.session!r},与发送方所在会话 {ctx.session!r} 不同",
                          src=sender.agent_id, dst=dst)
         if target.ip_id != sender.ip_id or target.project_id != sender.project_id:
             # 按构造不可能发生;万一注册表被破坏,宁可拒绝也不跨 IP 发送
@@ -189,25 +226,127 @@ class Router:
         problem = self._check_text(text)
         if problem:
             raise reject(REJECT_BAD_MESSAGE, problem, src=sender.agent_id, dst=dst)
+        return dst, text
 
+    def _enqueue(self, ctx: "_SendContext", sender: AgentIdentity, msg_id: str, dst: str, text: str, *,
+                 revision: Optional[str] = None, on_enqueued: Optional[Callable[[Any], None]] = None) -> SendReceipt:
+        revision = ctx.revision if revision is None else revision
         message = Message(
-            msg_id=msg_id, created_at=now_iso(), edge_id=edge_id, src=sender.agent_id, dst=dst,
-            project_id=sender.project_id, ip_id=sender.ip_id, session=session, text=text,
+            msg_id=msg_id, created_at=now_iso(), edge_id=ctx.edge_id, src=sender.agent_id, dst=dst,
+            project_id=sender.project_id, ip_id=sender.ip_id, session=ctx.session, text=text,
             state=QUEUED, topology_revision=revision, attempts=0, detail="", updated_at=now_iso(),
         )
         # 检查排空标记与入队在 IP 排空锁(共享)里完成:标记写入方持独占锁,所以两者不会交错(17 号方案 §3.2)
         with ipdrain.drain_shared(self.state_dir, sender.ip_id):
             if ipdrain.is_draining(self.state_dir, sender.ip_id):
-                raise reject(REJECT_IP_DRAINING, f"IP {sender.ip_id} 正在排空(ip remove 进行中),暂不接受该 IP 的消息",
-                             src=sender.agent_id, dst=dst)
+                raise ctx.reject(REJECT_IP_DRAINING,
+                                 f"IP {sender.ip_id} 正在排空(ip remove 进行中),暂不接受该 IP 的消息",
+                                 src=sender.agent_id, dst=dst)
             stored = self.spool.enqueue(message)
-        self.audit.record({
-            "msg_id": msg_id, "edge_id": edge_id, "src": message.src, "dst": message.dst,
-            "state": QUEUED, "detail": "鉴权通过,已入队", "session": session,
-            "topology_revision": revision, "queue_seq": stored.queue_seq,
-        })
-        return SendReceipt(msg_id, edge_id, message.src, message.dst, text, QUEUED, revision,
+        if on_enqueued is not None:
+            on_enqueued(stored)
+        self._record_queued(ctx, stored)
+        return SendReceipt(msg_id, ctx.edge_id, message.src, message.dst, text, QUEUED, revision,
                            stored.queue_seq)
+
+    def _record_queued(self, ctx: "_SendContext", stored: Message) -> None:
+        self.audit.record({
+            "msg_id": stored.msg_id, "edge_id": stored.edge_id, "src": stored.src, "dst": stored.dst,
+            "state": QUEUED, "detail": "鉴权通过,已入队", "session": stored.session,
+            "topology_revision": stored.topology_revision, "queue_seq": stored.queue_seq,
+        })
+
+    # ---- 幂等发送(路线图 336) --------------------------------------------
+    def _send_idempotent(self, ctx: "_SendContext", sender: AgentIdentity, key: str) -> SendReceipt:
+        """先写意图、再补齐的可恢复流程(19 号方案 D 节 3):
+          ① 没有记录 → 鉴权,把已鉴权的消息快照(含 msg_id)写成 intent;
+          ② intent → 按 msg_id 查 spool:不在就按当前拓扑重新鉴权,与快照一致才用快照入队,否则
+             idempotency_conflict;已在就不入队。之后改为 enqueued;
+          ③ 入队审计缺失就补记;重复调用另记 SEND_DEDUPLICATED。
+        任何一步崩溃后用同一个键重试,都只会有一条消息、msg_id 不变。"""
+        self._check_key(ctx, sender, key)
+        record_dir = self.state_dir / "idempotency" / sender.agent_id
+        path = record_dir / (hashlib.sha256(f"{ctx.edge_id}\0{key}".encode()).hexdigest() + ".json")
+        with exclusive_lock(self.state_dir / "idempotency" / f"{sender.agent_id}.lock"):
+            record = json.loads(path.read_text()) if path.exists() else None
+            if record is not None and record.get("state") == "enqueued":
+                return self._duplicate(ctx, record)
+            fresh = record is None              # 刚鉴权并写下意图:入队前不必再鉴权一次
+            if record is None:
+                self._checkpoint("before_intent")
+                dst, text = self._authorize(ctx, sender)
+                record = {"state": "intent", "key": key, "created_at": now_iso(),
+                          "message": {"msg_id": ctx.msg_id, "src": sender.agent_id, "dst": dst,
+                                      "edge_id": ctx.edge_id, "text": text, "session": ctx.session,
+                                      "project_id": sender.project_id, "ip_id": sender.ip_id,
+                                      "topology_revision": ctx.revision}}
+                record_dir.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(path, json.dumps(record, ensure_ascii=False, indent=2))
+                self._checkpoint("after_intent")
+            snap = record["message"]
+            try:
+                stored = self.spool.get(snap["msg_id"])
+            except MessageNotFoundError:
+                stored = None
+            if stored is None:
+                ctx.msg_id = snap["msg_id"]     # 审计里的拒绝记录也用这条消息的 msg_id
+                dst, text = (snap["dst"], snap["text"]) if fresh else self._authorize(ctx, sender)
+                if (dst, text) != (snap["dst"], snap["text"]):
+                    raise ctx.reject(REJECT_IDEMPOTENCY_CONFLICT,
+                                     f"补齐入队时内容与第一次鉴权的不一致(第一次:{snap['dst']}「{snap['text']}」;"
+                                     f"现在:{dst}「{text}」),不按任何一方发送,请操作员处理",
+                                     src=sender.agent_id, dst=dst)
+                receipt = self._enqueue(ctx, sender, snap["msg_id"], snap["dst"], snap["text"],
+                                        revision=snap["topology_revision"],
+                                        on_enqueued=lambda _: self._checkpoint("after_enqueue"))
+                queue_seq = receipt.queue_seq
+            else:
+                self._ensure_queued_audit(ctx, stored)
+                queue_seq = stored.queue_seq
+                receipt = None
+            record.update(state="enqueued", queue_seq=queue_seq, enqueued_at=now_iso())
+            atomic_write_text(path, json.dumps(record, ensure_ascii=False, indent=2))
+            self._checkpoint("after_mark")
+            if receipt is not None:
+                return receipt
+            return SendReceipt(snap["msg_id"], ctx.edge_id, snap["src"], snap["dst"], snap["text"], QUEUED,
+                               snap["topology_revision"], queue_seq)
+
+    def _duplicate(self, ctx: "_SendContext", record: Dict[str, Any]) -> SendReceipt:
+        """同键的重复调用:不入队(不再查 spool,消息可能已被归档),补记缺失的入队审计,记 SEND_DEDUPLICATED。"""
+        snap = record["message"]
+        try:
+            self._ensure_queued_audit(ctx, self.spool.get(snap["msg_id"]))
+        except MessageNotFoundError:
+            pass                                # 已被归档:入队审计早已写过(归档前消息走完了投递)
+        self.audit.record({"msg_id": snap["msg_id"], "edge_id": ctx.edge_id, "src": snap["src"], "dst": snap["dst"],
+                           "state": SEND_DEDUPLICATED, "detail": "同一幂等键的重复调用,没有入队",
+                           "session": ctx.session, "topology_revision": snap["topology_revision"]})
+        return SendReceipt(snap["msg_id"], ctx.edge_id, snap["src"], snap["dst"], snap["text"], QUEUED,
+                           snap["topology_revision"], record["queue_seq"], duplicate=True)
+
+    def _ensure_queued_audit(self, ctx: "_SendContext", stored: Message) -> None:
+        """入队后、写审计前崩溃:补记入队审计(按 msg_id 查;只在补齐 / 重复时才读审计)。"""
+        if not any(e.get("msg_id") == stored.msg_id and e.get("state") == QUEUED for e in self.audit.read()):
+            self._record_queued(ctx, stored)
+
+    def _check_key(self, ctx: "_SendContext", sender: AgentIdentity, key: str) -> None:
+        m = _KEY.match(key)
+        if not m:
+            raise ctx.reject(REJECT_BAD_KEY, f"幂等键格式不对(应为 <UTC 秒>-<UUID>):{key[:80]!r}",
+                             src=sender.agent_id)
+        age = time.time() - int(m.group(1))
+        if age > IDEMPOTENCY_TTL_S:
+            raise ctx.reject(REJECT_IDEMPOTENCY_EXPIRED,
+                             f"幂等键已超过有效期({IDEMPOTENCY_TTL_S // 86400} 天),不入队", src=sender.agent_id)
+        if age < -_KEY_FUTURE_SKEW_S:
+            raise ctx.reject(REJECT_BAD_KEY, "幂等键的时间在未来", src=sender.agent_id)
+
+    def _checkpoint(self, name: str) -> None:
+        """测试用:在幂等流程的各步之间注入崩溃。"""
+        hook = getattr(self, "crash_hook", None)
+        if hook is not None:
+            hook(name)
 
     def edges(self, env: Optional[Mapping[str, str]] = None) -> List[Dict[str, str]]:
         """env 所声称的角色可以使用的边,以及每条边按其 IP 渲染后的完整文字。

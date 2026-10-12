@@ -279,6 +279,7 @@ herdr 接受了但观察窗口内没看到目标开始处理 → **不记 `DELIV
 | 事件 | 说明 |
 | --- | --- |
 | `state = QUEUED` | 鉴权通过,已入队 |
+| `state = SEND_DEDUPLICATED` | 同一发送方、同一条边、同一幂等键的重复调用(路线图 336):没有入队,`msg_id` 是第一次入队的那条消息 |
 | `state = REJECTED` + `reject_code` | 鉴权失败。身份未核实时 `src` 为空,环境变量声称的身份记在 `claimed_project` / `claimed_role` / `claimed_ip` / `claimed_pane`(不可信,仅供排查) |
 | Broker 的每次状态迁移 | 记录新状态、原因,以及(迁到 `DELIVERED` 时)`evidence` |
 | `OPERATOR_RULING` | **人工裁定必须记录**,**先落盘,动作才生效**(§7.3 规则 4、5)。公共字段:`ruling_id`(稳定、唯一,用于幂等补做)、`actor`(谁裁定的)、`ruling`、`reason`、`msg_id`(被裁定的队列头)、`queue_seq`、`previous_state`、`new_state`。`ruling` 的取值与字段语义见下表 |
@@ -313,6 +314,9 @@ herdr 接受了但观察窗口内没看到目标开始处理 → **不记 `DELIV
 | `target_not_running` | 目标已登记,但 `lifecycle` 不是 `running` |
 | `bad_message` | 渲染后的消息为空、过长(默认 > 1000 字符)或含控制字符 |
 | `ip_draining` | 发送方所在 IP 正在排空(`a2a ip remove` 进行中);同 IP 铁律下也就是目标所在 IP。检查与入队在 IP 排空锁(共享)里完成,见 `17-stage8-ip-add-remove-plan.md` §3.2 |
+| `bad_idempotency_key` | 幂等键格式不对(应为 `<UTC 秒>-<UUID>`),或时间在未来(容许 5 分钟偏差)。路线图 336,见 `19-roadmap-leftovers-plan.md` D 节 |
+| `idempotency_expired` | 幂等键超过有效期(7 天),不入队;过期键对应的记录可以清理,清理后同键再来仍因过期被拒 |
+| `idempotency_conflict` | 同一幂等键第一次鉴权后、入队前中断,补齐时按当前拓扑重新鉴权得到的目标或文字与第一次不一致;不按任何一方发送,交操作员处理 |
 
 ## 10. 待确认与待验证
 

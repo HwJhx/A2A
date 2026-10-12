@@ -123,6 +123,15 @@ a2a plugin uninstall --agent-dir ~/.forenyx/fnx_dv     # 只删除指向本仓�
 
 **测试**:Router 单元:同键第二次不入队、返回原 msg_id、审计一条;不同键、不同边、不同发送方各自入队;并发两个进程同键只入队一次;无键不变;**四个崩溃点**(用可注入的检查点在 ① 前、①② 之间、入队后改 enqueued 前、②③ 之间抛出)之后重试:只有一条消息、msg_id 不变、入队审计恰好一条;①② 之间崩溃后模板被改 → 拒绝补齐(`idempotency_conflict`)、不入队;目标被删 → 照常拒绝;消息被归档后同键重试仍判为重复;过期的键被拒;`archive --older-than` 小于键有效期被拒。插件单元:同一运行 ID 内两次调用带相同键、`before_agent_start` 后换新键、回执 `duplicate` 的提示文字。VM 集成(假 agent):同一次处理里发两次只投递一次。
 
+**实现说明(2026-10-12)**:
+- **关键假设的依据**:没有做假模型服务的实测,改为读 fnx 自带 pi 0.79.10 源码(只读):`prompt()` 先 `emitBeforeAgentStart` 再 `_runAgentPrompt`;后者 `agent.prompt()` 之后 `while (_handlePostAgentRun()) agent.continue()`;可重试错误(`_isRetryableError`:429、5xx、超时、连接错误等)由 `_prepareRetry` 退避后返回 true → `agent.continue()`,**不经过 `prompt()`,不再触发 before_agent_start**。所以自动重试仍是同一个键。
+- **已知限制**(源码同一处):压缩后续跑(`_checkCompaction`)与 agent 忙时排队的输入(`hasQueuedMessages`)也走 `agent.continue()`。前者是同一次处理,符合预期;后者是人工在 agent 忙时插话,第二条输入与第一条共用一个键,同一条边上的第二次通知会被判重。broker 只在目标空闲时投递,不会造成这种情况。
+- **Router**(`router.py`):`send(edge, env, idempotency_key=...)`。身份核实后按发送方加锁 `<状态目录>/idempotency/<发送方>.lock`,记录 `<状态目录>/idempotency/<发送方>/<sha256(边 \0 键)>.json`;流程按方案 3 实现(intent 快照含 msg_id 与已鉴权内容 → 查 spool → 补齐时重新鉴权、与快照不一致 `idempotency_conflict` → enqueued;重复时补记缺失的入队审计并记 `SEND_DEDUPLICATED`,不查 spool 是否还在)。第一次发送刚写下 intent 时不重复鉴权。键格式 `<10 位 UTC 秒>-<UUID>`,超过 7 天 `idempotency_expired`,超前 5 分钟以上 `bad_idempotency_key`。鉴权拆成 `_authorize()`,有键无键共用。新拒绝码与审计事件已写入 `08-protocol.md`。
+- **CLI**:`a2a send <边> --idempotency-key K`,带键时回执多一个 `duplicate` 字段(`state` 仍为 `QUEUED`,插件照常识别)。
+- **插件**:加载时生成一个键,每次 before_agent_start 换新;`a2a_send` 带键调用;回执 `duplicate: true` 时告诉模型"这条通知在本次处理中已经发过,没有重复发送,不要再调用"。"发送结果未知"的提示不改(方案 5)。
+- **测试**:`test_idempotency.py` 12 个(同键一次、不同键/边/发送方各自入队、无键不变、坏键/过期/未来、第一次被拒后可重试、离开 spool 后仍判重、四个崩溃点、入队后写审计前崩溃、intent 后模板变了 → conflict、intent 后目标关闭 → 照常拒绝且恢复后补齐、8 线程与 6 进程同键并发);插件 3 个(同一次处理里第二次判重、新的一次处理再发、首次处理前用加载时的键)。Router 4 处、插件 2 处变异各自被发现。没有另做方案里的 VM 假 agent 集成测试:同键只入队一次已由多进程命令行测试覆盖,broker 对一条已入队消息只投递一次由原有测试覆盖。
+- `a2a spool archive --older-than` 不得小于键有效期:归档命令属于 189,在那里实现。
+
 ## E. `done/` 与审计日志的保留(189)
 
 **现状**:每条消息到终态后在 `spool/done/<msg_id>.json` 留一个文件,永不删除;`audit.jsonl` 一直追加。150 个 agent 压测约 600 条消息,单条约 1 KB,增长不快,但长期运行会一直累积。

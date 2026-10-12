@@ -80,6 +80,22 @@ if (action === "describe") {
     result.push({ registered_again: registered.length - before, active: [...active], error,
                   enum: send ? send.parameters.properties.edge_id.enum : null });
   }
+} else if (action === "sends") {
+  // rest[0]:JSON 列表,每项 "new_run"(触发 before_agent_start,开始新的一次处理)或边 id(调用 a2a_send)
+  result = [];
+  for (const step of JSON.parse(rest[0])) {
+    if (step === "new_run") {
+      for (const handler of handlers.before_agent_start ?? []) await handler({ prompt: "x" }, {});
+      continue;
+    }
+    const send = registry.get("a2a_send");
+    try {
+      const out = await send.execute("call", { edge_id: step }, undefined, () => {}, {});
+      result.push({ ok: true, text: out.content[0].text, details: out.details });
+    } catch (err) {
+      result.push({ ok: false, error: err.message });
+    }
+  }
 } else if (action === "is_herdr_write") {
   result = Object.fromEntries(JSON.parse(rest[0]).map((c) => [c, mod.isHerdrWrite(c)]));
 }

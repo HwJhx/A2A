@@ -21,6 +21,7 @@
  * 只用 Node 内置模块与可擦除的类型标注:pi 用 jiti 加载,单元测试用 node 直接加载。
  */
 import { execFile, execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -85,9 +86,18 @@ export function isReceipt(r: any): boolean {
  * 不把工具的 AbortSignal 传给子进程:发送通常不到 1 秒,中途杀掉只会把确定的结果变成"未知"。
  * 代价是按 Esc 不能取消一次已经开始的发送。超时只作兜底。
  */
-export function runSend(cfg: Config, edgeId: string): Promise<SendOutcome> {
+/**
+ * 幂等键(路线图 336):每次开始处理新输入(before_agent_start)生成一个,处理期间不变。
+ * pi 的自动重试(429 等)走 agent.continue(),不会再次触发 before_agent_start(pi 0.79.10 源码),
+ * 所以重试仍用同一个键:同一次处理里沿同一条边重复调用,Router 只入队一次。
+ */
+export function newRunKey(nowMs: number = Date.now()): string {
+  return `${Math.floor(nowMs / 1000)}-${randomUUID()}`;
+}
+
+export function runSend(cfg: Config, edgeId: string, key?: string): Promise<SendOutcome> {
   return new Promise((resolve) => {
-    execFile(cfg.python, ["-m", "a2a.cli", "send", edgeId],
+    execFile(cfg.python, ["-m", "a2a.cli", "send", edgeId, ...(key ? ["--idempotency-key", key] : [])],
       { env: cfg.env, encoding: "utf8", timeout: cfg.sendTimeoutMs },
       (error, stdout, stderr) => {
         const errText = (stderr || "").trim();
@@ -254,9 +264,11 @@ export default function (pi: any) {
     return undefined;
   });
 
-  const tool = makeSendTool(pi, cfg);
+  let runKey = newRunKey();                   // 加载时先有一个;每次开始处理新输入时换新
+  const tool = makeSendTool(pi, cfg, undefined, () => runKey);
   tool.load();
   pi.on("before_agent_start", async () => {
+    runKey = newRunKey();
     tool.refresh();
     return undefined;
   });
@@ -273,11 +285,12 @@ const edgesKey = (edges: Edge[]) => JSON.stringify(edges);
  *   - getActiveTools / setActiveTools 在扩展加载时还不能用(抛 not initialized),只能在事件处理函数里用。
  * 没有"注销工具"的接口:出边变空时只停用。
  */
-export function makeSendTool(pi: any, cfg: Config, list: () => Edge[] = () => listEdges(cfg)) {
+export function makeSendTool(pi: any, cfg: Config, list: () => Edge[] = () => listEdges(cfg),
+                             runKey?: () => string) {
   let registeredKey: string | null = null;   // 当前注册的工具对应的出边;null = 从未注册
 
   const register = (edges: Edge[]) => {
-    pi.registerTool(buildSendTool(cfg, edges));
+    pi.registerTool(buildSendTool(cfg, edges, runKey));
     registeredKey = edgesKey(edges);
   };
 
@@ -319,7 +332,7 @@ export function makeSendTool(pi: any, cfg: Config, list: () => Edge[] = () => li
   };
 }
 
-export function buildSendTool(cfg: Config, edges: Edge[]) {
+export function buildSendTool(cfg: Config, edges: Edge[], runKey?: () => string) {
   return {
     name: TOOL,
     label: "A2A 发送",
@@ -334,9 +347,16 @@ export function buildSendTool(cfg: Config, edges: Edge[]) {
     },
     async execute(_toolCallId: string, params: { edge_id: string }) {
       const startedAt = new Date().toISOString();
-      const outcome = await runSend(cfg, params.edge_id);
+      const outcome = await runSend(cfg, params.edge_id, runKey?.());
       if (outcome.kind === "sent") {
         const r = outcome.receipt;
+        if (r.duplicate === true) {
+          return {
+            content: [{ type: "text", text: `这条通知在本次处理中已经发过(发给 ${r.dst},msg_id=${r.msg_id}),`
+              + `这次没有重复发送。不要再调用 a2a_send 发这条边。` }],
+            details: { status: "duplicate", ...r },
+          };
+        }
         return {
           content: [{ type: "text", text: `已发送(排队投递中):发给 ${r.dst},msg_id=${r.msg_id},内容「${r.text}」` }],
           details: { status: "sent", ...r },

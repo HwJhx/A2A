@@ -410,6 +410,28 @@ class PiExtension(unittest.TestCase):
         self.assertEqual((out[0]["enum"], out[0]["active"]), (["dv_done"], ["read", "bash", "a2a_send"]))
         self.assertIn("暂不注册 a2a_send", err)
 
+    # ---- 路线图 336:同一次处理里沿同一条边只发一次 -------------------------------------
+    def test_a_second_send_in_the_same_run_is_deduplicated(self):
+        out, _ = self.harness(self.env(), "sends", json.dumps(["new_run", "dv_done", "dv_done"]))
+        first, second = out
+        self.assertEqual((first["details"]["status"], second["details"]["status"]), ("sent", "duplicate"))
+        self.assertEqual(second["details"]["msg_id"], first["details"]["msg_id"])
+        self.assertIn("已经发过", second["text"])
+        self.assertIn("不要再调用", second["text"])
+        self.assertEqual(len(self.spool.pending()), 1)
+        self.assertEqual([e["state"] for e in self.audit.read() if e.get("msg_id") == first["details"]["msg_id"]],
+                         ["QUEUED", "SEND_DEDUPLICATED"])
+
+    def test_a_new_run_sends_again(self):
+        out, _ = self.harness(self.env(), "sends", json.dumps(["new_run", "dv_done", "new_run", "dv_done"]))
+        self.assertEqual([o["details"]["status"] for o in out], ["sent", "sent"])
+        self.assertNotEqual(out[0]["details"]["msg_id"], out[1]["details"]["msg_id"])
+        self.assertEqual(len(self.spool.pending()), 2)
+
+    def test_sends_before_the_first_run_use_the_key_made_at_load(self):
+        out, _ = self.harness(self.env(), "sends", json.dumps(["dv_done", "dv_done"]))
+        self.assertEqual([o["details"]["status"] for o in out], ["sent", "duplicate"])
+
 
 if __name__ == "__main__":
     unittest.main()
