@@ -1,11 +1,13 @@
 /**
  * a2a 的 pi 插件(阶段 6,设计见 herdr/claude/10-stage6-test-plan.md §2a)。
  *
- * 安装:复制到 fnx 的 agent/extensions/ 目录(例如 ~/.forenyx/fnx_dv/agent/extensions/a2a.ts),
+ * 安装:`a2a plugin install --agent-dir ~/.forenyx/fnx_dv`(软链接到 fnx 的 agent/extensions/a2a.ts),
  * fnx 启动时自动加载。只在 a2a 管理的 pane 里生效(由 `a2a agent spawn` 注入 A2A_* 环境变量);
  * 普通使用 fnx 时什么都不做。
  *
- *   a2a_send 工具   参数只有 edge_id,取值限定为本角色在拓扑里的出边。执行时用
+ *   a2a_send 工具   参数只有 edge_id,取值限定为本角色在拓扑里的出边。每次开始处理新输入之前
+ *                   (before_agent_start)重新读取出边,有变化就同名重新注册;出边变空时停用该工具
+ *                   (路线图 338,方案 19 号 C 节)。执行时用
  *                   execFile(A2A_PYTHON, ["-m", "a2a.cli", "send", edge_id]) 调用 Router:不经过 shell,
  *                   继承 pane 的身份环境变量。鉴权、填模板、确定目标、入队全部由 Router 完成,
  *                   插件不重复实现。
@@ -252,17 +254,74 @@ export default function (pi: any) {
     return undefined;
   });
 
-  let edges: Edge[];
-  try {
-    edges = listEdges(cfg);
-  } catch (err) {
-    console.error(`[a2a] 读取可用通信边失败,不注册 a2a_send:${(err as Error).message}`);
-    return;
-  }
-  if (edges.length === 0) return;
+  const tool = makeSendTool(pi, cfg);
+  tool.load();
+  pi.on("before_agent_start", async () => {
+    tool.refresh();
+    return undefined;
+  });
+}
 
-  pi.registerTool({
-    name: "a2a_send",
+const TOOL = "a2a_send";
+const edgesKey = (edges: Edge[]) => JSON.stringify(edges);
+
+/**
+ * a2a_send 的注册与刷新(路线图 338)。依据 fnx 自带的 pi 0.79.10 源码:
+ *   - registerTool 按工具名存进 Map:同名再注册是替换,随后立即刷新工具表;
+ *   - 刷新时已存在的名字保持原来的启用状态,只有新名字才自动启用 → 停用后再恢复要显式 setActiveTools;
+ *   - before_agent_start 的处理函数在本轮请求之前执行,这里改的工具与系统提示本轮就生效;
+ *   - getActiveTools / setActiveTools 在扩展加载时还不能用(抛 not initialized),只能在事件处理函数里用。
+ * 没有"注销工具"的接口:出边变空时只停用。
+ */
+export function makeSendTool(pi: any, cfg: Config, list: () => Edge[] = () => listEdges(cfg)) {
+  let registeredKey: string | null = null;   // 当前注册的工具对应的出边;null = 从未注册
+
+  const register = (edges: Edge[]) => {
+    pi.registerTool(buildSendTool(cfg, edges));
+    registeredKey = edgesKey(edges);
+  };
+
+  const setActive = (on: boolean) => {
+    const active: string[] = pi.getActiveTools();
+    if (active.includes(TOOL) === on) return;
+    // 只增删 a2a_send,其他启用的工具(bash 等)保持原样
+    pi.setActiveTools(on ? [...active, TOOL] : active.filter((name) => name !== TOOL));
+  };
+
+  return {
+    /** 扩展加载时:有出边就注册(保证第一轮就有工具)。失败或没有出边就先不注册,下一轮再试。 */
+    load() {
+      let edges: Edge[];
+      try {
+        edges = list();
+      } catch (err) {
+        console.error(`[a2a] 读取可用通信边失败,暂不注册 a2a_send(下一轮处理前再试):${(err as Error).message}`);
+        return;
+      }
+      if (edges.length > 0) register(edges);
+    },
+    /** 每轮开始前:出边变化就同名重新注册;变空就停用;读取失败保留上一次的工具(Router 仍会完整鉴权)。 */
+    refresh() {
+      let edges: Edge[];
+      try {
+        edges = list();
+      } catch (err) {
+        console.error(`[a2a] 刷新可用通信边失败,沿用上一次的 a2a_send:${(err as Error).message}`);
+        return;
+      }
+      if (edges.length === 0) {
+        if (registeredKey !== null) setActive(false);
+        return;
+      }
+      if (edgesKey(edges) !== registeredKey) register(edges);
+      setActive(true);
+    },
+  };
+}
+
+export function buildSendTool(cfg: Config, edges: Edge[]) {
+  return {
+    name: TOOL,
     label: "A2A 发送",
     description: describe(edges),
     parameters: {
@@ -300,5 +359,5 @@ export default function (pi: any) {
         details: { status: "unknown", edge_id: params.edge_id, src, dst, started_at: startedAt, reason: outcome.reason },
       };
     },
-  });
+  };
 }

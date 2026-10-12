@@ -12,6 +12,7 @@ agent 用:
   a2a agent spawn | stop | close | purge | restore <role> <ip> [--session NAME]   生命周期
   a2a agent list [--session NAME]
   a2a broker run --session NAME [--once]
+  a2a plugin install | status | uninstall --agent-dir DIR   pi 插件(软链接到仓库里的 pi-extension/a2a.ts)
 
 输出都是 JSON(方便 agent 和脚本解析)。退出码:0 成功;2 用法错误;3 broker 已在运行;
 4 发送被拒绝;5 找不到;6 操作不合法(例如裁定的不是队列头)。
@@ -27,7 +28,7 @@ import signal
 import sys
 from typing import Any, List, Optional
 
-from . import rulings
+from . import plugin, rulings
 from .audit import AuditLog
 from .broker import Broker, BrokerAlreadyRunning
 from .errors import HerdrError
@@ -445,6 +446,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session")
     p.set_defaults(func=cmd_agent)
 
+    plug = sub.add_parser("plugin", help="pi 插件安装(软链接)").add_subparsers(dest="op", required=True)
+    for name, help_text in (("install", "在 <agent-dir>/agent/extensions/ 建软链接 a2a.ts -> 仓库里的插件"),
+                            ("status", "未安装 / 已链接到本仓库 / 链接到别处 / 普通文件,及同名工具冲突"),
+                            ("uninstall", "只删除指向本仓库插件的软链接")):
+        p = plug.add_parser(name, help=help_text)
+        p.add_argument("--agent-dir", required=True, help="fnx 的目录,例如 ~/.forenyx/fnx_dv")
+        p.set_defaults(func=cmd_plugin)
+
     broker = sub.add_parser("broker", help="消息投递进程").add_subparsers(dest="command", required=True)
     p = broker.add_parser("run", help="前台运行 broker(Ctrl-C / SIGTERM 退出)")
     p.add_argument("--session", help="服务的 herdr 会话名(默认取 HERDR_SESSION)")
@@ -452,6 +461,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--herdr-bin", default="herdr", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_broker_run)
     return parser
+
+
+def cmd_plugin(args: argparse.Namespace) -> int:
+    action = {"install": plugin.install, "status": plugin.status, "uninstall": plugin.uninstall}[args.op]
+    try:
+        _out(action(args.agent_dir))
+    except plugin.PluginError as exc:
+        return _err(str(exc), EXIT_INVALID)
+    except OSError as exc:                     # 权限不足、只读目录等
+        return _err(f"{type(exc).__name__}: {exc}", EXIT_INVALID)
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:

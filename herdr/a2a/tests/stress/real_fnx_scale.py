@@ -42,6 +42,7 @@ SRC = HERE.parent.parent / "src"
 sys.path.insert(0, str(SRC))
 
 from a2a._fsutil import atomic_write_text  # noqa: E402
+from a2a import plugin  # noqa: E402
 from a2a.audit import AuditLog  # noqa: E402
 from a2a.herdr_client import HerdrClient, session_delete, session_list, session_stop  # noqa: E402
 from a2a.messages import (DELIVERED, DELIVERY_UNCERTAIN, FAILED, REJECTED, TARGET_BLOCKED,  # noqa: E402
@@ -54,7 +55,6 @@ _spec = importlib.util.spec_from_file_location("stress_scale", HERE / "stress_sc
 stress = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(stress)  # 复用采样器与 /proc 工具
 
-PLUGIN = HERE.parent.parent / "pi-extension" / "a2a.ts"
 HOME = Path.home()
 EDGES = [
     {"id": "dv_done", "from": "dv", "to": "sw",
@@ -181,7 +181,7 @@ class Run:
         self.broker: Optional[subprocess.Popen] = None
         self.server_pid = 0
         self.report: Dict[str, object] = {"ips": self.n, "session": self.session, "kickoff": not args.no_kickoff}
-        self.plugin_files: List[tuple] = []        # (文件, 目录是否本次新建)
+        self.plugin_dirs: List[str] = []           # 本次用 a2a plugin install 新装插件的 fnx 目录
         self.roots: Dict[str, int] = {}            # agent_id -> fnx 进程 pid
         self.cwds: Dict[str, Path] = {}
         self.call_cap = CALLS_PER_IP * self.n * 2
@@ -209,28 +209,24 @@ class Run:
 
     # ---- 准备 -----------------------------------------------------------
     def install_plugin(self):
+        """用 a2a plugin install 以软链接安装(路线图 313);原本已安装的保持不动,结束时也不卸载。"""
         for agent in ("fnx_dv", "fnx_sw"):
-            ext = HOME / ".forenyx" / agent / "agent" / "extensions"
-            created = not ext.exists()
-            if not created:
-                for f in ext.glob("*.ts"):
-                    if "a2a_send" in f.read_text(errors="replace"):
-                        raise Stop("setup", f"{f} 也注册 a2a_send,不安装")
-            ext.mkdir(exist_ok=True)
-            dest = ext / f"a2a_scale_{os.getpid()}.ts"
-            shutil.copyfile(PLUGIN, dest)
-            self.plugin_files.append((dest, created))
+            fnx_dir = str(HOME / ".forenyx" / agent)
+            try:
+                result = plugin.install(fnx_dir)
+            except plugin.PluginError as exc:
+                raise Stop("setup", f"插件安装失败:{exc}")
+            if result["changed"]:
+                self.plugin_dirs.append(fnx_dir)
 
     def remove_plugin(self) -> List[str]:
         problems = []
-        for dest, created in self.plugin_files:
+        for fnx_dir in self.plugin_dirs:
             try:
-                dest.unlink(missing_ok=True)
-                if created:
-                    dest.parent.rmdir()
-            except OSError as exc:
-                problems.append(f"{dest}: {exc}")
-        self.plugin_files = []
+                plugin.uninstall(fnx_dir)
+            except (plugin.PluginError, OSError) as exc:
+                problems.append(f"{fnx_dir}: {exc}")
+        self.plugin_dirs = []
         return problems
 
     def setup_session(self):
@@ -280,7 +276,7 @@ class Run:
         self.report["spawn_per_agent_s"] = stress.summary(times)
         # 发提示词之前确认 fnx 确实加载了本次的插件(TUI 的 [Extensions] 里列出文件名);否则不调用模型
         # 部署约束(方案 16 号 §2.1):只加载本次的 a2a 插件,没有其他可能在 agent_end 里排消息的扩展
-        name = self.plugin_files[0][0].name
+        name = plugin.LINK_NAME
         wrong = {}
         for a in self.roots:
             listed = extensions_listed(self.client.agent_read(a, source="recent-unwrapped", lines=60))

@@ -396,7 +396,8 @@ STAGE6_EDGES = [
 class RealFnxPlugin(_Base):
     """阶段 6:真实 fnx 加载 a2a 插件。**不发任何提示词,不调用模型。**
 
-    插件与检查扩展临时复制进 fnx 的 agent/extensions/,结束时移除(目录原本不存在则一并删除)。
+    插件用 `a2a plugin install` 以软链接装进 fnx 的 agent/extensions/(路线图 313),结束时 uninstall
+    (原本已安装的保持不动);检查扩展临时复制进去,结束时移除。
     """
 
     def make_launchers(self):
@@ -414,22 +415,26 @@ class RealFnxPlugin(_Base):
         self.work = self.state / "work"  # agent 的工作目录:测试结束时必须仍为空
         self.work.mkdir()
         for role in ("dv", "sw"):
-            ext = Path(FNX[role]).parents[1] / "agent" / "extensions"
-            if not ext.exists():
-                self.addCleanup(self._rmdir_if_empty, ext)  # 逆序执行:在删完下面的文件之后
-            ext.mkdir(exist_ok=True)
-            for src in (PLUGIN, INSPECT):
-                dest = ext / src.name
-                if dest.exists():  # 已常驻安装的插件:测试结束时还原原内容
-                    self.addCleanup(dest.write_bytes, dest.read_bytes())
-                else:
-                    self.addCleanup(dest.unlink, missing_ok=True)
-                shutil.copy(src, dest)
+            fnx_dir = str(Path(FNX[role]).parents[1])
+            _, installed, _ = self.a2a_plain("plugin", "install", "--agent-dir", fnx_dir)
+            if installed.get("changed"):   # 先登记卸载再断言;原本已安装的保持不动;逆序执行:在删完检查扩展之后
+                self.addCleanup(self.a2a_plain, "plugin", "uninstall", "--agent-dir", fnx_dir)
+            self.assertEqual((installed["state"], Path(installed["source"])), ("linked", PLUGIN))
+            dest = Path(fnx_dir) / "agent" / "extensions" / INSPECT.name
+            self.addCleanup(dest.unlink, missing_ok=True)
+            shutil.copy(INSPECT, dest)
             # fnx 按工作目录在 agent/sessions/ 下建会话目录;没有发提示词,应当是空的
             sessions = Path(FNX[role]).parents[1] / "agent" / "sessions"
             self.addCleanup(self._rmdir_if_empty, sessions / ("-" + str(self.work).replace("/", "-") + "--"))
         # 清理按注册的逆序执行:先停掉 agent,再移除扩展文件和空目录
         self.addCleanup(self.purge_all)
+
+    def a2a_plain(self, *argv):
+        """不带 --session 的 a2a 命令(plugin 不需要会话)。"""
+        proc = subprocess.run([sys.executable, "-m", "a2a.cli", *argv], env=self.env, capture_output=True,
+                              text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.returncode, json.loads(proc.stdout), proc.stderr
 
     @staticmethod
     def _rmdir_if_empty(path):

@@ -202,7 +202,21 @@ a2a agent recover --session <会话> [--ip gpio] [--include-stopped]
 
 ## pi 插件(`pi-extension/a2a.ts`)
 
-在 a2a 管理的 fnx pane 里生效(由 `a2a agent spawn` 注入的 `A2A_*` 环境变量判断),普通使用 fnx 时什么都不做。测试或运行时临时复制到 `~/.forenyx/fnx_<x>/agent/extensions/`,用完删除。
+在 a2a 管理的 fnx pane 里生效(由 `a2a agent spawn` 注入的 `A2A_*` 环境变量判断),普通使用 fnx 时什么都不做。
+
+安装(软链接到仓库里的同一个文件,修改插件后所有智能体下次启动即生效;实测 fnx 能加载软链接形式的扩展,启动画面 `[Extensions]` 里显示为 `a2a.ts`):
+
+```bash
+a2a plugin install   --agent-dir ~/.forenyx/fnx_dv   # 建 agent/extensions/a2a.ts -> pi-extension/a2a.ts
+a2a plugin status    --agent-dir ~/.forenyx/fnx_dv   # not_installed / linked / linked_elsewhere / regular_file,及同名工具冲突
+a2a plugin uninstall --agent-dir ~/.forenyx/fnx_dv   # 只删指向本仓库的软链接;extensions/ 是 install 建的且已空才删
+```
+
+- `extensions/a2a.ts` 已存在但不是指向本仓库的软链接(普通文件、指向别处)时拒绝,不覆盖也不删除。
+- `extensions/` 里已有别的扩展注册 `a2a_send`(按 `name: "a2a_send"` 文本匹配,尽力而为)时拒绝安装。
+- 只往 fnx 的 agent 目录加文件,不改 fnx 的程序、启动脚本、libexec。集成测试与压测脚本也用这个命令,原本已安装的保持不动。
+- 插件是在 fnx 启动时加载的:修改插件后,已在运行的 agent 要 restore 才会用上新版本。
+- 可用的边每轮刷新(路线图 338):pi 每次开始处理新输入前,插件重新读取本角色的出边;有变化就更新 `a2a_send` 的可选边与说明,出边变空时停用 `a2a_send`,读取失败沿用上一次的。所以 `a2a topology add-edge / remove-edge` 之后不用重启 agent,下一轮就生效(本轮已开始处理的不受影响;Router 始终按当前拓扑鉴权)。
 
 - `a2a_send(edge_id)`:调用 `a2a send`,鉴权、模板、目标都由 Router 决定。结果分三类:成功、明确拒绝(未入队)、结果未知(可能已入队,提示不要重试)。
 - 拦截 bash 里直接调用 herdr 写入类命令(软限制)。**已知局限**:按正则匹配命令文本,可能误拦提到这些命令的文档 / 搜索命令,也能被变量、别名、脚本文件绕过;它防的是模型误用,不是安全边界。真正的隔离需要让 agent 用别的 OS 用户运行(L4),目前不做。

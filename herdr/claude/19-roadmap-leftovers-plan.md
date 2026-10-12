@@ -66,6 +66,14 @@ a2a plugin uninstall --agent-dir ~/.forenyx/fnx_dv     # 只删除指向本仓�
 
 另外 3 个智能体(313 行的后半句)归入 75 行,暂不处理。
 
+**实现说明(2026-10-12)**:
+- 实测(VM,真实 fnx_dv / fnx_sw,不调用模型):`agent/extensions/a2a.ts` 为指向仓库插件的软链接时,fnx 正常加载,`a2a_send` 注册、各角色可用的边正确;启动画面 `[Extensions]` 显示链接名 `a2a.ts`。按原方案实现,不需要退回"复制 + 校验值"。
+- `src/a2a/plugin.py` + `a2a plugin install/status/uninstall --agent-dir`(错误退出码 6)。`--agent-dir` 下必须已有 `agent/`(fnx 运行过);`extensions/` 不存在时创建,并在 `agent/.a2a-created-extensions` 记录(放在 extensions 之外,免得被当成扩展加载),uninstall 只在有该标记且目录已空时删除目录。
+- 同名冲突:除了 `a2a.ts` 本身,还检查 extensions/ 里其他 .ts/.js 是否注册 `a2a_send`(按 `name: "a2a_send"` 文本匹配,尽力而为;只读取该工具的扩展,如测试用的检查扩展,不算冲突)。这一条原本在压测脚本里,移进安装命令。
+- 集成测试 `RealFnxPlugin` 与压测脚本 `real_fnx_scale.py` 改用此命令;原本已安装(`changed=false`)的保持不动,结束时也不卸载。压测脚本核对启动画面扩展列表时改为只认 `a2a.ts`。
+- 测试:新增单元 10 个(`test_plugin.py`,临时目录),三处变异(不核对链接指向、不看标记文件、改回文字匹配)各自被发现。Mac 单元 567 通过(跳过 51);VM 全套(先等文件大小一致、无字节码缓存、含真实 fnx)567 通过、0 跳过,结束后 fnx 目录无残留。压测脚本需要调用模型,未运行,只确认能加载(`test_stress_helpers`)。
+- **Codex 审核(应修 3)已修**:① 标记文件改为记录 extensions/ 的 设备号:inode,卸载时核对;目录被外部删除重建后不再当成本命令创建的,作废标记被清掉;② `a2a plugin` 捕获 OSError(权限不足、只读目录等),按约定输出 JSON、退出码 6;③ 集成测试先按 `changed` 登记卸载再断言。新增单元 2 个,两处变异各自被发现。Mac 单元 569 通过(跳过 51);VM 全套(含真实 fnx)569 通过、0 跳过,fnx 目录无残留。按用户要求每条只审一次,不再复核。
+
 ## C. 插件每轮刷新可用的边(338)
 
 **现状**:插件加载时调用一次 `a2a edges`,用结果注册 `a2a_send`(参数 `edge_id` 的 enum 与工具说明)。拓扑之后新增的边要重启 agent 才看得到;删除的边仍出现在 enum 里,调用时被 Router 拒绝。
@@ -79,6 +87,13 @@ a2a plugin uninstall --agent-dir ~/.forenyx/fnx_dv     # 只删除指向本仓�
 **需要实测**(不调用模型):同名 `registerTool` 是替换还是报错 / 重复。不需要模型:用一个只在测试时安装的检查扩展,在命令处理函数里(用户输入 `/命令`,不触发模型)对比重新注册前后的 `pi.getAllTools()`,把结果写进文件。若同名重新注册不是替换,改为工具名带版本号、用 `setActiveTools` 只启用最新的那个,方案再审。
 
 **测试**:插件单元(Mac / VM node):边变化时重新注册、无变化不重注册、出边变空时停用、`a2a edges` 失败时保留旧工具;**启停 `a2a_send` 时其他启用的工具(含 bash 等)不变**。真实 fnx(不调用模型):运行中 `a2a topology` 增加一条边,触发 `before_agent_start` 需要输入 —— 这一步会调用模型,所以真实验证并入 F 的那次模型测试;不调用模型的部分只验证"同名重新注册"的 API 行为。
+
+**实现说明(2026-10-12)**:
+- 没有另做"同名重新注册"的实测,改为直接读 fnx 自带的 pi 0.79.10 源码(编译进 `libexec/forenyx-cli`,只读):`registerTool` 把工具按名字存进 Map(同名 = 替换)并立即 `_refreshToolRegistry`;刷新时已存在的名字保持原启用状态,只有新名字自动启用(所以停用后再恢复必须显式 `setActiveTools`);`emitBeforeAgentStart` 在 `_runAgentPrompt` 之前执行,其中改的工具列表与重建的系统提示本轮生效;`getActiveTools` / `setActiveTools` 在扩展加载期间抛 not initialized,只能在事件处理函数里用;没有注销工具的接口。
+- 插件:`makeSendTool(pi, cfg)` 的 `load()`(加载时有出边就注册;读取失败或没有出边先不注册,下一轮再试——原来加载失败就永远没有工具)与 `refresh()`(before_agent_start:出边与上次相同不重注册;不同就同名重注册;变空只停用;失败沿用;启停只增删 `a2a_send`)。工具定义抽成 `buildSendTool(cfg, edges)`。
+- 测试:插件单元测试的假 pi 改为按上述源码行为模拟(同名替换、新名字自动启用、加载期间调用启停接口会抛错);新增 5 个(无变化不重注册且其他工具不变、加边下一轮可见、出边变空只停用 / 恢复后重新启用、读取失败保留旧工具、加载时没有出边或读取失败后续补注册);4 处变异各自被发现。另:插件测试的假 herdr 先空跑一次——macOS 首次执行新建的可执行文件会做安全扫描,可能超过插件 1 秒的上报超时导致重试(推测是之前 Mac 上偶发失败的原因,未证实)。
+- Codex 审核:阻断 0、应修 0。源码核查只对 pi 0.79.10 成立,**升级 fnx / pi 后要重新核对**同名注册与启用状态的行为。将来考虑:每轮刷新用同步 `execFileSync` 调 `a2a edges`,最坏等 30 秒才开始本轮(低概率,不影响正确性)。
+- 真实 fnx 的"运行中加边、下一轮可见"需要输入才会触发 before_agent_start,会调用模型,并入 327 那次模型测试。本次 VM 上跑了插件单元测试与真实 fnx 加载插件的集成测试(fnx 正常加载改动后的插件,`a2a_send` 与边正确)。
 
 ## D. 发送防重复(幂等)(336)
 

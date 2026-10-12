@@ -95,7 +95,7 @@ class PiExtension(unittest.TestCase):
         # 说明里列出每条边按本 IP 渲染后的完整文字,模型据此区分"测试成功 / 测试失败"
         self.assertIn("sw_test_pass:发给 dv_gpio,内容是「gpio 测试成功。你只回复收到即可」", tool["description"])
         self.assertIn("sw_test_fail:发给 dv_gpio,内容是「gpio 测试失败。你只回复收到即可」", tool["description"])
-        self.assertEqual(sorted(out["events"]), sorted(["tool_call", "agent_start", "agent_end", "session_before_compact"]))
+        self.assertEqual(sorted(out["events"]), sorted(["tool_call", "agent_start", "agent_end", "session_before_compact", "before_agent_start"]))
 
     def test_does_nothing_outside_an_a2a_pane(self):
         out, _ = self.harness(self.env(A2A_ROLE=None), "describe")
@@ -109,7 +109,7 @@ class PiExtension(unittest.TestCase):
 
     def test_identity_outside_the_topology_registers_no_tool_but_keeps_the_guard(self):
         out, err = self.harness(self.env(A2A_IP="spi", HERDR_PANE_ID="w1:p9"), "describe")
-        self.assertEqual((out["tools"], sorted(out["events"])), ([], sorted(["tool_call", "agent_start", "agent_end", "session_before_compact"])))
+        self.assertEqual((out["tools"], sorted(out["events"])), ([], sorted(["tool_call", "agent_start", "agent_end", "session_before_compact", "before_agent_start"])))
         self.assertIn("读取可用通信边失败", err)
 
     # ---- 发送 ----------------------------------------------------------
@@ -209,6 +209,10 @@ class PiExtension(unittest.TestCase):
         body = {"ok": "exit 0", "fail": "exit 1", "hang": "exec sleep 10"}[mode]
         path.write_text(f'#!/bin/sh\necho "$*" >> {log}\n{body}\n')
         path.chmod(0o755)
+        # 先空跑一次:macOS 首次执行新建的可执行文件会做安全扫描,可能超过插件 1 秒的上报超时,
+        # 让第一次上报被当成失败重试(Mac 上偶发的测试失败,推测原因)。run_events 会清空记录
+        if mode != "hang":
+            subprocess.run([str(path), "warmup"], capture_output=True, timeout=30)
         return str(path), log
 
     def run_events(self, events, mode="ok", **env):
@@ -352,6 +356,59 @@ class PiExtension(unittest.TestCase):
         self.assertIsNone(allowed["outcome"])
         other, _ = self.harness(self.env(), "tool_call", "read", json.dumps({"path": "/tmp/x"}))
         self.assertIsNone(other["outcome"])
+
+    # ---- 路线图 338:每轮开始前(before_agent_start)刷新可用的边 -------------------------------
+    # 假 pi 按 fnx 自带 pi 0.79.10 的行为模拟(同名再注册 = 替换;已有名字保持启用状态;
+    # 加载期间不能调 getActiveTools / setActiveTools)
+
+    def variant(self, name, edges):
+        """另存一份只有 edges 不同的拓扑文件,步骤里复制成当前拓扑。"""
+        path = self.state / f"{name}.yaml"
+        TopologyStore.create(path, dict(TOPOLOGY, edges=edges))
+        return str(path)
+
+    def rounds(self, env, steps):
+        out, err = self.harness(env, "rounds", json.dumps(steps))
+        return out, err
+
+    def test_unchanged_edges_are_not_registered_again_and_other_tools_stay(self):
+        out, _ = self.rounds(self.env(), [{}, {}])
+        for step in out:
+            self.assertEqual((step["registered_again"], step["enum"], step["error"]), (0, ["dv_done"], None))
+            self.assertEqual(step["active"], ["read", "bash", "a2a_send"])
+
+    def test_a_new_edge_is_visible_in_the_next_round(self):
+        extra = {"id": "dv_extra", "from": "dv", "to": "sw", "template": "{ip} 补充说明"}
+        out, _ = self.rounds(self.env(), [{"topology": self.variant("more", TOPOLOGY["edges"] + [extra])}])
+        self.assertEqual((out[0]["registered_again"], out[0]["enum"]), (1, ["dv_done", "dv_extra"]))
+        self.assertEqual(out[0]["active"], ["read", "bash", "a2a_send"])
+
+    def test_losing_all_edges_deactivates_only_a2a_send_and_regaining_reactivates_it(self):
+        sw_only = self.variant("sw_only", [e for e in TOPOLOGY["edges"] if e["from"] == "sw"])
+        full = self.variant("full", TOPOLOGY["edges"])
+        out, _ = self.rounds(self.env(), [{"topology": sw_only}, {}, {"topology": full}])
+        self.assertEqual(out[0]["active"], ["read", "bash"])               # 只去掉 a2a_send
+        self.assertEqual((out[1]["active"], out[1]["registered_again"]), (["read", "bash"], 0))
+        # 同名再注册不会自动恢复启用(已有名字保持原状态):必须显式加回
+        self.assertEqual((out[2]["active"], out[2]["enum"]), (["read", "bash", "a2a_send"], ["dv_done"]))
+
+    def test_a_failed_refresh_keeps_the_previous_tool(self):
+        out, err = self.rounds(self.env(), [{"corrupt": True}])
+        self.assertEqual((out[0]["registered_again"], out[0]["enum"], out[0]["error"]), (0, ["dv_done"], None))
+        self.assertEqual(out[0]["active"], ["read", "bash", "a2a_send"])
+        self.assertIn("刷新可用通信边失败", err)
+
+    def test_registered_later_when_edges_appear_or_loading_failed(self):
+        no_dv = self.variant("no_dv", [e for e in TOPOLOGY["edges"] if e["from"] == "sw"])
+        full = self.variant("full", TOPOLOGY["edges"])
+        Path(self.state / "topology.yaml").write_text(Path(no_dv).read_text())   # 加载时没有出边
+        out, _ = self.rounds(self.env(), [{}, {"topology": full}])
+        self.assertEqual((out[0]["enum"], out[0]["active"]), (None, ["read", "bash"]))
+        self.assertEqual((out[1]["enum"], out[1]["active"]), (["dv_done"], ["read", "bash", "a2a_send"]))
+        Path(self.state / "topology.yaml").write_text("{{{ 坏的")                 # 加载时读取失败
+        out, err = self.rounds(self.env(), [{"topology": full}])
+        self.assertEqual((out[0]["enum"], out[0]["active"]), (["dv_done"], ["read", "bash", "a2a_send"]))
+        self.assertIn("暂不注册 a2a_send", err)
 
 
 if __name__ == "__main__":
