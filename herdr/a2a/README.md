@@ -227,6 +227,7 @@ a2a agent recover --session <会话> [--ip gpio] [--include-stopped]
 | `agent prompt` 对 `blocked` 的 agent 拒绝发送;超时或 `agent_prompt_stalled` 不代表没发出去 | 抛 `HerdrAgentBlocked` / `HerdrPromptStalled`;重试前先读状态和输出 |
 | 同时发两条给忙碌的 agent,都会被接受,按两轮依次处理,但顺序不确定 | 保证顺序要靠上层的队列,不是 herdr |
 | 虚拟机里 pane 默认工作目录是 Mac 的共享路径 | 创建 tab / pane 时用 `cwd=` 明确指定 |
+| agent(进程组组长)退出后,pane 的 shell 收回终端,它启动的子进程变成后台进程,pane 看起来只剩 shell | `agent stop` 在 Linux 上还核对原进程组已没有进程,否则报错、状态保持 running;人工结束残留进程后再 stop。没有登记进程组的旧记录、或读不了 /proc(权限不足、hidepid 挂载)时,同样不登记 stopped(fail-closed),人工确认后用 `agent close` 或 `agent restore`。spawn / restore 启动失败(含 Ctrl-C 中断)会关掉该 pane,restore 的记录标为 failed,之后 restore 新建 pane。stop 用 pidfd 锁定组长再发信号;pidfd 发信号成功与 killpg 之间组被复用的极窄窗口仍存在(已知局限) |
 | 会话 `stop` 后重新 attach:pane 与 pane ID 保留,进程退出,agent 名字丢失;**pane 的新 shell 不再带创建时注入的环境变量** | 启动命令自带身份变量(`Lifecycle._launch`);会话重启后用 `a2a agent recover` |
 
 ## 还没做 / 没验证

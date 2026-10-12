@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -20,8 +21,10 @@ from typing import Optional
 from a2a.audit import AuditLog
 from a2a.broker import Broker
 from a2a.herdr_client import HerdrClient, herdr_version, session_delete, session_stop
+from a2a.lifecycle import Lifecycle, LifecycleError
 from a2a.messages import DELIVERED, QUEUED, TARGET_MISSING, Message, new_msg_id, now_iso
 from a2a.policy import BrokerConfig, semantics_verified
+from a2a.procsignal import ProcSignaler
 from a2a.registry import Registry
 from a2a.spool import Spool
 from a2a.topology import TopologyStore
@@ -163,6 +166,156 @@ class FakeAgentLifecycle(_Base):
         events = [e["state"] for e in self.audit.read() if str(e.get("state", "")).startswith("AGENT_")]
         self.assertEqual(events, ["AGENT_SPAWNED", "AGENT_STOPPED", "AGENT_RESTORED", "AGENT_CLOSED",
                                   "AGENT_RESTORED", "AGENT_PURGED"])
+
+    def test_stop_is_not_recorded_while_a_child_of_the_agent_survives(self):
+        # 19 号方案 §A:agent(组长)退出但它启动的、忽略 SIGTERM 的子进程还在同一进程组 → 不登记 stopped
+        launcher = Path(self.store.current().roles["sw"].launcher)
+        launcher.write_text(f"#!/bin/bash\nexport FAKE_ROLE=sw\n( trap '' TERM; sleep 300 ) &\n"
+                            f'exec {sys.executable} {FAKE} "{self.state}/$A2A_ROLE""_""$A2A_IP"".log" work\n')
+        _, sw, _ = self.a2a("agent", "spawn", "sw", "uart")
+        pgid = self.registry.get("sw_uart").pgid
+        self.reap_at_end(pgid)                                           # 断言失败也不把残留子进程留在 VM 上
+        self.assertEqual(pgid, client.pane_process_info(sw["pane_id"])["foreground_process_group_id"])
+        rc, _, err = self.a2a("agent", "stop", "sw", "uart", ok=False)
+        self.assertEqual(rc, 6, err)
+        self.assertIn("没有完全退出", err)
+        self.assertTrue(self.wait_gone("sw_uart"))                       # agent 本身确实退出了
+        self.assertEqual(self.registry.get("sw_uart").lifecycle, "running")
+        # 实测:组长退出后 shell 收回终端,pane 看起来只剩 shell;残留的子进程成了后台进程,只能按进程组查到
+        info = client.pane_process_info(sw["pane_id"])
+        self.assertEqual(info["foreground_process_group_id"], info["shell_pid"])
+        members = ProcSignaler().group_members(pgid)
+        self.assertTrue(members)
+        names = {Path(f"/proc/{p}/cmdline").read_bytes().split(b"\0")[0].decode() for p in members}
+        self.assertTrue(names <= {"bash", "sleep", "/bin/bash", "/usr/bin/sleep"}, names)
+        rc, _, err = self.a2a("agent", "stop", "sw", "uart", ok=False)   # agent 已不在:按登记的进程组核对
+        self.assertEqual(rc, 6, err)
+        os.killpg(pgid, signal.SIGKILL)                                  # 人工处理:结束残留子进程
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and ProcSignaler().group_members(pgid):
+            time.sleep(0.2)
+        self.a2a("agent", "stop", "sw", "uart")                          # 现在可以登记 stopped
+        self.assertEqual(self.registry.get("sw_uart").lifecycle, "stopped")
+
+    # ---- 19 号方案 §A 复核:启动失败或被 Ctrl-C 中断时不留下 a2a 管不了的 agent(修复前在此复现过)
+    def switchable_launcher(self, role):
+        """启动脚本按 <状态目录>/fake_mode 选择假 agent 的模式(默认 work)。
+        修复失效时被测代码会留下未登记的 pane 和进程:测试结束时自己清理,不影响后面的测试。"""
+        before = self.panes()
+
+        def close_leaked_panes():
+            for pane_id in self.panes() - before:
+                try:
+                    client.pane_close(pane_id)
+                except Exception:
+                    pass
+        self.addCleanup(close_leaked_panes)
+        launcher = Path(self.store.current().roles[role].launcher)
+        launcher.write_text(f"#!/bin/bash\nexport FAKE_ROLE={role}\n"
+                            f'exec {sys.executable} {FAKE} "{self.state}/$A2A_ROLE""_""$A2A_IP"".log" '
+                            f'"$(cat {self.state}/fake_mode 2>/dev/null || echo work)"\n')
+        return self.state / "fake_mode"
+
+    def started_pid(self, agent_id, timeout=30):
+        pid_file = self.state / f"{agent_id}.log.pid"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not pid_file.exists():
+            time.sleep(0.2)
+        pid = int(pid_file.read_text())
+        self.addCleanup(self.kill_if_alive, pid)
+        return pid
+
+    @staticmethod
+    def kill_if_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def wait_dead(pid, timeout=15):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if Path(f"/proc/{pid}/stat").read_text().split(") ")[1][0] == "Z":
+                    return True
+            except FileNotFoundError:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def interrupt(self, agent_id, *argv):
+        """运行 a2a 命令,等 agent 启动并上报 working(命令在等就绪)后发 SIGINT,等同终端里按 Ctrl-C。"""
+        (self.state / f"{agent_id}.log.pid").unlink(missing_ok=True)
+        # 独立进程组:清理时连同它启动的 herdr 子进程(agent wait)一起结束
+        proc = subprocess.Popen([sys.executable, "-m", "a2a.cli", *argv, "--session", SESSION], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+        def stop_cli():   # 等 pid 超时或断言失败时,命令可能还在等就绪:结束整个进程组并回收,关闭管道
+            if proc.returncode is None:      # 正常流程已在下面 communicate 过
+                os.killpg(proc.pid, signal.SIGKILL)   # 尚未回收,pid(= 组号)不会被复用
+                proc.communicate(timeout=30)
+        self.addCleanup(stop_cli)
+        pid = self.started_pid(agent_id)
+        time.sleep(2.5)
+        self.assertIsNone(proc.poll(), "命令应当还在等 agent 就绪")
+        proc.send_signal(signal.SIGINT)
+        _, err = proc.communicate(timeout=60)
+        self.assertNotEqual(proc.returncode, 0, err)
+        return pid
+
+    def panes(self):
+        return {p["pane_id"] for p in client.pane_list()}
+
+    def test_restore_that_never_becomes_ready_closes_the_original_pane(self):
+        mode = self.switchable_launcher("dv")
+        _, dv, _ = self.a2a("agent", "spawn", "dv", "uart")
+        self.a2a("agent", "stop", "dv", "uart")
+        mode.write_text("stuck")
+        (self.state / "dv_uart.log.pid").unlink()
+        life = Lifecycle(client=client, topology=self.store, registry=self.registry, audit=self.audit,
+                         state_dir=self.state, ready_timeout_s=3)
+        with self.assertRaisesRegex(LifecycleError, "可投递"):
+            life.restore("dv", "uart")
+        # 修复前:pi 仍在原 pane 里运行,记录却是 failed,stop 拒绝处理
+        self.assertTrue(self.wait_dead(self.started_pid("dv_uart")))
+        self.assertNotIn(dv["pane_id"], self.panes())
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "failed")
+        mode.write_text("work")
+        _, restored, _ = self.a2a("agent", "restore", "dv", "uart")       # pane 已不在:新建
+        self.assertNotEqual(restored["pane_id"], dv["pane_id"])
+
+    def test_ctrl_c_during_spawn_leaves_no_unregistered_agent(self):
+        self.switchable_launcher("dv").write_text("stuck")
+        before = self.panes()
+        pid = self.interrupt("dv_uart", "agent", "spawn", "dv", "uart")
+        # 修复前:多出一个 pane,pi 仍在运行,注册表里没有它
+        self.assertTrue(self.wait_dead(pid))
+        self.assertEqual(self.panes(), before)
+        self.assertEqual(self.registry.list(), [])
+
+    def test_ctrl_c_during_restore_closes_the_pane_and_marks_failed(self):
+        mode = self.switchable_launcher("dv")
+        _, dv, _ = self.a2a("agent", "spawn", "dv", "uart")
+        self.a2a("agent", "stop", "dv", "uart")
+        mode.write_text("stuck")
+        pid = self.interrupt("dv_uart", "agent", "restore", "dv", "uart")
+        # 修复前:pi 已在原 pane 运行,记录却仍是 stopped
+        self.assertTrue(self.wait_dead(pid))
+        self.assertNotIn(dv["pane_id"], self.panes())
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "failed")
+
+    def reap_at_end(self, pgid):
+        """测试结束时(无论成败)结束进程组 pgid 里现在的进程。按 pid + 启动时间 + argv0 核对身份后再发信号:
+        结束时该组可能早已清空,pgid 或 pid 被别的进程复用。"""
+        sig = ProcSignaler()
+        members = {pid: sig.snapshot(pid) for pid in sig.group_members(pgid)}
+
+        def reap():
+            for pid, snap in members.items():
+                if snap is not None and sig.snapshot(pid) == snap:
+                    self.kill_if_alive(pid)
+        self.addCleanup(reap)
 
     def test_stopped_target_pauses_its_queue_until_restore_and_ruling(self):
         # 回归(08 §7.2):目标被停止后,队列头判 TARGET_MISSING 并暂停;恢复后由操作员裁定重试才继续

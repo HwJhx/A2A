@@ -65,6 +65,8 @@ class AgentRecord:
     updated_at: str
     # agent 的工作目录(18 号方案 Codex 审核):pane 丢失后新建 pane 时用;旧记录没有这个字段
     cwd: Optional[str] = None
+    # agent 启动后的前台进程组(19 号方案 §A):agent 已不在时,stop 据此确认它启动的子进程也都退出了
+    pgid: Optional[int] = None
 
     @property
     def identity(self) -> AgentIdentity:
@@ -174,6 +176,7 @@ class Registry:
         status: str = "unknown",
         lifecycle: str = "running",
         cwd: Optional[str] = None,
+        pgid: Optional[int] = None,
     ) -> AgentRecord:
         for value, name in (
             (identity.project_id, "project_id"), (identity.ip_id, "ip_id"), (identity.role, "role"),
@@ -196,7 +199,7 @@ class Registry:
             now = _now()
             record = AgentRecord(
                 identity.project_id, identity.ip_id, identity.role, identity.agent_id, session,
-                workspace_id, tab_id, pane_id, name, status, lifecycle, now, now, cwd,
+                workspace_id, tab_id, pane_id, name, status, lifecycle, now, now, cwd, pgid,
             )
             self._assert_unique_runtime(records, record)
             records[identity.agent_id] = record
@@ -215,6 +218,7 @@ class Registry:
         status: Optional[str] = None,
         lifecycle: Optional[str] = None,
         cwd: Optional[str] = None,
+        pgid: Optional[int] = None,
     ) -> AgentRecord:
         """更新运行时地址或状态。业务身份不可改。pane 重建后调用它。"""
         with self._thread_lock, exclusive_lock(self.lock_path):
@@ -226,7 +230,7 @@ class Registry:
             for key, value in (
                 ("session", session), ("workspace_id", workspace_id), ("tab_id", tab_id),
                 ("pane_id", pane_id), ("agent_name", agent_name), ("status", status),
-                ("lifecycle", lifecycle), ("cwd", cwd),
+                ("lifecycle", lifecycle), ("cwd", cwd), ("pgid", pgid),
             ):
                 if value is not None:
                     changes[key] = value

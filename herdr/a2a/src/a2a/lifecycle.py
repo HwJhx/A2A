@@ -14,6 +14,8 @@
 会把队列头判为 TARGET_MISSING 并暂停该目标,等操作员处理;已经不确定的消息保持不确定。
 
 限制:stop 通过 os.killpg 发信号,所以必须和 herdr 在同一台机器上运行(本项目是虚拟机)。
+Linux 上先用 pidfd 锁定并核对组长进程再发信号(19 号方案 §A,见 procsignal.py);stop 只有在
+herdr 看不到 agent 且 pane 明确只剩 shell 时才登记 stopped。
 拓扑里的"节点"是 角色 × IP 的组合,purge 不修改拓扑;要删 IP 请用 `a2a topology remove-ip`。
 """
 from __future__ import annotations
@@ -36,6 +38,7 @@ from .errors import HerdrError, HerdrNotFound, HerdrTimeout
 from .herdr_client import READY_STATUSES, HerdrClient
 from .identity import AgentIdentity, IdentityError, identity_env
 from .launcher import build_launch_command, preflight_launcher
+from .procsignal import ProcInspectError, ProcSignaler
 from .registry import AgentNotRegisteredError, AgentRecord, Registry
 from .topology import TopologyStore
 
@@ -80,6 +83,7 @@ class Lifecycle:
         stop_timeout_s: float = 15.0,
         kill: Callable[[int, int], None] = os.killpg,
         sleep: Callable[[float], None] = time.sleep,
+        signaler: Optional[ProcSignaler] = None,
     ) -> None:
         if not client.session:
             raise ValueError("生命周期操作必须指定 herdr 会话")
@@ -89,6 +93,8 @@ class Lifecycle:
         self.lock_dir = self.state_dir / "lifecycle"
         self.detect_timeout_s, self.ready_timeout_s, self.stop_timeout_s = detect_timeout_s, ready_timeout_s, stop_timeout_s
         self._kill, self._sleep = kill, sleep
+        # 注入了假 kill 的(单元测试)不碰真实进程:默认不用 pidfd
+        self._signaler = signaler or (ProcSignaler() if kill is os.killpg else ProcSignaler.disabled())
 
     # ---- 公共操作 --------------------------------------------------------
     def spawn(self, role: str, ip: str, *, cwd: Optional[str] = None) -> AgentRecord:
@@ -109,13 +115,14 @@ class Lifecycle:
             cwd = os.path.abspath(os.path.expanduser(cwd or "~"))
             created = self._new_pane(identity, cwd)
             try:
-                agent_name = self._launch(created["pane_id"], identity, launcher)
-            except Exception:
+                agent_name, pgid = self._launch(created["pane_id"], identity, launcher)
+            except BaseException:   # 含 Ctrl-C:不留下未登记的 agent
                 self._close_quietly(created["pane_id"])
                 raise
             record = self.registry.register(identity, session=self.session, workspace_id=created["workspace_id"],
                                             tab_id=created["tab_id"], pane_id=created["pane_id"],
-                                            agent_name=agent_name, status="idle", lifecycle="running", cwd=cwd)
+                                            agent_name=agent_name, status="idle", lifecycle="running", cwd=cwd,
+                                            pgid=pgid)
             self._audit("AGENT_SPAWNED", record, f"在 {record.pane_id} 启动")
             return record
 
@@ -127,6 +134,11 @@ class Lifecycle:
                 raise LifecycleError(f"{agent_id} 的 lifecycle 是 {record.lifecycle},不是 running")
             if self._agent_on(record) is not None:
                 self._terminate(record)
+            elif not self._fully_stopped(record, record.pgid):
+                # herdr 看不到 agent 不等于进程组都退出了(19 号方案 §A)
+                raise LifecycleError(f"{agent_id} 的 agent 已不在,但 pane {record.pane_id} 前台不是只剩 shell,"
+                                     f"或它原来的进程组 {record.pgid} 仍有进程(可能是 agent 启动的子进程还在);"
+                                     f"记录保持 running,请人工确认")
             updated = self.registry.update_runtime(agent_id, lifecycle="stopped", status="unknown")
             self._audit("AGENT_STOPPED", updated, "agent 进程已停止,pane 与注册信息保留")
             return updated
@@ -179,16 +191,32 @@ class Lifecycle:
                 cwd = os.path.abspath(os.path.expanduser(cwd)) if cwd is not None else record.cwd
                 where = self._new_pane(identity, cwd)
             try:
-                agent_name = self._launch(where["pane_id"], identity, launcher)
-            except Exception:
-                if not pane_alive:
+                agent_name, pgid = self._launch(where["pane_id"], identity, launcher)
+            except BaseException as exc:   # 含 Ctrl-C(KeyboardInterrupt):同样要清理
+                # 原 pane 也要关:启动命令发出后 agent 可能已在运行(未就绪、改名后取不到进程组等),
+                # 留着它就会有一个记录不是 running、stop 也管不了的进程。关掉 pane 后记录为 failed,
+                # 之后 restore 会新建 pane。先关 pane 再写记录,两步各自尝试,一步失败不跳过另一步
+                close_error = record_error = None
+                try:
                     self._close_quietly(where["pane_id"])
-                self.registry.update_runtime(identity.agent_id, lifecycle="failed")
-                raise
+                except Exception as close_exc:
+                    close_error = close_exc
+                try:
+                    self.registry.update_runtime(identity.agent_id, lifecycle="failed")
+                except Exception as record_exc:
+                    record_error = record_exc
+                if close_error is None and record_error is None:
+                    raise
+                pane = (f"关闭 pane {where['pane_id']} 失败({close_error}),agent 可能仍在运行"
+                        if close_error else f"pane {where['pane_id']} 已关闭")
+                state = (f"注册表未能标为 failed({record_error}),记录仍是 {record.lifecycle}"
+                         if record_error else "注册表已标为 failed")
+                raise LifecycleError(f"{identity.agent_id} 启动失败({exc});{pane};{state};"
+                                     f"请人工确认后执行 a2a agent close") from exc
             updated = self.registry.update_runtime(identity.agent_id, workspace_id=where["workspace_id"],
                                                    tab_id=where["tab_id"], pane_id=where["pane_id"],
                                                    agent_name=agent_name, status="idle", lifecycle="running",
-                                                   cwd=None if pane_alive else cwd)
+                                                   cwd=None if pane_alive else cwd, pgid=pgid)
             self._audit("AGENT_RESTORED", updated, "原 pane 重启" if pane_alive else f"新建 pane {updated.pane_id}")
             return updated
 
@@ -268,7 +296,7 @@ class Lifecycle:
             raise LifecycleError(f"启动脚本 {launcher} 预检不通过:{'; '.join(problems)}")
         return identity, launcher
 
-    def _launch(self, pane_id: str, identity: AgentIdentity, launcher: str) -> str:
+    def _launch(self, pane_id: str, identity: AgentIdentity, launcher: str) -> "tuple[str, Optional[int]]":
         self.client.pane_rename(pane_id, identity.agent_id)  # 显示名,不影响寻址
         launch_args = self.topology.current().roles[identity.role].launch_args
         # 身份与插件所需的变量直接写在启动命令前面,不依赖 pane 的环境:herdr 会话重启后,持久化 pane 里
@@ -282,7 +310,12 @@ class Lifecycle:
             raise LifecycleError(f"{identity.agent_id} 启动后 {self.ready_timeout_s:g} 秒内没有进入可投递状态") from exc
         # 改名是启动流程的最后一步:识别之前不能改名;每次重启都要重新改名(04 §2.1.1)
         self.client.agent_rename(pane_id, identity.agent_id)
-        return identity.agent_id
+        info = self.client.pane_process_info(pane_id)
+        pgid = info.get("foreground_process_group_id")
+        if not isinstance(pgid, int) or pgid <= 1 or pgid == info.get("shell_pid"):
+            # 拿不到进程组就无法在 stop 时确认它启动的子进程都退出了;不登记成功,也不留下旧的进程组号
+            raise LifecycleError(f"{identity.agent_id} 启动后取不到前台进程组(pgid={pgid}),不登记为运行中")
+        return identity.agent_id, pgid
 
     def _terminate(self, record: AgentRecord) -> None:
         """SIGTERM agent 的前台进程组,等它从 herdr 里消失。不碰 pane 的 shell。"""
@@ -302,13 +335,70 @@ class Lifecycle:
             raise LifecycleError(f"{record.agent_id} 的前台进程组不明确(pgid={pgid}, shell={shell_pid}),拒绝发信号")
         if "pi" not in argv0:
             raise LifecycleError(f"{record.pane_id} 的前台进程 {argv0} 不是 agent,拒绝发信号")
-        self._kill(pgid, signal.SIGTERM)
+        leader = next((p for p in info.get("foreground_processes", []) if p.get("pid") == pgid), None)
+        if leader is None or (leader.get("argv") or [""])[0] != "pi":
+            raise LifecycleError(f"{record.agent_id} 的前台进程组 {pgid} 的组长不是 pi 或不在前台进程列表里,拒绝发信号")
+        if self._signaler.supported:
+            try:
+                self._signal_verified(record, pgid)
+            except ProcInspectError as exc:
+                raise LifecycleError(f"{record.agent_id} 无法核对组长进程:{exc};拒绝发信号") from exc
+        else:
+            self._kill(pgid, signal.SIGTERM)
         deadline = time.monotonic() + self.stop_timeout_s
         while time.monotonic() < deadline:
-            if self._agent_on(record) is None:
+            if self._fully_stopped(record, pgid):
                 return
             self._sleep(0.3)
-        raise LifecycleError(f"{record.agent_id} 在 {self.stop_timeout_s:g} 秒内没有退出(已发送 SIGTERM)")
+        try:
+            left = self._signaler.group_members(pgid) if self._signaler.supported else []
+        except ProcInspectError:
+            left = "无法检查"
+        raise LifecycleError(f"{record.agent_id} 在 {self.stop_timeout_s:g} 秒内没有完全退出:herdr 仍能看到 agent,"
+                             f"或 pane {record.pane_id} 前台不是只剩 shell,或进程组 {pgid} 仍有进程 {left}"
+                             f"(例如 agent 启动的子进程);记录保持 running,请人工确认")
+
+    def _signal_verified(self, record: AgentRecord, pgid: int) -> None:
+        """Linux:用 pidfd 锁定组长这个进程,核对身份后发信号(19 号方案 §A)。"""
+        before = self._signaler.snapshot(pgid)
+        if before is None:
+            return   # 组长已退出:不再按 pgid 发信号,交给后面的"完全退出"核验
+        if before.pgid != pgid or before.argv0 != "pi":
+            raise LifecycleError(f"{record.agent_id} 的组长 {pgid} 已不是 pi 进程组的组长,拒绝发信号")
+        try:
+            fd = self._signaler.open(pgid)
+        except ProcessLookupError:
+            return
+        try:
+            if self._signaler.snapshot(pgid) != before:   # pidfd 指向的必须就是快照的那个进程
+                raise LifecycleError(f"{record.agent_id} 的组长 {pgid} 在核对期间被替换,拒绝发信号")
+            try:
+                self._signaler.send(fd, signal.SIGTERM)
+            except ProcessLookupError:
+                return   # 组长已退出:不能再 killpg(pgid 可能已被复用)
+            self._kill(pgid, signal.SIGTERM)   # 覆盖组内其他进程(pi 启动的工具子进程)
+        finally:
+            self._signaler.close(fd)
+
+    def _fully_stopped(self, record: AgentRecord, pgid: Optional[int]) -> bool:
+        """herdr 看不到 agent,pane 明确只剩 shell(pane 已不在也算),且(Linux)原进程组里已没有进程:
+        组长退出后子进程会变成 pane 前台看不见的后台进程(实测)。无法核对进程组时抛 LifecycleError(fail-closed)。"""
+        if self._agent_on(record) is not None:
+            return False
+        try:
+            if pane_shell_only(self.client.pane_process_info(record.pane_id)) is not True:
+                return False
+        except HerdrNotFound:
+            pass
+        if not self._signaler.supported:
+            return True   # 没有 /proc 与 pidfd(macOS):只能核对 pane
+        if pgid is None:
+            raise LifecycleError(f"{record.agent_id} 是旧记录,没有登记进程组,无法确认它启动的子进程都已退出,"
+                                 f"不登记 stopped;请人工确认后用 a2a agent close(关闭 pane)或 restore(重新启动)处理")
+        try:
+            return not self._signaler.group_members(pgid)
+        except ProcInspectError as exc:
+            raise LifecycleError(f"{record.agent_id} 无法核对进程组 {pgid}:{exc};不登记 stopped") from exc
 
     # ---- 查询与工具 ------------------------------------------------------
     def _agent_on(self, record: AgentRecord) -> Optional[Dict[str, Any]]:

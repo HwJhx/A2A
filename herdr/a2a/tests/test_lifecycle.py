@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Dict, List
 
 from a2a.audit import AuditLog
-from a2a.errors import HerdrNotFound, HerdrTimeout
+from a2a.errors import HerdrError, HerdrNotFound, HerdrTimeout
 from a2a.herdr_client import Created
 from a2a.lifecycle import Lifecycle, LifecycleError
+from a2a.procsignal import ProcInspectError, ProcSnapshot
 from a2a.registry import AgentNotRegisteredError, Registry
 from a2a.topology import TopologyError, TopologyStore
 
@@ -90,6 +91,7 @@ class FakeHerdr:
             raise HerdrNotFound("x", code="pane_not_found")
         del self.panes[pane_id]
         self.agents.pop(pane_id, None)
+        self.process.pop(pane_id, None)
 
     def pane_process_info(self, pane_id):
         if pane_id not in self.panes:
@@ -278,6 +280,271 @@ class Spawn(Base):
         self.life.spawn("dv", "uart")
         with self.assertRaisesRegex(LifecycleError, "已登记"):
             self.life.spawn("dv", "uart")
+
+
+class FakeSignaler:
+    """假的 pidfd 信号器:snapshots 是依次返回的快照(None 表示进程不在),可让 open / send 抛 ESRCH。"""
+    supported = True
+
+    def __init__(self, test, snapshots, *, open_gone=False, send_gone=False, on_gone=None):
+        self.test, self.snapshots = test, list(snapshots)
+        self.open_gone, self.send_gone, self.on_gone = open_gone, send_gone, on_gone
+        self.calls = []
+        self.members = {}   # pgid -> 仍活着的进程
+
+    def group_members(self, pgid):
+        if self.members.get(pgid) == "error":
+            raise ProcInspectError("权限不足")
+        return list(self.members.get(pgid, []))
+
+    def snapshot(self, pid):
+        self.calls.append(("snapshot", pid))
+        snap = self.snapshots.pop(0)
+        if snap is None and self.on_gone:
+            self.on_gone()
+        return snap
+
+    def open(self, pid):
+        self.calls.append(("open", pid))
+        if self.open_gone:
+            self.on_gone and self.on_gone()
+            raise ProcessLookupError(pid)
+        return 99
+
+    def send(self, fd, sig):
+        self.calls.append(("send", fd, sig))
+        if self.send_gone:
+            self.on_gone and self.on_gone()
+            raise ProcessLookupError(fd)
+        self.test.killed.append(("pidfd", sig))
+
+    def close(self, fd):
+        self.calls.append(("close", fd))
+
+
+class StopVerified(Base):
+    """19 号方案 §A:pidfd 锁定组长后发信号;只有 herdr 看不到 agent 且 pane 只剩 shell 才算停止。"""
+    PI = ProcSnapshot(start_time=777, pgid=4242, argv0="pi")
+
+    def setUp(self):
+        super().setUp()
+        self.life.stop_timeout_s = 0.05
+
+    def use(self, *snapshots, **kw):
+        self.sig = FakeSignaler(self, snapshots, **kw)
+        self.life._signaler = self.sig
+        return self.life.spawn("dv", "uart")
+
+    def leader_exits_child_stays(self, record):
+        """组长退出,但它启动的子进程(同一进程组)还在前台。"""
+        self.herdr.agents.pop(record.pane_id, None)
+        self.herdr.process[record.pane_id] = {"foreground_process_group_id": 4242, "shell_pid": 4000,
+                                              "foreground_processes": [{"argv": ["sleep"], "pid": 4300}]}
+
+    def test_signals_the_leader_through_pidfd_then_the_group(self):
+        self.use(self.PI, self.PI)
+        self.assertEqual(self.life.stop("dv", "uart").lifecycle, "stopped")
+        self.assertEqual(self.killed, [("pidfd", signal.SIGTERM), (4242, signal.SIGTERM)])
+        self.assertEqual([c[0] for c in self.sig.calls], ["snapshot", "open", "snapshot", "send", "close"])
+
+    def test_refuses_when_the_leader_was_replaced_while_checking(self):
+        self.use(self.PI, ProcSnapshot(start_time=888, pgid=4242, argv0="pi"))
+        with self.assertRaisesRegex(LifecycleError, "被替换"):
+            self.life.stop("dv", "uart")
+        self.assertEqual(self.killed, [])
+        self.assertIn(("close", 99), self.sig.calls)
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "running")
+
+    def test_refuses_when_the_snapshot_is_not_a_pi_group_leader(self):
+        for snap in (ProcSnapshot(777, 4242, "vim"), ProcSnapshot(777, 5000, "pi")):
+            with self.subTest(snap=snap):
+                self.setUp()
+                self.use(snap)
+                with self.assertRaises(LifecycleError):
+                    self.life.stop("dv", "uart")
+                self.assertEqual(self.killed, [])
+
+    def test_refuses_when_the_leader_is_not_in_the_foreground_list(self):
+        record = self.use()
+        self.herdr.process[record.pane_id]["foreground_processes"] = [{"argv": ["pi"], "pid": 4300}]
+        with self.assertRaisesRegex(LifecycleError, "组长"):
+            self.life.stop("dv", "uart")
+        self.assertEqual(self.killed, [])
+
+    def test_leader_gone_before_pidfd_send_never_calls_killpg(self):
+        for kw, snaps in (({"open_gone": True}, (self.PI,)), ({"send_gone": True}, (self.PI, self.PI)), ({}, (None,))):
+            with self.subTest(kw=kw, snaps=snaps):
+                self.setUp()
+                pane = {}
+                # 组长在 stop 过程中(核对之后)退出,它启动的子进程还在
+                record = self.use(*snaps, on_gone=lambda: self.leader_exits_child_stays(pane["r"]), **kw)
+                pane["r"] = record
+                with self.assertRaisesRegex(LifecycleError, "没有完全退出"):
+                    self.life.stop("dv", "uart")
+                self.assertNotIn((4242, signal.SIGTERM), self.killed)   # 没有按旧 pgid 发组信号
+                self.assertEqual(self.registry.get("dv_uart").lifecycle, "running")
+                # agent 已不在、子进程仍在时再 stop:仍拒绝
+                with self.assertRaisesRegex(LifecycleError, "不是只剩 shell"):
+                    self.life.stop("dv", "uart")
+                self.herdr.process[record.pane_id] = None              # 子进程也退出了 → 可以登记 stopped
+                self.assertEqual(self.life.stop("dv", "uart").lifecycle, "stopped")
+
+    def test_leader_gone_and_pane_back_to_shell_counts_as_stopped(self):
+        holder = {}
+
+        def exit_cleanly():
+            self.herdr.agents.pop(holder["r"].pane_id, None)
+            self.herdr.process[holder["r"].pane_id] = None
+        holder["r"] = self.use(self.PI, open_gone=True, on_gone=exit_cleanly)
+        self.assertEqual(self.life.stop("dv", "uart").lifecycle, "stopped")
+        self.assertNotIn((4242, signal.SIGTERM), self.killed)
+
+    def test_orphaned_child_in_the_group_is_not_stopped_even_if_the_pane_looks_clean(self):
+        # 实测:组长退出后 shell 收回终端,残留子进程成了后台进程,pane 看起来只剩 shell
+        self.use(self.PI, self.PI)
+        self.sig.members[4242] = [4300]
+        with self.assertRaisesRegex(LifecycleError, r"进程组 4242 仍有进程 \[4300\]"):
+            self.life.stop("dv", "uart")
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "running")
+        # agent 已不在时再 stop:按注册表里登记的进程组核对,仍拒绝
+        self.assertEqual(self.registry.get("dv_uart").pgid, 4242)
+        with self.assertRaisesRegex(LifecycleError, "不是只剩 shell"):
+            self.life.stop("dv", "uart")
+        self.sig.members[4242] = []                                   # 人工结束残留进程后
+        self.assertEqual(self.life.stop("dv", "uart").lifecycle, "stopped")
+
+    def test_legacy_record_without_pgid_is_not_stopped_when_the_agent_is_already_gone(self):
+        # Codex 审核阻断:旧记录没有进程组,agent 已不在时无法确认子进程都退出了 → 不登记 stopped
+        record = self.use()
+        data = json.loads(self.registry.path.read_text())
+        del data["agents"]["dv_uart"]["pgid"]
+        self.registry.path.write_text(json.dumps(data))
+        self.herdr.agents.pop(record.pane_id, None)
+        self.herdr.process[record.pane_id] = None                    # pane 看起来只剩 shell
+        with self.assertRaisesRegex(LifecycleError, "旧记录"):
+            self.life.stop("dv", "uart")
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "running")
+        self.assertEqual(self.life.restore("dv", "uart").pgid, 4242)   # restore 后补上进程组
+
+    def test_cannot_inspect_the_process_group_fails_closed(self):
+        self.use(self.PI, self.PI)
+        self.sig.members[4242] = "error"
+        with self.assertRaisesRegex(LifecycleError, "无法核对进程组"):
+            self.life.stop("dv", "uart")
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "running")
+
+    def test_cannot_inspect_the_leader_refuses_to_signal(self):
+        self.use()
+        self.sig.snapshot = lambda pid: (_ for _ in ()).throw(ProcInspectError("权限不足"))
+        with self.assertRaisesRegex(LifecycleError, "无法核对组长"):
+            self.life.stop("dv", "uart")
+        self.assertEqual(self.killed, [])
+
+    def test_spawn_or_restore_without_a_process_group_does_not_succeed(self):
+        record = self.life.spawn("dv", "uart")
+        self.life.stop("dv", "uart")
+        original = self.herdr.pane_run
+
+        def run_without_group(pane_id, command):
+            original(pane_id, command)
+            self.herdr.process[pane_id] = {"foreground_process_group_id": 4000, "shell_pid": 4000,
+                                           "foreground_processes": [{"argv": ["pi"], "pid": 4000}]}
+        self.herdr.pane_run = run_without_group
+        with self.assertRaisesRegex(LifecycleError, "取不到前台进程组"):
+            self.life.restore("dv", "uart")
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "failed")   # 不保留旧的进程组作数
+        # Codex 复核:agent 已在原 pane 启动并改名,失败时不能留下一个记录不是 running 的运行进程
+        self.assertNotIn(record.pane_id, self.herdr.panes)
+        self.assertNotIn(record.pane_id, self.herdr.agents)
+        with self.assertRaisesRegex(LifecycleError, "取不到前台进程组"):
+            self.life.spawn("dv", "gpio")
+        with self.assertRaises(AgentNotRegisteredError):
+            self.registry.get("dv_gpio")
+        self.assertEqual(record.pgid, 4242)
+
+    def test_failed_restore_in_the_original_pane_leaves_no_unmanaged_agent(self):
+        record = self.life.spawn("dv", "uart")
+        self.life.stop("dv", "uart")
+
+        def never_ready(target, *, until=None, timeout_ms=None):
+            raise HerdrTimeout("没就绪", code="timeout")
+        self.herdr.agent_wait = never_ready                       # pi 已启动,但没进入可投递状态
+        with self.assertRaisesRegex(LifecycleError, "可投递"):
+            self.life.restore("dv", "uart")
+        self.assertNotIn(record.pane_id, self.herdr.panes)        # 连同已启动的 agent 一起关掉
+        self.assertNotIn(record.pane_id, self.herdr.agents)
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "failed")
+        del self.herdr.agent_wait
+        restored = self.life.restore("dv", "uart")                # 之后 restore 新建 pane(用登记的工作目录)
+        self.assertNotEqual(restored.pane_id, record.pane_id)
+        self.assertEqual(self.herdr.panes[restored.pane_id]["cwd"], record.cwd)
+
+    def test_failed_restore_whose_pane_cannot_be_closed_says_the_agent_may_still_run(self):
+        self.life.spawn("dv", "uart")
+        self.life.stop("dv", "uart")
+        self.herdr.agent_rename = lambda target, name: (_ for _ in ()).throw(HerdrError("改名失败"))
+        self.herdr.pane_close = lambda pane_id: (_ for _ in ()).throw(HerdrError("关不掉"))
+        with self.assertRaisesRegex(LifecycleError, "可能仍在运行.*注册表已标为 failed.*a2a agent close"):
+            self.life.restore("dv", "uart")
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "failed")
+
+    def test_failed_restore_still_closes_the_pane_when_the_registry_write_fails(self):
+        # Codex 复核:注册表写失败不能跳过关 pane
+        record = self.life.spawn("dv", "uart")
+        self.life.stop("dv", "uart")
+        self.herdr.agent_rename = lambda target, name: (_ for _ in ()).throw(HerdrError("改名失败"))
+        original = self.registry.update_runtime
+
+        def update_runtime(agent_id, **fields):
+            if fields.get("lifecycle") == "failed":
+                raise OSError("磁盘已满")
+            return original(agent_id, **fields)
+        self.registry.update_runtime = update_runtime
+        with self.assertRaisesRegex(LifecycleError, "已关闭.*未能标为 failed.*磁盘已满.*仍是 stopped"):
+            self.life.restore("dv", "uart")
+        self.assertNotIn(record.pane_id, self.herdr.panes)
+        self.assertNotIn(record.pane_id, self.herdr.agents)
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "stopped")
+        self.registry.update_runtime = original
+        del self.herdr.agent_rename
+        self.assertNotEqual(self.life.restore("dv", "uart").pane_id, record.pane_id)   # pane 已不在:新建
+
+    def test_ctrl_c_during_start_leaves_no_unmanaged_agent(self):
+        # Codex 复核:KeyboardInterrupt 不是 Exception,清理分支不能被它绕过
+        def interrupted(target, *, until=None, timeout_ms=None):
+            raise KeyboardInterrupt
+        self.herdr.agent_wait = interrupted                       # pi 已启动,等就绪时按了 Ctrl-C
+        with self.assertRaises(KeyboardInterrupt):
+            self.life.spawn("dv", "uart")
+        self.assertEqual(self.herdr.panes, {})
+        self.assertEqual(self.herdr.agents, {})
+        with self.assertRaises(AgentNotRegisteredError):
+            self.registry.get("dv_uart")
+        del self.herdr.agent_wait
+        record = self.life.spawn("dv", "uart")
+        self.life.stop("dv", "uart")
+        self.herdr.agent_wait = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.life.restore("dv", "uart")
+        self.assertNotIn(record.pane_id, self.herdr.panes)
+        self.assertNotIn(record.pane_id, self.herdr.agents)
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "failed")
+
+    def test_spawn_and_restore_record_the_agent_process_group(self):
+        self.assertEqual(self.life.spawn("dv", "uart").pgid, 4242)
+        self.life.stop("dv", "uart")
+        self.assertEqual(self.life.restore("dv", "uart").pgid, 4242)
+
+    def test_agent_gone_but_child_still_in_foreground_is_not_stopped(self):
+        # 正常路径(没有 pidfd)也一样:herdr 看不到 agent 不等于进程组都退出了
+        record = self.life.spawn("dv", "uart")
+        self.life._kill = lambda pgid, sig: (self.killed.append((pgid, sig)), self.leader_exits_child_stays(record))
+        with self.assertRaisesRegex(LifecycleError, "没有完全退出"):
+            self.life.stop("dv", "uart")
+        self.assertEqual(self.registry.get("dv_uart").lifecycle, "running")
+        self.herdr.process[record.pane_id] = {"foreground_process_group_id": 4000, "shell_pid": 4000}  # 不完整
+        with self.assertRaises(LifecycleError):
+            self.life._terminate(self.registry.get("dv_uart"))
 
 
 class StopRestoreClosePurge(Base):

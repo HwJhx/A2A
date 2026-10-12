@@ -15,6 +15,8 @@
   * 模式 burst:<边>(阶段 8 压测):每收到一行输入,取其中的数字 k(没有数字时为 1),报告 working,
     (有屏障时先等屏障)串行执行 k 次 `a2a send <边>`,每次成功后在 events 里记单调时钟时间 t 和 msg_id;
     然后报告 idle。按顺序逐行处理。
+  * 模式 stuck(19 号方案 §A):启动 1 秒后报告 working,之后一直不报告 idle(已识别但永远不就绪)。
+  * 每种模式启动时都把自己的 pid 写进 <日志>.pid,供测试检查进程是否还活着。
 """
 import json
 import os
@@ -103,6 +105,10 @@ def burst_worker(edge, inputs):
         report("idle")
 
 
+with open(log + ".pid", "w") as f:
+    f.write(str(os.getpid()))
+if mode == "stuck":
+    threading.Thread(target=lambda: (time.sleep(1.0), report("working")), daemon=True).start()
 inputs = queue.Queue()
 line_buffer = bytearray()
 if mode.startswith("burst:"):
