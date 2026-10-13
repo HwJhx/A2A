@@ -160,3 +160,102 @@ Mac 浏览器 ──HTTP / WebSocket──▶ VM 上的 Node 后端(gui_demo/ser
 ### 第六轮复核(2026-10-13)
 
 阻断无;第五轮确认解决。应修 1 项,已改:两个后端同时启动时陈旧 socket 回收有竞态 → §5 加单实例锁(Linux 抽象命名空间 Unix socket,进程退出内核自动释放),拿到锁才做检查、回收、监听;§7 第 1 步加并发启动测试和 kill -9 后可再启动测试。
+
+## 10. 实施记录
+
+### 第 0 步 · 环境(2026-10-13)
+
+- 依赖(版本锁定在 `gui_demo/package.json`):`ws 8.18.0`、`node-pty 1.0.0`;开发依赖 `typescript 5.6.3`、`esbuild 0.24.0`、`@xterm/xterm 5.5.0`、`@xterm/addon-fit 0.10.0`、`@types/node 22.7.5`、`@types/ws 8.5.12`。在 VM 的 `~/gui_demo_run/` 用 `npm install` 安装,24 秒,node-pty 在 Node 22.20.0 上编译通过(`build/Release/pty.node`)。npm 不在默认 PATH,运行时用 `~/.local/lib/node-v22.20.0-linux-arm64/bin`。
+- 同步:VM 上没有 rsync,改用 `gui_demo/bin/sync-to-vm.sh`(Mac 上 tar 打包、`orb` 管道到 VM 解包;排除 `node_modules`、构建产物;关掉 macOS 扩展属性)。
+- 最小服务(`server/src/main.ts`,只回一行文字并用 node-pty 跑一次 `echo`)监听 `192.168.139.41:8765`:
+  - Mac 上 `curl http://192.168.139.41:8765/` 和 Chrome 打开都正常,页面显示"服务可达。node-pty ok";
+  - **`ubuntu.orb.local` 在这台 Mac 上不可用**:它被解析成 `198.18.0.81`(代理软件的 fake-ip 网段),请求不通。所以访问地址改用 `http://192.168.139.41:8765`。这个地址是 VM 在 OrbStack 网络里的 DHCP 地址,VM 重启后可能变;后端启动时会打印实际地址;
+  - Mac 的 `127.0.0.1:8765` 不可达,`lsof -iTCP:8765 -sTCP:LISTEN` 在 Mac 上没有任何监听:OrbStack **没有**把这个端口转发到 Mac 的 localhost 或局域网(Mac 局域网地址 192.168.0.187 上没有 8765)。§5 第 1 层成立,不用改监听地址。
+- codex-test 交叉验证第 0 步时发现两处问题,已在第 1 步修正:
+  - 它那边 `sync-to-vm.sh` 卡住("start VM: timed out waiting for VM to start"),而普通 `orb` 命令正常。判断是经标准输入向 `orb` 传 tar 流在非交互环境里挂起 → 改为先在 Mac 的 `/private/tmp` 打包,VM 经 `/mnt/mac` 读文件,读前核对大小;
+  - VM 副本里有 `._*`(macOS AppleDouble)文件,是第一次同步(还没关掉扩展属性时)留下的,之后的同步只解包不删除旧文件 → 打包时排除 `._*`、`.DS_Store`,解包前清空目标目录(保留 `node_modules`)。
+  - 用户同意第 0 步并入第 1 步一起审核、交叉验证;第 0 步的交叉验证中止。
+
+### 第 1 步 · 工程后端、认证、admin.sock(2026-10-13)
+
+代码(`herdr/gui_demo/`):
+
+| 文件 | 内容 |
+| --- | --- |
+| `server/src/config.ts` | 配置;监听地址默认取 VM eth0 的 IPv4(DHCP 变了也跟着变),可用环境变量覆盖(测试用) |
+| `server/src/a2a.ts` | `projectEnv`(唯一的工程环境构造:删继承的 `A2A_*`/`HERDR_*`,设三个变量)、`a2aArgs`(只给 agent / ip / broker run 加 `--session`)、`checkProject`(会话名、拓扑 project_id、拓扑路径三者一致) |
+| `server/py/topology_tool.py` | 用 a2a 的 `TopologyStore` 建拓扑 / 显示 |
+| `server/src/herdr.ts` | 宿主 tmux 起 herdr 会话、停删会话 |
+| `server/src/broker.ts` | 每工程一个 broker 子进程,意外退出 3 秒后重启;后端退出时一起停 |
+| `server/src/projects.ts` | 新建(失败按相反顺序回滚,`GUI_DEMO_FAIL_AT` 仅测试用)、删除、列表、后端重启时恢复;修改操作串行 |
+| `server/src/auth.ts` | 一次性令牌(同步兑换)、会话 cookie(后端只存 SHA-256)、Origin 校验 |
+| `server/src/admin.ts` | 单实例锁(抽象 Unix socket,名字按数据目录**真实路径**取摘要)、admin.sock 陈旧回收 |
+| `server/src/http.ts` | 静态页面与 `/api/login` 免 cookie,其余 401;修改类要 Origin + JSON;WebSocket 握手先查 Origin 与 cookie(终端第 4 步做) |
+| `web/src/main.ts` | 只有登录:读 `#token=`、`replaceState` 去掉、POST 兑换 |
+| `bin/login-url`、`bin/sync-to-vm.sh` | 见 §5;同步脚本见上 |
+
+与方案的差别:
+- 单实例锁名带数据目录真实路径的摘要(方案写的是只按 uid):这样测试可以用各自的临时数据目录并行起后端;同一数据目录换软链接写法也是同一把锁(有测试)。
+- 删除工程时 herdr 会话删不掉就报错并保留工程登记,便于重试。
+
+测试(VM,`npm test`,真实 herdr 0.9.3 与 tmux;测试用 `guidemo_test_` 前缀、127.0.0.1 随机端口、临时数据目录):**21 个全部通过**,约 20 秒;跑完无残留的 herdr 会话、tmux、broker、临时目录。
+- `test/auth.test.mjs`(13 个):免 cookie 范围;错令牌 / 令牌重用 401;无 / 错 Origin 403、非 JSON 415、`/api/login` 无 Origin 403;WebSocket 无 cookie / 错 cookie 401、错 Origin 403;并发 20 个兑换恰好 1 个成功;`login-url` 新地址可用且旧令牌失效、后端不在时报错不输出令牌、正常退出删 admin.sock;已有后端时再启动报错且不删 socket;`kill -9` 后可再启动;有陈旧 socket 时两个后端同时启动恰好一个成功;路径被普通文件占用不删;别的进程在 admin.sock 上监听时不删;软链接指向同一数据目录被锁挡住;权限 0600 / 0700。
+- `test/projects.test.mjs`(8 个):两个工程各自的 herdr 会话、宿主 tmux、broker(核对进程命令行与环境变量)、拓扑互不串;删除后会话 / tmux / 状态目录 / broker 都没了、项目路径保留;后端重启后工程恢复、broker 换新进程;在 topology / herdr / broker / save 四处注入失败都完整回滚;参数校验(相对路径、家目录外、`..`、软链接逃出、空名、超长、重名);工程环境函数与 `queue` 等命令只靠环境变量读到本工程。
+- 变异检查(只改 VM 上编译出的副本,不碰 Mac 源码):兑换不作废令牌、不校验 Origin、去掉单实例锁、活的 admin.sock 也删、不清继承的 `A2A_*`、`queue` 也传 `--session`、失败不回滚,7 个变异**都被测试抓到**。第一次跑时"活的 admin.sock 也删"没被抓到(被单实例锁挡在前面),补了"别的进程在 admin.sock 上监听"的测试后抓到。
+- 第一次全量跑有 1 个失败,是测试本身的问题(`/proc/<pid>/cmdline` 末尾的 `\0` 产生空元素),已改。变异检查里"失败不回滚"会故意留下 herdr 会话,当时留下 3 个,已清理并让变异脚本跑完自己清。
+
+#### Codex 审核第 0 + 1 步代码(2026-10-13)
+
+阻断 2、应修 4、将来考虑 1。逐条处理:
+
+| # | 问题 | 复现 | 修改与验证 |
+| --- | --- | --- | --- |
+| 阻断 1 | `sync-to-vm.sh` 的目标名校验放过 `.`、`./`:VM 上会清空家目录(除 node_modules);目标是软链接时会写进链接目标 | 只跑校验逻辑(没跑删除):`.`、`./`、`foo/.` 都放行 | 目标名必须匹配 `^gui_demo_[A-Za-z0-9_-]+$`;VM 端拒绝软链接,核对真实路径是家目录下的一级目录且不是家目录本身。验证:7 个不安全的名字都退出码 2;软链接目标被拒,链接指向的目录里没写进任何文件 |
+| 阻断 2 | herdr `session list` 失败被当成"会话不存在":删除工程会跳过停会话直接删状态目录;新建回滚时停不掉会话仍继续删状态目录 | 用注入失败的 herdr 包装(`test/fakes/herdr`)在真实 herdr 上复现:回滚那条确实继续删了;删除那条见下方说明 | `herdr.ts` 查询失败一律抛错,停 / 删后再确认会话已不在;删除工程任何一步确认不了就报错并保留工程与状态目录;回滚某步失败即停止,保留状态目录并报告"回滚未完成"。新增测试 3 个 |
+| 应修 1 | `checkPath` 先建目录后核验真实路径:经软链接会先在家目录外建出目录再拒绝 | 复现:`~/…/link/newdir`(link 指向 /tmp 下)在 /tmp 下建出了 newdir | 先找最近的已存在祖先、核验其真实路径,再建目录,建完再核验一次。新增测试 |
+| 应修 2 | tmux 查询失败被当成空列表、`kill-session` 不查结果,删除工程可能留下窗口 tmux | 用 tmux 包装注入失败复现(见下方说明) | 区分"没有 tmux 服务"(空)与其他错误(抛错);关掉后再确认已不在。新增测试 |
+| 应修 3 | 先拉 broker 再绑 HTTP,端口被占时退出不停 broker;后端被 kill -9 后遗留的 broker 占着锁,新 broker 起不来 | 两个都复现:端口被占后留下 broker 进程;kill -9 后重启,新 broker 不在运行 | 改为先绑 HTTP 再恢复工程,启动失败时按相反顺序回收;启动 broker 前先按命令行与 `A2A_STATE_DIR` 找出本工程遗留的 broker 并停掉。新增测试 2 个 |
+| 应修 4 | `queue` 的环境断言太弱 | 是(原断言只看退出码与输出非空) | 在本工程状态目录放带工程 id 的 `dispatch.halted`,断言 `queue` 读到它,另一个工程读到 null |
+| 将来考虑 | 不可信网络下应上 HTTPS / Secure cookie | — | 不做,demo 依赖 VM 内网边界(§5) |
+
+说明:第一次复现时,"`session list` 失败"和"tmux 查询失败"两条测试的失败**不能算复现**——测试包装读控制文件时漏掉了没有换行结尾的最后一行,失败根本没注入。修好包装后,用变异检查确认:把这 5 处修复在 VM 编译副本上改回旧行为(会话列表失败当作不存在、tmux 查询失败当作空、回滚失败后继续、先建目录再核验、不接管遗留 broker),对应测试**全部失败**,说明测试能抓到这些问题。
+
+测试:VM 上 28 个全部通过(新增 `test/failclosed.test.mjs` 7 个),跑完无残留。
+
+#### Codex 复核第 0 + 1 步修改(2026-10-13)
+
+上轮 2 阻断 + 4 应修确认解决,无新阻断。应修 1 项、将来考虑 1 项:
+- 应修:`reapOrphans` 只按命令行与 `A2A_STATE_DIR` 匹配,会把同工程手动启动的 broker 也当孤儿停掉 → 问题成立(要手动指向 GUI 的私有状态目录才会发生,概率低)。改为:GUI 启动 broker 时注入随机身份 `GUI_DEMO_BROKER_ID`,把 pid、进程启动时间(`/proc/<pid>/stat` 第 22 项)、身份写进 `<工程目录>/broker.json`;只回收三者都对得上的遗留进程;有身份不明的匹配进程就不启动 GUI 的 broker、不碰它,并报告"身份不明的 broker"。新增测试"同工程有手动启动的 broker";变异"身份不明也回收""不核对身份标记"都被抓到。
+- 将来考虑:扫描到发信号之间的 PID 复用窗口 → 发信号前再核对一次身份与启动时间,窗口已缩小;没有用 pidfd(Node 没有直接接口)。
+- 测试:VM 上 29 个全部通过,无残留。
+
+#### Codex 第二轮复核(2026-10-13)
+
+阻断无、应修无,第 0 + 1 步审核通过。将来考虑:`broker.json` 直接写入,写到一半被强杀会留下不完整记录(后果只是拒绝自动回收、需人工处理)→ 已改为先写临时文件再改名;崩溃窗口测试没有补。改后 VM 上 29 个测试全部通过。
+
+#### Codex 独立交叉验证第 0 + 1 步(2026-10-13)
+
+- 同步脚本:本轮执行 `sync-to-vm.sh gui_demo_xcheck` 两次,均报 `start VM: timed out waiting for VM to start`;新版 `/mnt/mac` 归档读取路径没有通过脚本完成同步。随后用临时 tar 手动同步到此前不存在的 `~/gui_demo_xcheck`;排除 `node_modules`、`server/dist`、`web/dist` 后,Mac/VM 文件清单及 SHA-256 一致,VM 中没有 `._*`。`sync-to-vm.sh .` 与 `sync-to-vm.sh foo` 均退出码 2,目标校验在 VM 写入前拒绝。手动同步验证了载荷与排除规则,但不能替代同步脚本成功记录。
+- 构建:Ubuntu VM 使用 Node v22.20.0、npm 10.9.3。`npm install`、`npm run build`、`npx tsc -p server` 成功;依赖实际版本与锁定版本一致,`node-pty/build/Release/pty.node` 存在。npm 报告 2 个依赖漏洞(1 moderate、1 high)。
+- 测试:`node --test --test-concurrency=1 test/*.test.mjs` 实际 29/29 通过,0 失败、0 跳过。结束后无 `guidemo_test_`/`guidemo_xc_` 会话或 tmux、无测试 broker、无 `/tmp/gd-*` 和 `~/gd-test-proj-*` 遗留。
+- 网络与登录:后端监听 `192.168.139.41:8765`;Mac 直连主页 200、`/api/projects` 401。Mac loopback 与局域网地址 `192.168.0.187` 不可达,Mac 无 8765 监听。`ubuntu.orb.local` 解析为 `198.18.0.81`,curl 得到空响应。Mac 使用 `login-url` 新 token 首次 POST 得到 204 和 cookie,重复 token 得到 401。后端停止后 `login-url` 返回错误且不泄露 token。
+- 清理:服务停止后 VM 无 8765 监听;临时数据目录及 `~/gui_demo_xcheck` 已删除。未操作非 `guidemo_xc_`/`guidemo_test_` 会话或 tmux。
+- 对照结论:构建、29 项测试、网络隔离和一次性登录结果与本节最新记录一致。新增偏差是新版同步脚本本轮仍遇到 VM 启动超时;这次现象不能证明旧版标准输入 tar 管道问题仍存在。`ubuntu.orb.local` 不可访问与记录一致,本轮具体表现为解析到 fake-IP 后返回空响应。
+
+#### 交叉验证结果对比与跟进(2026-10-13)
+
+| 项目 | 我的记录 | codex-test | 结论 |
+| --- | --- | --- | --- |
+| 构建、依赖版本、node-pty | 通过 | 通过 | 一致 |
+| 测试 | 29 / 29,无残留 | 29 / 29,无残留 | 一致 |
+| 网络隔离(VM 地址可达、Mac 回环与局域网不可达、Mac 无监听) | 如 §10 | 相同 | 一致 |
+| `ubuntu.orb.local` | 解析到 198.18.0.81,不通 | 相同(curl 空响应) | 一致 |
+| 一次性登录、`login-url` | 如 §10 | 相同 | 一致 |
+| 不安全的同步目标被拒 | 退出码 2 | 退出码 2 | 一致 |
+| 同步脚本 | 我这边正常 | 两次超时 "start VM: timed out waiting for VM to start" | **不一致**,见下 |
+| npm audit | 没跑 | 2 项(1 moderate、1 high) | 我漏了,见下 |
+
+跟进:
+- **npm audit**:`ws 8.18.0` 有两项服务端漏洞(未初始化内存泄露、碎片帧耗尽内存),第 4 步后端要收 WebSocket,必须升;`esbuild 0.24.0` 的漏洞在它的开发服务器(`--serve`),本项目只打包不受影响,顺手升。改为 `ws 8.21.3`(2026-08-07 发布)、`esbuild 0.28.2`(2026-08-08 发布),`npm audit` 0 项;测试 29 / 29 通过。另外发现仓库里**没有 `package-lock.json`**,间接依赖其实没锁住 → 已生成并放进 `gui_demo/`,以后安装用 `npm ci`。
+- **同步脚本在 codex-test 那边超时**:旧版(标准输入传 tar)和新版(经 `/mnt/mac` 读归档)都超时,说明我原先"标准输入管道挂起"的判断不对,根因未明。已请 codex-test 用几条最小的 `orb` 命令定位。
+  - 定位结果:5 条最小 `orb` 命令(`sh -lc`、`bash -c`、带位置参数、读 `/mnt/mac/private/tmp`、列 `gui_demo` 目录)在 codex-test 的**沙箱内**批量运行超过 90 秒没有返回;获准**在沙箱外**重跑,每条约 0.1 秒成功。脚本用到的每种调用方式在沙箱外都正常。结论:超时来自 codex-test 的 workspace-write 沙箱对 OrbStack 调用的限制,不是脚本本身的问题(没有拿到沙箱内逐条的报错,所以沙箱里具体卡在哪一步未确认)。处理:脚本不改;codex-test 以后在沙箱外运行同步脚本。

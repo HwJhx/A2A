@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# 测试用包装:控制文件 $GD_FAKE_CTL 里每行是一个参数前缀,命中就模拟失败;否则调用真实的 tmux($GD_REAL_TMUX)。
+if [ -n "${GD_FAKE_CTL:-}" ] && [ -f "$GD_FAKE_CTL" ]; then
+  while IFS= read -r pat || [ -n "$pat" ]; do
+    [ -n "$pat" ] && [[ "$*" == "$pat"* ]] && { echo "injected failure: tmux $*" >&2; exit 1; }
+  done < "$GD_FAKE_CTL"
+fi
+real="${GD_REAL_TMUX:-}"
+if [ -z "$real" ]; then  # 在 tmux 里运行时拿不到测试进程的环境:按 PATH 找,跳过本目录
+  self="$(cd "$(dirname "$0")" && pwd)"
+  real="$(PATH="$(printf %s "$PATH" | tr : '\n' | grep -vx "$self" | paste -sd:)" command -v tmux)"
+fi
+exec "$real" "$@"

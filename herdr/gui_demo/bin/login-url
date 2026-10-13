@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+// 向正在运行的后端要一个新的一次性登录地址(之前未用的令牌随之作废)。后端不在时报错,不打印任何令牌。
+// 用法(在 VM 上):gui_demo/bin/login-url
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+
+const home = path.resolve(process.env.GUI_DEMO_HOME ?? path.join(os.homedir(), ".a2a_gui_demo"));
+const sock = path.join(home, "admin.sock");
+const c = net.connect(sock);
+let out = "";
+c.setEncoding("utf8");
+c.on("connect", () => c.write("login-url\n"));
+c.on("data", (d) => (out += d));
+c.on("end", () => {
+  if (out.startsWith("http")) {
+    process.stdout.write(out);
+  } else {
+    process.stderr.write(`后端返回异常:${out}`);
+    process.exitCode = 1;
+  }
+});
+c.on("error", (e) => {
+  process.stderr.write(`连不上后端(${sock}:${e.code ?? e.message}):后端未运行?启动后端会打印新的登录地址。\n`);
+  process.exitCode = 1;
+});

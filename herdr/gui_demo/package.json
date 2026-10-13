@@ -1,0 +1,25 @@
+{
+  "name": "a2a-gui-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "测试用 Web GUI demo(21 号文档):工程 / 智能体 / herdr attach 终端",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p server && esbuild web/src/main.ts --bundle --format=esm --outfile=web/dist/main.js --loader:.css=css",
+    "start": "node server/dist/main.js",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs"
+  },
+  "dependencies": {
+    "node-pty": "1.0.0",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.7.5",
+    "@types/ws": "8.5.12",
+    "@xterm/addon-fit": "0.10.0",
+    "@xterm/xterm": "5.5.0",
+    "esbuild": "0.28.2",
+    "typescript": "5.6.3"
+  }
+}
