@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { authed, originOk, redeem, sessionCookie } from "./auth.js";
+import { addAgent, agentAction, deleteIp, listAgents } from "./agents.js";
 import { HOME } from "./config.js";
 import { createProject, deleteProject, getProject, listProjects, UserError } from "./projects.js";
 
@@ -93,6 +94,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const m = url.pathname.match(/^\/api\/projects\/(p[0-9a-f]{8})$/);
   if (m && method === "GET") return send(res, 200, getProject(m[1]));
   if (m && method === "DELETE") return send(res, 200, await deleteProject(m[1]));
+
+  const ag = url.pathname.match(/^\/api\/projects\/(p[0-9a-f]{8})\/agents$/);
+  if (ag && method === "GET") return send(res, 200, await listAgents(ag[1]));
+  if (ag && method === "POST") return send(res, 201, await addAgent(ag[1], await readJson(req)));
+  const act = url.pathname.match(/^\/api\/projects\/(p[0-9a-f]{8})\/agents\/([a-z0-9_-]{1,40})\/(stop|restore)$/);
+  if (act && method === "POST") return send(res, 200, await agentAction(act[1], act[2], act[3] as "stop" | "restore"));
+  const ipm = url.pathname.match(/^\/api\/projects\/(p[0-9a-f]{8})\/ips\/([a-z0-9_-]{1,40})$/);
+  if (ipm && method === "DELETE") return send(res, 200, await deleteIp(ipm[1], ipm[2], await readJson(req)));
   return send(res, 404, { error: "没有这个接口" });
 }
 

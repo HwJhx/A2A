@@ -127,6 +127,7 @@ Mac 浏览器 ──HTTP / WebSocket──▶ VM 上的 Node 后端(gui_demo/ser
 - "项目路径"在 demo 里只作 agent 工作目录的父目录;同事的 GUI 里它可能还有别的含义,讨论时再对齐。
 - 20 号文档 §8.5 的"登记已有 pane"命令不做:demo 采用"GUI 调 a2a 创建"的做法。
 - 单独删除一类智能体(同 IP 另一类还在时)暂不支持,见 §4.4。
+- 删除 IP 时,GUI 先核对"该 IP 下的 agent 与界面看到的一致",再调用 `a2a ip remove`,两步之间没有跨进程锁:若有人在这个空当里从外部对 GUI 的状态目录执行 `a2a ip add`,新加的 agent 也会被一起删掉。彻底解决需要 a2a 提供在 IP 锁内按预期集合删除的接口(第 3 步 Codex 审核应修 1;用户决定不改 a2a,记为已知限制)。
 
 ## 9. Codex 审核记录
 
@@ -307,3 +308,61 @@ Mac 浏览器 ──HTTP / WebSocket──▶ VM 上的 Node 后端(gui_demo/ser
 - 跟进 2:codex-test 运行中后端收到一次 SIGTERM,原因未确认。我之前清理开发后端用的 `pkill -f "^node server/dist/main.js"` 会误杀 VM 上**任何** demo 后端(包括 codex-test 的、以后用户验收用的),按时间核对我在它运行期间没有执行过,但这个做法有隐患 → 改为按 pid 文件与进程组只停自己启动的那个。
 - 浏览器占用:codex-test 的 chrome-devtools 浏览器结束后没有退出,占着共享的配置目录,我的浏览器工具起不来;用户手动关掉后恢复。
 - 清理:开发后端已停,临时目录已删;VM 上无 `guidemo_` 会话、tmux、broker,无 demo 后端进程,8765 无监听。
+
+### 第 3 步 · agent 后端(2026-10-13)
+
+代码:`server/src/agents.ts`(新增)、`server/src/http.ts`(接路由)。接口:
+
+| 接口 | 做什么 |
+| --- | --- |
+| `GET /api/projects/<id>/agents` | 角色(dv 验证智能体、sw 软件智能体)、拓扑里的 IP 列表、各 agent(`a2a agent list`:生命周期、pane、herdr 实时状态) |
+| `POST /api/projects/<id>/agents` `{role, ip}` | `a2a ip add <ip> --roles <role> --cwd <项目路径>/{role}_{ip}`;校验种类只能 dv / sw、IP 名规则、`角色_IP` ≤ 32 字、不能重复;herdr 会话不在时 409 |
+| `POST /api/projects/<id>/agents/<agent>/stop`、`…/restore` | `a2a agent stop` / `agent restore` |
+| `DELETE /api/projects/<id>/ips/<ip>` `{expect: [...]}` | 删除该 IP 的全部 agent 并从拓扑删除,只用有排空的 `a2a ip remove --force`(§4.4)。`expect` 是界面上看到的该 IP 下的 agent,和实际不一致就 409,防止删掉界面上没显示的 agent;成功后关掉这些 agent 的窗口 tmux(第 4 步才会建) |
+
+修改操作与工程的新建、删除共用一个串行队列。
+
+验证:
+- 测试(`test/agents.test.mjs`,5 个,用 a2a 集成测试的假 agent:以 pi 的名字运行、herdr 识别为 agent、不调模型):新增 dv_uart、sw_uart 在不同 tab、同一 workspace,工作目录在项目路径下;参数校验(重复 409;种类、IP 名、超 32 字 400;工程不存在 404);stop 后 herdr 里没有该 agent、restore 后回来;`expect` 不全 409 且两个都还在、缺 `expect` 400、一致时两个都删且 IP 从拓扑删除;只有一类时单独删除;删除工程时还在的 agent 一起清掉。全部 35 个测试通过,无残留。
+- 变异检查:不核对 `expect`、不限 32 字、不查重复、删除改用 `agent purge`(不排空)——4 个都被抓到。注意最后一个是因为 IP 没从拓扑删掉才被抓到;"队列里有消息时 `ip remove` 拒绝删除"这条路径 GUI 测试没有覆盖,依赖 a2a 自己的测试。
+- 真实 fnx(开发用后端,经接口操作,不往终端提交任何输入,没有模型调用):新增 dv_uart、sw_uart 后 herdr 识别为 pi、idle,分别在 w2:t1、w2:t2,工作目录正确;stop 后 pane w2:p1 保留、herdr 里找不到 agent;restore 在原 pane 里回来、idle;`expect` 不全被拒;删除 IP 后两个都没了、VM 上没有 pi 进程。之后删除工程、停后端、清理,无残留。
+
+#### Codex 审核第 3 步(2026-10-13)
+
+阻断无。应修 3 项、将来考虑 1 项:
+
+| # | 问题 | 判断 | 处理 |
+| --- | --- | --- | --- |
+| 应修 1 | `expect` 核对与 `ip remove` 之间不共享跨进程锁:外部 CLI 可在两步之间新增 agent,GUI 仍会删掉整个 IP | 真问题,但要有人在毫秒级窗口里对 GUI 的私有状态目录手动执行 `a2a ip add` 才会发生。`ip remove` 自己拿 IP 的文件锁,GUI 不能在外面先拿(会自锁),彻底解决要改 a2a(给 `ip remove` 加"预期 agent 集合"参数,在锁内核对) | **用户决定记为 demo 的已知限制**(2026-10-13),见 §8;讨论时作为"a2a 缺一个原子的按预期删除接口"提出 |
+| 应修 2 | 删除 IP 成功后关窗口 tmux 失败,重试时 agent 已没了,`expect` 对不上 409,残留窗口清不掉 | 真问题 | agent 删掉后关窗口失败不再算删除失败,返回 200 + 提示"部分完成";新增"回收残留窗口":注册表里没有对应 agent 的窗口 tmux 在刷新列表时关掉。回收放在串行队列里异步执行(避免和新增 agent 时建窗口抢,把新窗口当残留关掉),列表接口不等它 |
+| 应修 3 | GUI 层没测"队列不空拒删" | 是 | 新增测试:冻住 broker(SIGSTOP,进程不退出所以不会被重启),以 sw_q 的身份 `a2a send` 一条发给 dv_q 的消息,删除 IP → 500,agent 和窗口都在;恢复 broker、消息投递后再删 → 成功 |
+| 将来考虑 | 全局串行队列让一个工程的长操作(最长 180–240 秒)挡住其他工程 | 是 | demo 不改,多工程并行时可按工程串行 |
+
+验证:`agents.test.mjs` 新增 2 个,共 7 个通过;全部 37 个通过,无残留。变异检查:关窗口失败当删除失败、不回收残留窗口、先关窗口再删,3 个都被抓到。
+
+#### Codex 复核第 3 步修改(2026-10-13)
+
+阻断无、应修无,应修 2、3 确认解决。将来考虑 2 项,都不改:① 外部 CLI 竞态,按用户决定记为已知限制(§8);② 后端退出时不等异步回收,残留窗口留到下次刷新列表再回收,不影响消息与 agent 状态。
+
+#### Codex 独立交叉验证第 3 步(2026-10-13)
+
+- 同步/构建/审计:`sync-to-vm.sh gui_demo_xcheck` 成功;Ubuntu 22.04.5、Node v22.20.0、npm 10.9.3。`npm ci` 成功,`npm run build` 的 server/web TypeScript 检查与 esbuild 均通过;`npm audit` 为 0 vulnerabilities。
+- 自动测试:`node --test --test-concurrency=1 test/*.test.mjs` 共 37/37 通过,0 失败、0 跳过。结束时测试创建的资源已清理。
+- 真实 fnx 接口(不向终端提交输入,未调用模型):临时工程 `pec42fb04` 下经 API 新增 `dv_uart`、`sw_uart`;API 显示均 running/idle,Herdr 均识别为 `pi`,分别在 `w2:t1`/`w2:t2`、`w2:p1`/`w2:p2`,工作目录分别为 `<项目路径>/dv_uart` 与 `<项目路径>/sw_uart`。stop 后 `dv_uart` lifecycle 为 stopped、pane `w2:p1` 保留,Herdr agent list/get 中找不到该 agent;restore 后回到原 pane、running/idle。只提交 `expect:["dv_uart"]` 删除返回 409 且两者仍在;提交完整列表后删除返回 200,API agents 与 ips 均为空,Herdr agent list 为空且 VM 无 `pi` 进程。重复创建返回 409;`role:rtl`、`ip:"Uart"`、超长 IP 分别返回 400。
+- 浏览器:同标签页粘贴登录地址未验证。当前隔离 IAB 不可用,Chrome 浏览器通道报 request-header policy 错误,本机 Chrome UI 权限未授予;没有启动或留下浏览器窗口。
+- 清理:删除临时工程后停止本轮后端并移除临时 `GUI_DEMO_HOME`、`~/gd-xc-proj`、`~/gui_demo_xcheck` 和 Mac cookie 临时文件。VM 无 `guidemo_xc_`/`guidemo_test_` session、tmux、broker 或 `pi` 进程,无 8765 监听或 `/tmp/gd-*`;Mac 无 8765 监听。既有 `a2a_codex_verify` 仍 running,未操作其他 session。
+- 对照结论:构建、37 项测试、agent 创建/状态/工作目录、stop/restore、参数校验、`expect` 防误删和清理结果与本节第 3 步记录一致。浏览器同标签登录项因工具权限未能独立验证,不作通过判断。
+
+#### 交叉验证第 3 步结果对比(2026-10-13)
+
+| 项目 | 我 | codex-test | 结论 |
+| --- | --- | --- | --- |
+| 构建、`npm ci`、audit | 通过、0 项 | 通过、0 项 | 一致 |
+| 测试 | 37 / 37,无残留 | 37 / 37,无残留 | 一致 |
+| 真实 fnx 新增(pi、idle、不同 tab、工作目录) | 符合 | 符合 | 一致 |
+| 停止(pane 保留、agent 查不到)/ 重启(原 pane、idle) | 符合 | 符合 | 一致 |
+| `expect` 不全 409、写全删除、拓扑与 pi 进程清空 | 符合 | 符合 | 一致 |
+| 参数校验(重复 409;种类、大写、超长 400) | 符合 | 符合 | 一致 |
+| 同一标签页粘贴新登录地址 | 我在浏览器里验证通过 | **未验证**(它那边浏览器工具不可用) | 只有我一方验证 |
+
+结论:codex-test 能测的项全部一致。"同一标签页粘贴新登录地址"只有我一方的浏览器验证,没有交叉验证;第 4 步页面二做完后,用户验收时可顺带确认。
