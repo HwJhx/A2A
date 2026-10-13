@@ -19,9 +19,13 @@ export async function herdrSessions(): Promise<Map<string, string>> {
   return rows;
 }
 
+/** 会话的 herdr 服务在不在运行。只有 herdr 明确报 server_not_running 才算"没在运行";
+ *  其他失败(超时、连接或服务出错)抛错,调用方据此不做清理、不重起会话(fail-closed)。 */
 export async function herdrRunning(session: string): Promise<boolean> {
   const r = await run(HERDR, ["--session", session, "workspace", "list"], { timeoutMs: 10_000 });
-  return r.code === 0;
+  if (r.code === 0) return true;
+  if (/"code"\s*:\s*"server_not_running"/.test(r.stdout + r.stderr)) return false;
+  throw new Error(`查询 herdr 会话 ${session} 的状态失败:${(r.stderr || r.stdout).trim()}`);
 }
 
 export async function startHerdr(id: string, session: string): Promise<void> {
@@ -30,7 +34,7 @@ export async function startHerdr(id: string, session: string): Promise<void> {
     HERDR, "session", "attach", session], { timeoutMs: 15_000 });
   if (r.code !== 0) throw new Error(`启动 herdr 宿主 tmux 失败:${r.stderr.trim()}`);
   for (let i = 0; i < 100; i++) {
-    if (await herdrRunning(session)) return;
+    if (await herdrRunning(session).catch(() => false)) return; // 刚启动时查询报错就接着等
     await sleep(300);
   }
   throw new Error(`herdr 会话 ${session} 30 秒内没有起来`);

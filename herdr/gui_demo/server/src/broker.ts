@@ -105,7 +105,7 @@ function signalIfOurs(p: ProjectRef, pid: number, sig: NodeJS.Signals): void {
   try { process.kill(pid, sig); } catch { /* 已退出 */ }
 }
 
-async function reapOrphans(p: ProjectRef): Promise<void> {
+export async function reapOrphans(p: ProjectRef): Promise<void> {
   const stray = strayBrokers(p);
   const unknown = stray.filter((pid) => !isOurOrphan(p, pid));
   if (unknown.length) {

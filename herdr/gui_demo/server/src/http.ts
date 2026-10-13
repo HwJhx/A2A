@@ -8,7 +8,7 @@ import { authed, originOk, redeem, sessionCookie } from "./auth.js";
 import { addAgent, agentAction, deleteIp, listAgents } from "./agents.js";
 import { HOME } from "./config.js";
 import { handleTerminalUpgrade } from "./terminal.js";
-import { createProject, deleteProject, getProject, listProjects, UserError } from "./projects.js";
+import { createProject, deleteProject, getProject, listProjects, recoverProject, UserError } from "./projects.js";
 
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web");
 const STATIC: Record<string, [string, string]> = {
@@ -96,6 +96,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const m = url.pathname.match(/^\/api\/projects\/(p[0-9a-f]{8})$/);
   if (m && method === "GET") return send(res, 200, getProject(m[1]));
   if (m && method === "DELETE") return send(res, 200, await deleteProject(m[1]));
+  const rec = url.pathname.match(/^\/api\/projects\/(p[0-9a-f]{8})\/recover$/);
+  if (rec && method === "POST") return send(res, 200, await recoverProject(rec[1]));
 
   const ag = url.pathname.match(/^\/api\/projects\/(p[0-9a-f]{8})\/agents$/);
   if (ag && method === "GET") return send(res, 200, await listAgents(ag[1]));

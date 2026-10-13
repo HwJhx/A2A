@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# 在 VM 上运行:后台启动后端,打印一次性登录地址。日志与 pid 文件在数据目录(默认 ~/.a2a_gui_demo)。
+# 用法:~/gui_demo_run/bin/start      就绪等待时间:GUI_DEMO_START_TIMEOUT(秒,默认 120;工程多时启动要逐个拉起 broker)
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PATH="$HOME/.local/lib/node-v22.20.0-linux-arm64/bin:$HOME/.local/bin:$PATH"
+source "$ROOT/bin/_pidfile.sh"
+TIMEOUT="${GUI_DEMO_START_TIMEOUT:-120}"
+[[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -ge 1 ]] || { echo "GUI_DEMO_START_TIMEOUT 必须是正整数(秒)" >&2; exit 2; }
+mkdir -p "$DATA" && chmod 700 "$DATA"
+if backend_pid; then
+  echo "后端已在运行(pid $PID)。要新的登录地址:$ROOT/bin/login-url" >&2
+  exit 1
+fi
+[ -f "$PIDF" ] && { echo "发现陈旧的 pid 文件(进程已不在,或 pid 已被别的进程复用),忽略" >&2; rm -f "$PIDF"; }
+[ -f "$ROOT/server/dist/main.js" ] || { echo "还没构建:在 Mac 上运行 gui_demo/bin/deploy-vm.sh" >&2; exit 1; }
+: > "$LOG"
+setsid nohup node "$ROOT/server/dist/main.js" >> "$LOG" 2>&1 < /dev/null &
+pid=$!
+for _ in $(seq 20); do st="$(start_time "$pid")"; [ -n "$st" ] && break; sleep 0.05; done
+echo "$pid $st" > "$PIDF"
+for _ in $(seq $((TIMEOUT * 5))); do
+  if grep -q "登录地址" "$LOG"; then
+    grep -E "数据目录|登录地址|注意" "$LOG"
+    echo "日志:$LOG    停止:$ROOT/bin/stop"
+    exit 0
+  fi
+  [ "$(start_time "$pid")" = "$st" ] || break
+  sleep 0.2
+done
+if [ "$(start_time "$pid")" = "$st" ]; then
+  echo "${TIMEOUT} 秒内没有就绪,结束后台进程…" >&2
+  stop_group "$pid" "$st" || { echo "后台进程 $pid 结束不了,pid 文件保留,请检查" >&2; exit 1; }
+fi
+rm -f "$PIDF"
+echo "启动失败,日志如下:" >&2
+cat "$LOG" >&2
+exit 1

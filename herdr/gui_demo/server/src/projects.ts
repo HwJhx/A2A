@@ -3,9 +3,11 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { a2a, a2aError, checkProject, parseJson, projectDir, pyTool, sessionName, stateDir } from "./a2a.js";
-import { brokerStatus, startBroker, stopBroker } from "./broker.js";
-import { DATA_DIR, FAIL_AT, HOME, LAUNCHERS, PROJECTS_FILE } from "./config.js";
-import { herdrRunning, herdrSessions, killTmux, startHerdr, stopHerdr, tmuxSessions, windowTmuxPrefix } from "./herdr.js";
+import { brokerStatus, reapOrphans, startBroker, stopBroker } from "./broker.js";
+import { DATA_DIR, FAIL_AT, FAIL_ONCE, HOME, LAUNCHERS, PROJECTS_FILE } from "./config.js";
+
+const failedOnce = new Set<string>(); // 仅测试用:GUI_DEMO_FAIL_ONCE 每个步骤只失败一次
+import { herdrRunning, herdrSessions, hostTmux, killTmux, startHerdr, stopHerdr, tmuxSessions, windowTmuxPrefix } from "./herdr.js";
 
 export interface Project {
   id: string;
@@ -210,9 +212,49 @@ export function deleteProject(id: string): Promise<{ warnings: string[] }> {
   });
 }
 
-export async function listProjects(): Promise<Array<Project & { herdr: boolean; broker: ReturnType<typeof brokerStatus> }>> {
+/** VM 或 herdr 重启后恢复:停 broker(含后端被强杀留下的孤儿)→ herdr 会话没在运行就重新起 →
+ *  `a2a agent recover`(要求 broker 已停;对还活着的 agent 不做事,可重复执行)→ 起 broker。
+ *  herdr 会话没在运行、或 broker 没在运行时都可以恢复,所以中途失败后可以再点一次。
+ *  窗口 tmux 里的 attach 循环会自己接上恢复后的 agent。 */
+export function recoverProject(id: string): Promise<{ result: unknown; warnings: string[] }> {
+  return serial(async () => {
+    const project = getProject(id);
+    let herdrUp: boolean;
+    try {
+      herdrUp = await herdrRunning(project.session);
+    } catch (e) {
+      // 查不清会话状态时什么都不动:不关宿主 tmux、不重起会话、不停 broker
+      throw new UserError(`${(e as Error).message};会话状态不明,不做恢复`, 503);
+    }
+    if (herdrUp && brokerStatus(id).running) throw new UserError("herdr 会话与 broker 都在运行,不需要恢复", 409);
+    await checkProject(project);
+    await stopBroker(id);
+    await reapOrphans(project); // 身份不明的 broker 会让这里报错,不自动停
+    if (!herdrUp) {
+      await killTmux(hostTmux(id)); // 旧的宿主 tmux(会话停了它多半已退出)
+      await startHerdr(id, project.session);
+    }
+    if (FAIL_ONCE === "recover" && !failedOnce.has("recover")) {
+      failedOnce.add("recover");
+      throw new UserError("测试注入:agent recover 失败", 500);
+    }
+    const r = await a2a(project, ["agent", "recover"], 300_000);
+    const result = parseJson(r.stdout);
+    const warnings: string[] = [];
+    // 退出码非 0 但有 JSON 结果:部分 agent 没恢复(结果里有原因),仍然起 broker
+    if (r.code !== 0 && result === undefined) throw new UserError(`agent recover 失败:${a2aError(r)}`, 500);
+    if (r.code !== 0) warnings.push("部分 agent 没有恢复,见结果里的原因");
+    await startBroker(project);
+    return { result, warnings };
+  });
+}
+
+/** herdr: true 运行 / false 没在运行 / null 状态查询失败(页面显示"查询失败",恢复会被拒绝)。 */
+export async function listProjects(): Promise<Array<Project & { herdr: boolean | null; broker: ReturnType<typeof brokerStatus> }>> {
   const out = [];
-  for (const p of loadProjects()) out.push({ ...p, herdr: await herdrRunning(p.session), broker: brokerStatus(p.id) });
+  for (const p of loadProjects()) {
+    out.push({ ...p, herdr: await herdrRunning(p.session).catch(() => null), broker: brokerStatus(p.id) });
+  }
   return out;
 }
 

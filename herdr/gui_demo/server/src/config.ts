@@ -55,3 +55,5 @@ export const SHUTDOWN_DELAY_MS = intEnv("GUI_DEMO_SHUTDOWN_DELAY_MS", 0, 0, 60_0
 
 // 仅测试用:让新建工程在指定步骤失败,验证回滚
 export const FAIL_AT = process.env.GUI_DEMO_FAIL_AT ?? "";
+// 仅测试用:指定步骤只失败一次(之后重试会成功),用来测"失败后可以重试"
+export const FAIL_ONCE = process.env.GUI_DEMO_FAIL_ONCE ?? "";

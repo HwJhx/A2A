@@ -34,7 +34,7 @@ async function refresh(grid: HTMLElement): Promise<void> {
 
 function projectCard(p: Project, grid: HTMLElement): HTMLElement {
   const healthy = p.herdr && p.broker?.running;
-  const status = !p.herdr ? "herdr 会话未运行" : !p.broker?.running ? "broker 未运行" : "运行中";
+  const status = p.herdr === null ? "herdr 状态查询失败" : !p.herdr ? "herdr 会话未运行" : !p.broker?.running ? "broker 未运行" : "运行中";
   return h("div", { class: "card", role: "link", tabindex: "0", "data-id": p.id,
     onclick: () => { location.hash = `#/p/${p.id}`; },
     onkeydown: (e: Event) => { if ((e as KeyboardEvent).key === "Enter") location.hash = `#/p/${p.id}`; } },
@@ -44,7 +44,27 @@ function projectCard(p: Project, grid: HTMLElement): HTMLElement {
   h("h2", {}, p.name),
   h("p", { class: "muted" }, p.description || "还没有简介"),
   h("p", { class: "path", title: p.path }, p.path),
-  h("div", { class: "card-foot" }, h("span", { class: healthy ? "dot ok" : "dot bad" }, status), h("span", { class: "enter" }, "进入")));
+  h("div", { class: "card-foot" }, h("span", { class: healthy ? "dot ok" : "dot bad" }, status),
+    p.herdr === null
+      // 状态查不清时恢复会被后端拒绝(不在状态不明时做清理):只给"刷新状态"
+      ? h("button", { class: "icon", type: "button", title: "herdr 状态查询失败,重新查询",
+        onclick: (e: Event) => { e.stopPropagation(); void refresh(grid); } }, "刷新状态")
+      : !healthy
+      ? h("button", { class: "icon", type: "button", title: "重新启动 herdr 会话(没在运行时)、恢复 agent、启动 broker",
+        onclick: (e: Event) => { e.stopPropagation(); void recover(p, grid, e.currentTarget as HTMLButtonElement); } }, "恢复")
+      : h("span", { class: "enter" }, "进入")));
+}
+
+async function recover(p: Project, grid: HTMLElement, btn: HTMLButtonElement): Promise<void> {
+  btn.disabled = true;
+  btn.textContent = "恢复中…";
+  try {
+    const r = await api.recoverProject(p.id);
+    if (r.warnings.length) alert(`${r.warnings.join("\n")}\n\n${JSON.stringify(r.result, null, 2)}`);
+  } catch (e) {
+    alert(`恢复失败:${(e as Error).message}`);
+  }
+  await refresh(grid);
 }
 
 function openCreate(grid: HTMLElement): void {

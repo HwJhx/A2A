@@ -13,7 +13,7 @@ export interface Project {
   session: string;
   createdAt: string;
   description?: string;
-  herdr?: boolean;
+  herdr?: boolean | null;
   broker?: { running: boolean; pid: number | null; restarts: number };
 }
 
@@ -58,6 +58,7 @@ export const api = {
   project: (id: string) => call<Project>("GET", `/api/projects/${id}`),
   createProject: (body: { name: string; path: string; description: string }) => call<Project>("POST", "/api/projects", body),
   deleteProject: (id: string) => call<{ warnings: string[] }>("DELETE", `/api/projects/${id}`),
+  recoverProject: (id: string) => call<{ result: unknown; warnings: string[] }>("POST", `/api/projects/${id}/recover`),
   agents: (id: string) => call<AgentsInfo>("GET", `/api/projects/${id}/agents`),
   addAgent: (id: string, body: { role: Role; ip: string }) => call<AgentRow & { warnings: string[] }>("POST", `/api/projects/${id}/agents`, body),
   stopAgent: (id: string, agentId: string) => call<AgentRow>("POST", `/api/projects/${id}/agents/${agentId}/stop`),

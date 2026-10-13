@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# 在 VM 上运行:停止后端(停 broker、断开终端;herdr 会话与 agent 保留,下次启动后继续可用)。
+# 用法:~/gui_demo_run/bin/stop
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/bin/_pidfile.sh"
+if ! backend_pid; then
+  if [ -f "$PIDF" ]; then
+    echo "pid 文件陈旧(进程已不在,或 pid 已被别的进程复用),不发信号,已删除 pid 文件"
+    rm -f "$PIDF"
+  else
+    echo "后端没在运行"
+  fi
+  exit 0
+fi
+read -r _ st < "$PIDF"
+if stop_group "$PID" "$st"; then
+  rm -f "$PIDF"
+  echo "已停止"
+else
+  echo "后端(pid $PID)没有退出,请检查日志 $LOG" >&2
+  exit 1
+fi

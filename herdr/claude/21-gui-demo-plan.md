@@ -470,3 +470,67 @@ Mac 浏览器 ──HTTP / WebSocket──▶ VM 上的 Node 后端(gui_demo/ser
 | 页面二外观、路由、离开页面后客户端为 0 | 我在浏览器里验证 | **未验证**(它的浏览器工具不可用) | 只有我一方 |
 
 说明:codex-test 的第一个探针在连接刚建立时就发输入,没送到;它判断为"被初始闸门丢弃"。按代码,握手时闸门已按"运行中且识别得到"给了写权限、且该 agent 从未加过栅栏,不应丢弃;更可能是连接刚建立时 `tmux attach` 客户端还在启动,这时写入的按键被 tmux 当作启动阶段的终端应答吞掉。两种原因都只发生在连接后的极短时间,页面上人工操作碰不到;等首屏输出后复测通过。确切原因没有进一步证实。
+
+### 第 5 步 · 恢复、部署脚本、README、整体走查(2026-10-13)
+
+代码:
+- 恢复:`POST /api/projects/<id>/recover`(`projects.ts` 的 `recoverProject`):会话在运行时 409;否则停 broker → 关旧宿主 tmux → 重新起 herdr 会话 → `a2a agent recover`(它要求 broker 已停)→ 起 broker。窗口 tmux 里的 attach 循环自己接上恢复后的 agent。页面一的卡片在"herdr 会话未运行"时显示"恢复"按钮。
+- 脚本:`bin/deploy-vm.sh`(Mac 上:同步到 `~/gui_demo_run`、`npm ci`、构建)、`bin/start`(VM 上:后台启动,pid 与日志在数据目录,打印登录地址;已在运行时拒绝)、`bin/stop`(按 pid 停止,等待退出)。
+- `gui_demo/README.md`:用途、运行环境、部署 / 启动 / 停止 / 登录、数据目录、使用提示、已知限制、测试、代码结构。
+
+验证:
+- 测试:新增 `test/recover.test.mjs`(停掉工程的 herdr 会话 → 列表显示未运行、不能新增 agent → 恢复 → agent 运行且空闲、broker 换了新进程、原来的终端连接没断且能把输入送到新的 agent;会话在运行时恢复返回 409)。全部 55 个通过,无残留。
+- 脚本:临时数据目录、8767 端口下:启动成功并打印地址;再次启动被拒;`login-url` 可用;停止后端口释放;再次停止提示"没在运行"。
+- 正式部署走查(`deploy-vm.sh` → `bin/start`,默认数据目录、8765;自动化浏览器只点界面,真实 fnx,只打字不回车):新建工程 → 进入页面二 → 两类各新增 uart → 在 sw_uart 终端键入文字(herdr 里只在 sw_uart 看到,agent 空闲)→ 退格删掉 → 停止(只读)/ 重启(恢复)→ 命令行停掉工程的 herdr 会话模拟重启 → 页面一卡片显示"herdr 会话未运行 / 恢复",点恢复后"运行中",页面二 dv_uart 运行且空闲、终端正常 → 删除整个 IP → 删除工程。结束后 `projects.json` 为空,无 `guidemo_` 会话、tmux、broker、pi、`tmux attach` 进程;走查用的项目路径已手动删除。验收实例保持运行,等用户验收。
+
+#### Codex 审核第 5 步(2026-10-13)
+
+阻断 1、应修 2:
+
+| # | 问题 | 判断与复现 | 处理与验证 |
+| --- | --- | --- | --- |
+| 阻断 | `bin/stop` 只用 `kill -0` 判断 pid 存活就发 SIGTERM;后端异常退出后 pid 文件残留、pid 被复用时会给无关进程发信号;`bin/start` 也会把无关进程当成后端 | 真问题。变异(改回只用 `kill -0`)下,新测试里的无关进程被杀 | 新增 `bin/_pidfile.sh`:pid 文件记"pid 启动时间",认作后端要求启动时间一致**且**命令行含 `server/dist/main.js`;否则当陈旧文件,不发信号、删掉。测试:陈旧 pid 文件指向仍在运行的 `sleep`(启动时间对得上 / 对不上两种),`stop` 不动它,`start` 照常启动,`sleep` 始终活着 |
+| 应修 1 | 恢复时 `agent recover` 失败(无 JSON):新会话在、broker 没起,页面因 herdr 在运行而隐藏"恢复",没法重试;强杀留下的孤儿 broker 占着锁会让恢复失败 | 真问题。变异:herdr 在运行就拒绝恢复 → 重试测试失败;恢复前不清孤儿 → 孤儿测试失败 | herdr 没在运行**或** broker 没在运行时都可以恢复(页面同样显示按钮);herdr 已在运行就不重起;恢复前先 `reapOrphans`(只停身份对得上的孤儿,身份不明的报错不碰)。测试:注入一次 recover 失败 → 500,列表 herdr 在、broker 不在 → 再点成功;kill -9 留孤儿 broker + 会话停掉 → 新后端上恢复先停掉孤儿再恢复,broker 换新 |
+| 应修 2 | `bin/start` 固定约 20 秒超时后删 pid 文件,但不结束后台进程;工程多时启动可能超过 20 秒,之后无法可靠 stop | 真问题。变异(超时不结束后台进程)下测试失败 | 就绪等待可配置(`GUI_DEMO_START_TIMEOUT`,默认 120 秒);超时先结束进程组(SIGTERM,30 秒后 SIGKILL)并确认退出,再删 pid 文件;结束不了就保留 pid 文件并报错。测试:有工程要拉 broker 时把等待设成 1 秒 → 脚本报"没有就绪",pid 文件、后端进程、broker 都没了 |
+
+另外:测试辅助函数第一次只收了标准输出,而"发现陈旧的 pid 文件"写在标准错误里,导致 1 个测试误报失败,改为两路都收。新增仅测试用的 `GUI_DEMO_FAIL_ONCE`(某步只失败一次)。README 补了 pid 文件格式、就绪超时、broker 没运行时也能恢复。全部 59 个测试通过,无残留。
+
+验收实例重新部署:旧实例的 pid 文件是旧格式(只有 pid),先核对其命令行确是 `gui_demo_run` 的后端再手动 SIGTERM,然后 `deploy-vm.sh` → `bin/start`;新 pid 文件为"pid 启动时间"格式。实例里没有工程。
+
+#### Codex 复核第 5 步修改(2026-10-13)
+
+上轮 1 阻断 + 2 应修确认解决。新增应修 1:`herdrRunning()` 把任何非零退出码都当"会话未运行",查询临时出错时恢复会关掉宿主 tmux、试图重起仍在运行的会话。
+- 判断:真问题。herdr 在服务没在运行时会输出 `{"error":{"code":"server_not_running",…}}`,可以和其他失败区分。变异(改回"非零即未运行")下新测试失败。
+- 修改:`herdrRunning` 只在明确 `server_not_running` 时返回 false,其他失败抛错;恢复遇到查询失败返回 503"会话状态不明,不做恢复",不关宿主 tmux、不重起会话、不停 broker;工程列表里该工程显示"herdr 状态查询失败";删除工程、新增 agent 遇到查询失败直接报错;只有起会话后等待就绪的循环把查询报错当"还没起来"继续等。
+- 测试:用 herdr 包装让 `workspace list` 报错(会话实际在运行)→ 恢复 503,列表 herdr 为 null;恢复正常后宿主 tmux 的创建时间不变、broker 进程不变、herdr 为 true。全部 60 个测试通过,无残留。
+- 验收实例用 `bin/stop`(新格式 pid 文件,核对身份后停止)→ `deploy-vm.sh` → `bin/start` 重新部署,里面没有工程。
+
+#### Codex 第二轮复核第 5 步(2026-10-13)
+
+阻断、应修均无。Codex 认为"删除工程先停 broker 再查 herdr,查询失败时删除中止、broker 暂停"作为 fail-closed 取舍对 demo 可接受(暂时影响可用性,卡片会显示"恢复"把 broker 拉回)。将来考虑:herdr 状态为 null 时卡片仍显示"恢复",点了必然 503 → 已改:状态查询失败时按钮改为"刷新状态"(只重新查询)。浏览器验证(8767 开发后端,herdr 包装注入 `workspace list` 失败):卡片显示"herdr 状态查询失败 / 刷新状态",去掉注入后点击变回"运行中"。只改前端,`deploy-vm.sh` 更新验收实例的前端文件(后端每次请求从磁盘读),验收后端未重启,登录地址仍有效。
+
+#### Codex 独立交叉验证第 5 步(2026-10-13)
+
+VM: OrbStack `ubuntu`, Ubuntu 22.04.5, Node v22.20.0, npm 10.9.3。验收实例检查时仍由原 PID 716648 监听 `192.168.139.41:8765`;整个验证没有访问默认数据目录、没有向验收实例建工程,结束后 `curl http://192.168.139.41:8765/` 为 200、监听 PID 仍为 716648。
+
+- 同步与构建:`herdr/gui_demo/bin/sync-to-vm.sh gui_demo_xcheck`;VM `cd ~/gui_demo_xcheck && npm ci && npm run build && npm audit && node --test --test-concurrency=1 test/*.test.mjs`。`npm ci` 成功,构建成功,`npm audit` 为 0 vulnerabilities,测试 60/60 通过、0 失败、0 跳过(252.2 秒)。
+- 脚本走查:均使用 `GUI_DEMO_HOME=/tmp/gui-demo-s5-home.dXO2NZ`、`GUI_DEMO_PORT=8768`、`GUI_DEMO_SESSION_PREFIX=guidemo_xc_`。`bin/start` 启动并打印 8768 登录地址;第二次启动以状态码 1 拒绝;`bin/login-url` 返回新地址;`bin/stop` 停止并释放 8768;第二次 stop 提示后端未运行。随后以仍存活的 `sleep` PID 和准确启动时间伪造陈旧 `server.pid`;stop 报告陈旧文件、删掉 pid 文件,该无关进程在 stop 后仍存活,由测试者结束。
+- 恢复走查:隔离工程 `p6168ce93` 位于 `~/gd-xc-proj/restore-step5`,会话 `guidemo_xc_p6168ce93`;用真实 fnx 启动 `dv_uart` 后,`herdr agent list` 为 `pi/idle`,工作目录正确。`herdr session stop` 后 `/api/projects` 显示 `herdr:false`;`POST /api/projects/p6168ce93/recover` 返回 200,之后 `herdr:true`、broker 从 PID 726223 换为 726608,`dv_uart` 恢复为 `pi/idle`;重复 recover 返回 409。只启动 agent,没有向终端输入,没有调用模型。
+- README 对照:部署/启动/停止/登录、一次性令牌、VM 内网地址、默认数据目录、PID 身份核验、恢复行为、测试命令与当前脚本/接口一致。README 的 `gui_demo_run`、默认目录和 8765 是用户部署默认值;本轮按隔离要求用 `gui_demo_xcheck`、临时目录和 8768,没有运行会覆盖验收目录的 `deploy-vm.sh`。
+- 清理:工程删除 API 返回 200 且无 warnings;验证删除会保留项目路径后由测试者删除。临时数据目录、项目路径、`~/gui_demo_xcheck` 均清除;无 `guidemo_xc_`/`guidemo_test_` 会话、tmux、broker、pi、attach 进程,无 `/tmp/gd-*`、`~/gd-test-proj-*`,8768 无监听。已有 `a2a_codex_verify` 会话保持运行;未触碰其他会话。
+
+与本节历史记录一致:60 项全套通过、启动脚本拒绝重复启动、PID 防误杀、停止后可恢复会话/agent/broker均得到独立复核。此前记录的正式浏览器页面二、终端交互完整走查本轮没有重做;本轮恢复检查通过 API 与 CLI 验证,不把未重做的浏览器检查计入本轮证据。
+
+#### 交叉验证第 5 步结果对比(2026-10-13)
+
+| 项目 | 我 | codex-test | 结论 |
+| --- | --- | --- | --- |
+| 构建、`npm ci`、audit | 通过、0 项 | 通过、0 项 | 一致 |
+| 测试 | 60 / 60,无残留 | 60 / 60(约 252 秒),无残留 | 一致 |
+| 脚本:启动、重复启动被拒、`login-url`、停止释放端口、重复停止 | 符合 | 符合 | 一致 |
+| 陈旧 pid 文件指向仍在运行的无关进程,`stop` 不发信号 | 符合(测试) | 符合(手动) | 一致 |
+| 真实 fnx 恢复:herdr 停 → false → 恢复 200、herdr true、broker 换新、agent pi / idle;再恢复 409 | 符合(浏览器走查) | 符合(接口) | 一致 |
+| 验收实例不受影响 | — | 8765 仍由原 pid 监听、返回 200 | 一致 |
+| 浏览器里的恢复与终端重连 | 我在浏览器里走查过 | 未重做 | 只有我一方 |
+
+结论:能交叉验证的项全部一致。第 5 步完成,demo 交给用户验收。
