@@ -193,3 +193,21 @@ test("工程环境:只对 agent / ip / broker run 传 --session,其余靠环境�
   assert.equal(JSON.parse(queueOther.stdout).dispatch_halted, null);
   await assert.rejects(mod.checkProject({ id: "p99999999", session: `${PREFIX}p99999999` }));
 });
+
+test("页面一用到的接口:简介、按 id 取工程、配置", async () => {
+  const { call } = await session();
+  const cfg = await call("GET", "/api/config");
+  assert.equal(cfg.status, 200);
+  assert.equal(cfg.json.home, os.homedir());
+  assert.equal((await call("POST", "/api/projects", { name: "简介太长", path: workDir(), description: "x".repeat(201) })).status, 400);
+  assert.equal((await call("POST", "/api/projects", { name: "简介类型", path: workDir(), description: 42 })).status, 400);
+  const P = await call("POST", "/api/projects", { name: "<b>有简介</b>", path: workDir(), description: "  smoke。 " });
+  assert.equal(P.status, 201, JSON.stringify(P.json));
+  ids.push(P.json.id);
+  const got = await call("GET", `/api/projects/${P.json.id}`);
+  assert.equal(got.status, 200);
+  assert.equal(got.json.description, "smoke。");
+  assert.equal(got.json.name, "<b>有简介</b>");
+  assert.equal((await call("GET", "/api/projects/p00000000")).status, 404);
+  assert.equal((await call("DELETE", `/api/projects/${P.json.id}`)).status, 200);
+});

@@ -13,6 +13,7 @@ export interface Project {
   path: string;
   session: string;
   createdAt: string;
+  description?: string;
 }
 
 export class UserError extends Error {
@@ -107,13 +108,25 @@ function checkName(raw: unknown): string {
   return name;
 }
 
-export function createProject(input: { name?: unknown; path?: unknown }): Promise<Project> {
+function checkDescription(raw: unknown): string {
+  if (raw === undefined || raw === null) return "";
+  const text = typeof raw === "string" ? raw.trim() : "";
+  // eslint-disable-next-line no-control-regex
+  if (typeof raw !== "string" || [...text].length > 200 || /[\u0000-\u0008\u000b-\u001f\u007f]/.test(text)) {
+    throw new UserError("简介必须是不超过 200 个字符的文字");
+  }
+  return text;
+}
+
+export function createProject(input: { name?: unknown; path?: unknown; description?: unknown }): Promise<Project> {
   return serial(async () => {
     const name = checkName(input.name);
+    const description = checkDescription(input.description);
     if (loadProjects().some((p) => p.name === name)) throw new UserError(`已有同名工程:${name}`);
     const projectPath = checkPath(input.path);
     const id = `p${crypto.randomBytes(4).toString("hex")}`;
-    const project: Project = { id, name, path: projectPath, session: sessionName(id), createdAt: new Date().toISOString() };
+    const project: Project = { id, name, path: projectPath, session: sessionName(id), createdAt: new Date().toISOString(),
+      ...(description ? { description } : {}) };
     if ((await herdrSessions()).has(project.session)) throw new UserError(`herdr 会话 ${project.session} 已存在`, 409);
 
     const undo: Array<() => Promise<unknown>> = [];

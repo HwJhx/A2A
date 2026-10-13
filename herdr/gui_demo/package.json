@@ -6,7 +6,7 @@
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
-    "build": "tsc -p server && esbuild web/src/main.ts --bundle --format=esm --outfile=web/dist/main.js --loader:.css=css",
+    "build": "tsc -p server && tsc -p web && esbuild web/src/main.ts --bundle --format=esm --outfile=web/dist/main.js --loader:.css=css",
     "start": "node server/dist/main.js",
     "test": "node --test --test-concurrency=1 test/*.test.mjs"
   },

@@ -5,7 +5,8 @@ import path from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { authed, originOk, redeem, sessionCookie } from "./auth.js";
-import { createProject, deleteProject, listProjects, UserError } from "./projects.js";
+import { HOME } from "./config.js";
+import { createProject, deleteProject, getProject, listProjects, UserError } from "./projects.js";
 
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web");
 const STATIC: Record<string, [string, string]> = {
@@ -83,12 +84,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (!authed(req)) return send(res, 401, { error: "未登录" });
 
   if (url.pathname === "/api/me" && method === "GET") return send(res, 200, { ok: true });
+  if (url.pathname === "/api/config" && method === "GET") return send(res, 200, { home: HOME });
   if (url.pathname === "/api/projects" && method === "GET") return send(res, 200, await listProjects());
   if (url.pathname === "/api/projects" && method === "POST") {
     const body = await readJson(req);
     return send(res, 201, await createProject(body));
   }
   const m = url.pathname.match(/^\/api\/projects\/(p[0-9a-f]{8})$/);
+  if (m && method === "GET") return send(res, 200, getProject(m[1]));
   if (m && method === "DELETE") return send(res, 200, await deleteProject(m[1]));
   return send(res, 404, { error: "没有这个接口" });
 }
