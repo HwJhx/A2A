@@ -28,8 +28,9 @@ import signal
 import sys
 from typing import Any, List, Optional
 
-from . import plugin, rulings
-from .audit import AuditLog
+from . import archive as spool_archive
+from . import plugin, rulings, storage
+from .audit import AuditCorrupt, AuditLog
 from .broker import Broker, BrokerAlreadyRunning
 from .errors import HerdrError
 from .herdr_client import HerdrClient, herdr_version
@@ -103,10 +104,20 @@ def cmd_edges(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    if args.msg_id is None:                    # 不带 msg_id:存储用量与提示(路线图 189)
+        _out(storage.usage(state_dir(), _spool(), _audit()))
+        return 0
     try:
         _out(_spool().get(args.msg_id).to_dict())
         return 0
     except MessageNotFoundError:
+        try:
+            archived = spool_archive.find_archived(_spool(), args.msg_id)
+        except spool_archive.ArchiveError as exc:
+            return _err(str(exc), EXIT_INVALID)
+        if archived is not None:
+            _out(dict(json.loads(archived), archived=True))
+            return 0
         rejected = [e for e in _audit().read() if e.get("msg_id") == args.msg_id and e.get("state") == "REJECTED"]
         if rejected:
             _out(rejected[-1])
@@ -114,6 +125,21 @@ def cmd_status(args: argparse.Namespace) -> int:
         return _err(f"找不到消息 {args.msg_id}", EXIT_NOT_FOUND)
     except SpoolError as exc:
         return _err(str(exc), EXIT_INVALID)
+
+
+def cmd_spool_archive(args: argparse.Namespace) -> int:
+    try:
+        _out(spool_archive.archive_guarded(state_dir(), _spool(), _audit(), args.older_than, dry_run=args.dry_run))
+    except (spool_archive.ArchiveError, SpoolError) as exc:
+        return _err(str(exc), EXIT_INVALID)
+    return 0
+
+
+def cmd_audit_rotate(args: argparse.Namespace) -> int:
+    if args.max_size <= 0:
+        return _err("--max-size 必须大于 0", EXIT_USAGE)
+    _out(_audit().rotate(int(args.max_size * 1024 * 1024)))
+    return 0
 
 
 # ---- 操作员命令 ----------------------------------------------------------
@@ -365,9 +391,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("edges", help="列出当前 pane 身份可用的通信边及渲染后的文字(只读)")
     p.set_defaults(func=cmd_edges)
 
-    p = sub.add_parser("status", help="查询一条消息")
-    p.add_argument("msg_id")
+    p = sub.add_parser("status", help="查询一条消息(含已归档的);不带 msg_id 时显示存储用量与提示")
+    p.add_argument("msg_id", nargs="?")
     p.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("spool", help="消息存储维护").add_subparsers(dest="op", required=True)
+    p = sp.add_parser("archive", help="把到终态超过 N 天的记录打包进 spool/archive/(不归档未放行、被裁定引用的)")
+    p.add_argument("--older-than", type=int, default=storage.DEFAULT_RETENTION_DAYS,
+                   help=f"天数(默认 {storage.DEFAULT_RETENTION_DAYS};不能小于幂等键有效期 "
+                        f"{spool_archive.MIN_OLDER_THAN_DAYS} 天)")
+    p.add_argument("--dry-run", action="store_true", help="只列出会归档多少条、跳过哪些")
+    p.set_defaults(func=cmd_spool_archive)
+
+    au = sub.add_parser("audit", help="审计日志维护").add_subparsers(dest="op", required=True)
+    p = au.add_parser("rotate", help="当前文件超过 --max-size 时轮转并压缩(全部历史仍可读)")
+    p.add_argument("--max-size", type=float, default=storage.DEFAULT_AUDIT_MAX_MB,
+                   help=f"MB(默认 {storage.DEFAULT_AUDIT_MAX_MB})")
+    p.set_defaults(func=cmd_audit_rotate)
 
     p = sub.add_parser("queue", help="各目标的队列头与暂停原因")
     p.add_argument("dst", nargs="?")
@@ -483,7 +523,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    return args.func(args)
+    try:
+        return args.func(args)
+    except AuditCorrupt as exc:
+        # 已轮转的审计分段损坏:读不出完整历史,依赖它的命令(broker 启动恢复、resolve、ruling void、
+        # ip remove 续做等)一律停下,不按不完整的历史行动(19 号方案 E 节 3)
+        return _err(f"审计日志损坏,已停止:{exc}", EXIT_INVALID)
 
 
 if __name__ == "__main__":

@@ -173,6 +173,28 @@ else:
 - 审计日志写到一半崩溃时,残片在下次追加前被隔离到 `audit.jsonl.corrupt`,并补记一条 `AUDIT_REPAIRED`;`read()` 容忍中间坏行,且不修改文件。
 - 新增状态 `DELIVERY_UNCERTAIN`:prompt 可能已送达(`agent_prompt_stalled` 或客户端超时),**核实前不得重发**。
 
+## 存储:归档与审计轮转(路线图 189)
+
+不做无策略删除,不自动定时执行;只统计、提示,由操作员执行或自己配定时任务。
+
+```bash
+a2a status                                        # 不带 msg_id:done/、archive/、审计(含分段)、幂等记录、状态目录合计、磁盘剩余,以及提示
+a2a spool archive [--older-than 30] [--dry-run]   # 到终态超过 N 天的记录打包进 spool/archive/<年-月>-<分卷>.tar.gz
+a2a audit rotate [--max-size 100]                 # 当前文件超过 N MB 时改名为 audit.d/<代次>.jsonl 并压缩成 .jsonl.gz
+a2a status <msg_id>                               # 已归档的消息也能查到(输出带 "archived": true)
+```
+
+- 归档不动:槽位未放行的(含队列头的 last_terminal)、被未作废裁定引用的、pending 里还留着同一条的;`--older-than` 不能小于幂等键有效期 7 天。每次新建分卷、不改旧包;核对包内每个文件与原文件一致后才删原文件;中途中断后重跑不丢不重。
+- 审计轮转后,所有内部逻辑(补做裁定、resolve、ip remove 续做等)读到的仍是全部历史(分段按代次 + 当前文件,按追加顺序)。
+- **分段损坏时停下**:某个 `.jsonl.gz` 解压失败、校验不符,或代次有缺口时,依赖审计历史的命令(broker 启动、`resolve`、`ruling void`、`queue`、`ip remove` 等)报"审计日志损坏"并以退出码 6 停止,不按不完整的历史行动。恢复:从备份还原 `audit.d/` 里报错的那个分段,再重试。
+- 默认阈值:保留 30 天、审计 100 MB、磁盘剩余低于 10% 时提示。
+- 定时执行示例(crontab,每天 3 点;按实际的状态目录与 a2a 路径修改):
+
+  ```cron
+  0 3 * * * A2A_STATE_DIR=/path/to/state PYTHONPATH=/path/to/herdr/a2a/src python3 -m a2a.cli audit rotate --max-size 100
+  5 3 * * * A2A_STATE_DIR=/path/to/state PYTHONPATH=/path/to/herdr/a2a/src python3 -m a2a.cli spool archive --older-than 30
+  ```
+
 ## 按 IP 增删(`a2a ip`,阶段 8)
 
 ```bash

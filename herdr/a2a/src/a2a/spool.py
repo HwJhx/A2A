@@ -428,8 +428,24 @@ class Spool:
             for path in target_dir.glob("*.json"):
                 if self._done_path(path.stem).exists():
                     continue
-                messages.append(self._load(path))
+                try:
+                    messages.append(self._load(path))
+                except SpoolError as exc:
+                    # 不持锁读取:列目录之后、读文件之前,别的线程 / 进程把它终态归档了(先写 done 再删 pending;
+                    # 状态更新是原子替换,不会出现文件暂时不存在)。只有 done/ 里确有它的有效终态记录才跳过;
+                    # 外部误删、目录异常等没有终态记录的消失照常报错(fail-closed),不静默漏掉消息。
+                    # 刚到终态的消息槽位未放行,不会被归档,所以这里不必再查归档包
+                    if isinstance(exc.__cause__, FileNotFoundError) and self._archived_terminal(path.stem):
+                        continue
+                    raise
         return sorted(messages, key=lambda m: (m.dst, *_seq_key(m)))
+
+    def _archived_terminal(self, msg_id: str) -> bool:
+        """done/ 里有这条消息的有效终态记录。"""
+        try:
+            return self._load(self._done_path(msg_id)).state in TERMINAL_STATES
+        except SpoolError:
+            return False
 
     def pending(self, dst: Optional[str] = None) -> List[Message]:
         """未到终态的消息,同一目标内按 queue_seq 排序。dst 为空时返回所有目标的。

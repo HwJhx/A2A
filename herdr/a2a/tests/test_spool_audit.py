@@ -9,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from a2a import (ALLOWED_TRANSITIONS, AuditLog, IllegalTransitionError, InvalidIdError, Message,
@@ -39,6 +40,37 @@ class SpoolTests(unittest.TestCase):
         self.assertEqual(self.spool.pending(), [m])
         self.assertEqual(self.spool.pending("sw_gpio"), [])
         self.assertEqual(self.spool.pending_targets(), ["sw_uart"])
+
+    def test_a_pending_file_archived_during_the_scan_is_skipped(self):
+        # VM 全套测试中发现:不持锁读 pending 时,文件可能刚被别的线程归档到 done/;
+        # 以前这会抛 SpoolError,broker 扫描因此全局停止投递
+        a = self.spool.enqueue(make_message())
+        b = self.spool.enqueue(make_message())
+        real = Path.read_text
+        archived_now = {"yes": False}
+
+        def vanishing(path, *args, **kwargs):
+            if path.name == f"{a.msg_id}.json" and "pending" in path.parts:
+                if archived_now["yes"]:                                   # 读之前刚被终态归档:done 里已有终态记录
+                    done = self.spool._done_path(a.msg_id)
+                    done.parent.mkdir(parents=True, exist_ok=True)
+                    done.write_bytes(Spool._dump(replace(a, state=FAILED)).encode())
+                raise FileNotFoundError(path)
+            return real(path, *args, **kwargs)
+        Path.read_text = vanishing
+        try:
+            # 没有终态记录的消失(外部误删、目录异常):照常报错,不静默漏掉(Codex 复核)
+            with self.assertRaises(SpoolError):
+                self.spool.pending()
+            archived_now["yes"] = True
+            self.assertEqual([m.msg_id for m in self.spool.pending()], [b.msg_id])
+            self.assertEqual(self.spool.queue_targets(), ["sw_uart"])
+        finally:
+            Path.read_text = real
+        broken = self.root / "pending" / "sw_uart" / f"{b.msg_id}.json"
+        broken.write_text("{坏的")
+        with self.assertRaises(SpoolError):                               # 内容损坏照常报错
+            self.spool.pending()
 
     def test_message_ids_are_unique(self):
         ids = [new_msg_id() for _ in range(200)]

@@ -186,7 +186,7 @@
 另外:文件权限经查无问题(状态文件均为 0600)。以下是 Codex 复核意见里**我认可、但尚未处理**的项,留给阶段 5 或之后:
 
 - [x] 客户端缺口:`rename_agent` 不能清除名字已有(`agent_rename(None)`);仍需补 `agent_prompt` 的客户端超时与 `agent_prompt_stalled` 一并映射为"结果不确定"(`HerdrPromptStalled` 已有,Broker 要据此进入 `DELIVERY_UNCERTAIN`)✅(2026-10-11 路线图清理) 阶段 5 已做:`agent_rename(None)` 用 `--clear`;`policy.py` 把 `agent_prompt_stalled`、`timeout`、`client_timeout` 都归为不确定 → DELIVERY_UNCERTAIN
-- [ ] `done/` 目录的保留期、归档与磁盘告警策略(不做无策略删除)
+- [x] `done/` 目录的保留期、归档与磁盘告警策略(不做无策略删除) ✅ 2026-10-13:`a2a status`(不带 msg_id)统计 done/、归档、审计全部分段、幂等记录、状态目录合计与磁盘剩余并给提示;`a2a spool archive --older-than N`(默认 30 天,不小于幂等键有效期 7 天;不归档未放行槽位、被未作废裁定引用、pending 里仍有的;按月分卷,核对后删原文件,中断后重跑不丢不重;归档后 `a2a status <msg_id>` 仍可查);`a2a audit rotate --max-size MB`(默认 100;按代次改名 + 压缩,read() 读全部分段 + 当前文件,分段损坏或代次缺口 fail-closed,CLI 统一报错退出 6)。不自动定时执行,README 给 cron 示例
 - [x] `Spool.recover()` 放在 Broker 启动时调用(已实现方法,待 Broker 接上)✅(2026-10-11 路线图清理) 阶段 5 已接上(`broker.py` 启动恢复第一步)
 
 新发现(已写进 04 号文档):
