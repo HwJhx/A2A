@@ -2,6 +2,8 @@
 import { a2a, a2aError, parseJson, pyTool } from "./a2a.js";
 import { herdrRunning, killTmux, tmuxSessions, windowTmuxPrefix } from "./herdr.js";
 import { getProject, Project, serial, UserError } from "./projects.js";
+import { fence } from "./fence.js";
+import { ensureWindow } from "./windows.js";
 
 export const ROLES = { dv: "验证智能体", sw: "软件智能体" } as const;
 export type Role = keyof typeof ROLES;
@@ -41,7 +43,7 @@ async function requireHerdr(p: Project): Promise<void> {
   if (!(await herdrRunning(p.session))) throw new UserError(`工程的 herdr 会话 ${p.session} 没有运行`, 409);
 }
 
-async function agentRows(p: Project): Promise<AgentRow[]> {
+export async function agentRows(p: Project): Promise<AgentRow[]> {
   const r = await a2a(p, ["agent", "list"]);
   if (r.code !== 0) throw new UserError(`agent list 失败:${a2aError(r)}`, 500);
   const rows = (parseJson(r.stdout) as Array<Record<string, string | null>> | undefined) ?? [];
@@ -105,7 +107,7 @@ const reaping = new Set<string>();
 const reapWarnings = new Map<string, string[]>();
 
 /** 在某类智能体下新增一个 IP 的 agent:`a2a ip add <ip> --roles <role> --cwd <项目路径>/{role}_{ip}`。 */
-export function addAgent(id: string, input: { role?: unknown; ip?: unknown }): Promise<AgentRow> {
+export function addAgent(id: string, input: { role?: unknown; ip?: unknown }): Promise<AgentRow & { warnings: string[] }> {
   return serial(async () => {
     const p = getProject(id);
     const role = checkRole(input.role);
@@ -116,7 +118,14 @@ export function addAgent(id: string, input: { role?: unknown; ip?: unknown }): P
     if (r.code !== 0) throw new UserError(`新增 ${role}_${ip} 失败:${a2aError(r)}`, 500);
     const row = (await agentRows(p)).find((a) => a.agentId === `${role}_${ip}`);
     if (!row) throw new UserError(`ip add 成功了,但注册表里没有 ${role}_${ip}`, 500);
-    return row;
+    // 窗口 tmux 建不成不算新增失败:浏览器打开终端时还会再建一次
+    const warnings: string[] = [];
+    try {
+      await ensureWindow(p.id, p.session, row.agentId);
+    } catch (e) {
+      warnings.push(`agent 已启动,但窗口没建成(打开终端时会再试):${(e as Error).message}`);
+    }
+    return { ...row, warnings };
   });
 }
 
@@ -135,7 +144,14 @@ export function deleteIp(id: string, rawIp: string, input: { expect?: unknown })
     if (actual.join(",") !== expected.join(",")) {
       throw new UserError(`IP ${rawIp} 下的智能体已经变化(现在是:${actual.join("、") || "无"}),请刷新后再删`, 409);
     }
-    const r = await a2a(p, ["ip", "remove", rawIp, "--force"], 240_000);
+    // 删除期间先撤销这些 agent 的终端写权限,并让新的终端握手被拒(fence.ts)
+    const release = fence(p.id, actual);
+    let r;
+    try {
+      r = await a2a(p, ["ip", "remove", rawIp, "--force"], 240_000);
+    } finally {
+      release();
+    }
     if (r.code !== 0) {
       throw new UserError(`删除 IP ${rawIp} 失败:${a2aError(r)}。可在 VM 上用 a2a queue 查看队列,`
         + `或 a2a ip undrain ${rawIp} 放弃这次删除`, 500);
@@ -160,7 +176,14 @@ export function agentAction(id: string, agentId: string, action: "stop" | "resto
     const { role, ip } = parseAgentId(agentId);
     await requireHerdr(p);
     if (!(await agentRows(p)).some((a) => a.agentId === agentId)) throw new UserError(`${agentId} 不存在`, 404);
-    const r = await a2a(p, ["agent", action, role, ip], 180_000);
+    // 停止 / 重启期间先撤销终端写权限:停止后窗口里是 pane 的 shell,重启时 a2a 会往 shell 里输入启动命令
+    const release = fence(p.id, [agentId]);
+    let r;
+    try {
+      r = await a2a(p, ["agent", action, role, ip], 180_000);
+    } finally {
+      release();
+    }
     if (r.code !== 0) throw new UserError(`${action === "stop" ? "停止" : "重启"} ${agentId} 失败:${a2aError(r)}`, 500);
     const row = (await agentRows(p)).find((a) => a.agentId === agentId);
     if (!row) throw new UserError(`${agentId} 操作后不在注册表里`, 500);

@@ -80,3 +80,38 @@ button.icon { padding: 3px 9px; font-size: 12px; }
   #app { padding: 24px 16px; }
   .grid { grid-template-columns: 1fr; }
 }
+
+/* ---- 页面二 ---- */
+.page2-head { margin-bottom: 20px; }
+.page2-head .muted { margin-top: 6px; font-size: 13px; }
+.page2 { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 20px; align-items: start; }
+.side { display: flex; flex-direction: column; gap: 6px; position: sticky; top: 16px; }
+.side a { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-radius: 10px;
+  color: var(--text); text-decoration: none; background: var(--card); border: 1px solid var(--line); }
+.side a.active { border-color: var(--accent); background: rgba(95, 180, 255, 0.14); }
+.side .count { font-size: 12px; color: var(--muted); background: rgba(255,255,255,0.08); border-radius: 999px; padding: 1px 8px; }
+.main { min-width: 0; }
+.main-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.main-head h2 { margin: 0; }
+.banner { color: #ffd36a; font-size: 13px; margin: 0 0 10px; }
+.agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 560px), 1fr)); gap: 16px; }
+.agent { background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; min-width: 0; }
+.agent-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.agent-head .spacer { flex: 1; }
+.status { font-size: 12px; color: var(--muted); }
+.status::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.status.ok::before { background: var(--ok); }
+.status.bad::before { background: var(--danger); }
+.term { position: relative; height: 420px; background: #0b111b; }
+.term-host { position: absolute; inset: 6px; }
+.term-note { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 12px; font-size: 12px; color: #ffd36a;
+  background: rgba(11, 17, 27, 0.92); border-top: 1px solid var(--line); }
+.term.readonly .term-host { opacity: 0.55; }
+.small { font-size: 12px; }
+.empty { padding: 30px; border: 1px dashed var(--line); border-radius: 12px; text-align: center; }
+@media (max-width: 760px) {
+  .page2 { grid-template-columns: 1fr; }
+  .side { position: static; flex-direction: row; }
+  .side a { flex: 1; }
+  .term { height: 320px; }
+}

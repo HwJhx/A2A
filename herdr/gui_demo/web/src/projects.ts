@@ -1,6 +1,7 @@
 // 页面一:工程列表。卡片 = 已有工程(点击进入页面二),最后一张是"新建项目"。每张工程卡片可删除。
 import { api, ApiError, Project } from "./api.js";
 import { avatar, clear, h } from "./dom.js";
+import { modal } from "./modal.js";
 
 let home = "";
 
@@ -44,14 +45,6 @@ function projectCard(p: Project, grid: HTMLElement): HTMLElement {
   h("p", { class: "muted" }, p.description || "还没有简介"),
   h("p", { class: "path", title: p.path }, p.path),
   h("div", { class: "card-foot" }, h("span", { class: healthy ? "dot ok" : "dot bad" }, status), h("span", { class: "enter" }, "进入")));
-}
-
-function modal(title: string, body: Node[], actions: HTMLElement[]): HTMLDialogElement {
-  const dlg = h("dialog", { class: "modal" }, h("h3", {}, title), ...body, h("div", { class: "actions" }, ...actions));
-  dlg.addEventListener("close", () => dlg.remove());
-  document.body.append(dlg);
-  dlg.showModal();
-  return dlg;
 }
 
 function openCreate(grid: HTMLElement): void {

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { authed, originOk, redeem, sessionCookie } from "./auth.js";
 import { addAgent, agentAction, deleteIp, listAgents } from "./agents.js";
 import { HOME } from "./config.js";
+import { handleTerminalUpgrade } from "./terminal.js";
 import { createProject, deleteProject, getProject, listProjects, UserError } from "./projects.js";
 
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web");
@@ -20,7 +21,8 @@ const BASE_HEADERS = {
   "Referrer-Policy": "no-referrer",
   "X-Content-Type-Options": "nosniff",
   "Cache-Control": "no-store",
-  "Content-Security-Policy": "default-src 'self'; connect-src 'self'; frame-ancestors 'none'",
+  // xterm.js 会动态插入 <style>,所以样式允许内联;脚本仍只允许本站文件
+  "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
 };
 
 function send(res: ServerResponse, status: number, body?: unknown, headers: Record<string, string> = {}): void {
@@ -119,11 +121,11 @@ export function createHttpServer(): http.Server {
       else res.end();
     });
   });
-  // WebSocket(终端,第 4 步实现):握手前先校验会话 cookie 与 Origin
-  server.on("upgrade", (req, socket) => {
+  // WebSocket(终端):握手前先校验 Origin 与会话 cookie,再交给终端桥校验工程与 agent
+  server.on("upgrade", (req, socket, head) => {
     if (!originOk(req)) return rejectUpgrade(socket, 403, "Forbidden");
     if (!authed(req)) return rejectUpgrade(socket, 401, "Unauthorized");
-    rejectUpgrade(socket, 404, "Not Found");
+    handleTerminalUpgrade(req, socket, head).catch(() => rejectUpgrade(socket, 500, "Error"));
   });
   return server;
 }

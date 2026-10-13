@@ -17,6 +17,25 @@ export interface Project {
   broker?: { running: boolean; pid: number | null; restarts: number };
 }
 
+export type Role = "dv" | "sw";
+
+export interface AgentRow {
+  agentId: string;
+  role: Role;
+  ip: string;
+  lifecycle: string;
+  paneId: string | null;
+  agentName: string | null;
+  live: string | null;
+}
+
+export interface AgentsInfo {
+  roles: Record<Role, string>;
+  ips: string[];
+  agents: AgentRow[];
+  warnings: string[];
+}
+
 let onUnauthorized: () => void = () => undefined;
 export const setUnauthorizedHandler = (fn: () => void) => { onUnauthorized = fn; };
 
@@ -39,4 +58,10 @@ export const api = {
   project: (id: string) => call<Project>("GET", `/api/projects/${id}`),
   createProject: (body: { name: string; path: string; description: string }) => call<Project>("POST", "/api/projects", body),
   deleteProject: (id: string) => call<{ warnings: string[] }>("DELETE", `/api/projects/${id}`),
+  agents: (id: string) => call<AgentsInfo>("GET", `/api/projects/${id}/agents`),
+  addAgent: (id: string, body: { role: Role; ip: string }) => call<AgentRow & { warnings: string[] }>("POST", `/api/projects/${id}/agents`, body),
+  stopAgent: (id: string, agentId: string) => call<AgentRow>("POST", `/api/projects/${id}/agents/${agentId}/stop`),
+  restoreAgent: (id: string, agentId: string) => call<AgentRow>("POST", `/api/projects/${id}/agents/${agentId}/restore`),
+  deleteIp: (id: string, ip: string, expect: string[]) =>
+    call<{ removed: string[]; warnings: string[] }>("DELETE", `/api/projects/${id}/ips/${ip}`, { expect }),
 };

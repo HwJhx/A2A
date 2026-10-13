@@ -1,11 +1,11 @@
 // 前端入口:登录(读 #token=…,先从地址栏去掉,再 POST /api/login 兑换会话 cookie),然后按地址栏 # 路由。
 // 页面加载时和地址栏 # 变化时都会检查 #token=(在同一标签页粘贴新登录地址不会重新加载页面)。
 //   #/        页面一:工程列表
-//   #/p/<id>  页面二:智能体页
+//   #/p/<id>[/dv|/sw]  页面二:智能体页(默认验证智能体)
 import "./main.css";
 import { ApiError, setUnauthorizedHandler } from "./api.js";
 import { clear, h } from "./dom.js";
-import { renderProject } from "./project.js";
+import { leaveProject, renderProject } from "./project.js";
 import { renderProjects } from "./projects.js";
 
 const app = document.getElementById("app")!;
@@ -28,6 +28,7 @@ async function loggedIn(): Promise<boolean> {
 }
 
 function showLoggedOut(): void {
+  leaveProject(); // 停掉页面二的终端连接与定时刷新
   // 对话框挂在 body 下,不在 #app 里:会话失效时一并关掉,免得它们留在"未登录"页上面
   for (const dlg of document.querySelectorAll("dialog")) {
     dlg.close();
@@ -39,10 +40,13 @@ function showLoggedOut(): void {
 }
 
 async function route(): Promise<void> {
-  const m = location.hash.match(/^#\/p\/(p[0-9a-f]{8})$/);
+  const m = location.hash.match(/^#\/p\/(p[0-9a-f]{8})(?:\/(dv|sw))?$/);
   try {
-    if (m) await renderProject(app, m[1]);
-    else await renderProjects(app);
+    if (m) await renderProject(app, m[1], (m[2] as "dv" | "sw" | undefined) ?? "dv");
+    else {
+      leaveProject();
+      await renderProjects(app);
+    }
   } catch (e) {
     // 401 已由 api.ts 切到"未登录"页;其他错误照常抛出
     if (!(e instanceof ApiError && e.status === 401)) throw e;

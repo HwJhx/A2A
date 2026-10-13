@@ -5,20 +5,24 @@ import type http from "node:http";
 import { acquireInstanceLock, startAdminSocket } from "./admin.js";
 import { issueLoginToken, loginUrl } from "./auth.js";
 import { stopAllBrokers } from "./broker.js";
-import { DATA_DIR, HOST, PORT } from "./config.js";
+import { DATA_DIR, HOST, PORT, SHUTDOWN_DELAY_MS } from "./config.js";
+import { sleep } from "./proc.js";
 import { createHttpServer } from "./http.js";
 import { resumeProjects } from "./projects.js";
+import { closeAllTerminals } from "./terminal.js";
 
 let lock: net.Server | null = null;
 let admin: net.Server | null = null;
 let server: http.Server | null = null;
 
 async function release(): Promise<void> {
+  closeAllTerminals();
   if (server) {
     server.close();
     server.closeAllConnections();
   }
   await stopAllBrokers();
+  if (SHUTDOWN_DELAY_MS) await sleep(SHUTDOWN_DELAY_MS);
   admin?.close();
   lock?.close();
 }
