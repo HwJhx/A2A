@@ -183,6 +183,15 @@ a2a plugin uninstall --agent-dir ~/.forenyx/fnx_dv     # 只删除指向本仓�
 
 **需要用户同意**后执行。
 
+**实现与实测(2026-10-13,用户同意后执行,共 8 次模型调用)**:
+- **327**:插件发送成功的结果文字末尾加"不需要再说明或总结,直接结束这一轮。"。`real_fnx_scale.py --ips 1`(dv → sw → dv,5 次模型调用,1/1 走完,框架检查通过):发送后的那句话从改动前中位数 74 字 / 52 个输出 token(阶段 7、8 历史 205 次)降到 21.5 字 / 12 个(2 次)。pi 在工具返回后仍会再调一次模型。可选方案 `terminate: true`(pi 文档 extensions.md「Early termination」:同批工具结果都带它时跳过后续模型调用)能省掉这次调用,但最后一条消息会是工具调用(stopReason = toolUse),插件 `idleIsCertain` 只认 stop / aborted,会一直报 working、broker 不再投递;要做须连同空闲判断一起改并重新做真实验证。用户决定:到此为止,接受这次很短的调用(将来考虑)。
+- **338 真实验证**:新增 `tests/stress/real_fnx_probes.py` 与只在测试时安装的 `tests/pi-ext/a2a-turn-inspect.ts`(每轮 agent_start 记录 a2a_send 可选边与启用的工具)。fnx_dv 运行中 `a2a topology add-edge dv_extra`,再给一条只要求回复 OK 的提示(1 次模型调用):这一轮开始时可选边为 `[dv_done, dv_extra]`。
+- **探测 8**:同一脚本把 dv 改为不加 `--no-builtin-tools` 后 restore,提示"用 bash 运行 echo probe8"(约 2 次模型调用):模型直接执行 bash,**没有人工批准**,状态 idle → working → done(约 3 秒),没有 blocked,屏幕无批准提示;刷新后 read / bash / edit / write / a2a_send 都启用。工作目录为空,清理无问题。
+- **Codex 审核(阻断 1、应修 2)已修(只涉及探测脚本)**:① 有副作用之前同时检查 herdr 与 tmux 会话名;用 owns_tmux / owns_session / spawned 记录归属,清理只动本次确认创建的(实测:预先建同名 tmux 会话时脚本拒绝执行且该会话保留);② 338 超时或新边不可见、探测 8 超时或会话记录里没有 bash 执行 `echo probe8` 并得到 `probe8` 的证据(不再用屏幕文字,提示词里就有 probe8)都判失败;③ 清理问题、工作目录非空也判失败;退出码 0 / 1。用新的取证方法核对 10-13 那次运行的会话记录:bash 调用 `echo probe8`,结果 `probe8`,探测 8 结论成立。将来考虑:327 的新样本只有 2 个,可在相同模型 / 提示 / 链路下增加样本再评估。
+- **Codex 复核(应修 3)已修**:① 等待会话启动期间一出现在 session list 就记归属(启动超时也会清理该会话),清理后复核会话已不在;② 清理每一步单独捕获并记录,检查扩展先登记再复制,工作目录检查失败也记入;③ 探测 8 只读 restore 之后新建的会话记录,bash 调用与结果按 toolCallId 配对(实测:把已有记录全部标为旧记录时取证为空,不会被旧记录误判通过)。将来考虑:会话名检查与创建之间仍有极小的竞态窗口,可改用随机 ID。
+- **Codex 复核(阻断 1、应修 2)已修**:① 阻断:探测 8 开放了全部内置工具,不能只靠提示词约束。新增只在测试时复制进 fnx 的 `tests/pi-ext/a2a-probe-guard.ts`:在 tool_call 钩子(执行前)只放行 bash 执行 `echo probe8`,其他工具调用一律拦下;报告另记本轮全部工具调用。10-13 那次运行没有这道限制,会话记录显示只执行了 `echo probe8`(338 那轮没有任何工具调用),没有其他副作用。守卫的放行 / 拦截逻辑有单元测试(node 加载扩展,8 种调用;变异"全部放行"被发现);它在真实 fnx 里的拦截效果需要模型调用才能验证,未单独验证(插件拦截 herdr 写入用的是同一机制)。② 等待会话启动时 session_list 出错也继续等,清理时按 owns_tmux(本次启动了 attach、名字事先不存在)同样处理该会话,清理后复核。③ tmux kill-session 之后用 has-session 复核,仍在则记入清理问题。
+- **Codex 复核(阻断 1、应修 1)已修**:① 守卫在注册 tool_call 钩子之后写标记 `probe-guard-loaded-<角色>_<IP>`(内容为 fnx 进程号);脚本在 restore 前删旧标记,restore 后最多等 15 秒,标记出现且等于注册表登记的进程组号(即本次 pi 进程号)才发提示,否则判失败、不发提示(fail-closed)。实测(VM,不调用模型):空跑时真实 fnx_dv 里 guard_loaded = true;删掉启用标记让守卫不注册时 guard_loaded = false、判失败、发出的提示为 0。② `has-session` 非零时只有 stderr 为"can't find session""no server running""(No such file or directory)"才算已清理,其他(权限、连接错误)记入清理问题。
+
 ---
 
 ## 不在范围内

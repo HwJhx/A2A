@@ -358,7 +358,9 @@ export function buildSendTool(cfg: Config, edges: Edge[], runKey?: () => string)
           };
         }
         return {
-          content: [{ type: "text", text: `已发送(排队投递中):发给 ${r.dst},msg_id=${r.msg_id},内容「${r.text}」` }],
+          // 路线图 327:阶段 6 观察到模型发完后还会再输出一段"已发送"总结,浪费 token、拉长处理时间
+          content: [{ type: "text", text: `已发送(排队投递中):发给 ${r.dst},msg_id=${r.msg_id},内容「${r.text}」。`
+            + `不需要再说明或总结,直接结束这一轮。` }],
           details: { status: "sent", ...r },
         };
       }

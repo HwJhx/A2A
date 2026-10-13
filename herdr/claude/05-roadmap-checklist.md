@@ -48,7 +48,7 @@
 
 - [x] 探测 6:`fnx_dv` 能否被 herdr 识别为 `pi` ✅ **结论:不能自动识别**。前台进程名是 `forenyx-cli`(`~/.forenyx/fnx_dv/libexec/forenyx-cli`),`agent list` 为空。用 `herdr pane report-agent <pane> --source <id> --agent pi --state idle --seq N` 手动上报后,被识别为 `pi`、状态 `idle`,可按 pane ID 寻址。需要让 fnx 自己上报,见下方「新增事项」
 - [x] 探测 7:pi 的 `bash` 能否拿到 `A2A_ROLE` / `A2A_IP` / `HERDR_PANE_ID` ✅(用 `!` 前缀在 fnx_dv 里执行,读到 `ROLE=dv IP=uart PANE=w1:p2 ENV=1`;注意这是用户侧 `!` 命令,不是模型调用的 bash 工具,模型侧仍需再确认)
-- [ ] 探测 8:pi 二开版的 `bash` 工具是否会弹人工批准
+- [x] 探测 8:pi 二开版的 `bash` 工具是否会弹人工批准 ✅ 2026-10-13 实测(VM,真实 fnx_dv,不加 `--no-builtin-tools`,`tests/stress/real_fnx_probes.py`):提示"用 bash 运行 echo probe8",模型直接调用 bash 执行,**没有弹人工批准**;herdr 状态 idle → working → done(约 3 秒),全程没有 blocked,屏幕上没有批准提示;工作目录为空。即 fnx 的 bash 工具不需要人工批准,正式使用开放 bash 时不会卡在审批上(也意味着没有这道人工把关)
 - [x] 确认 `fnx-sw` 的 pi 版本与 `pi-custom` 一致(我只读了 `pi-custom`)✅ 已被实测取代(2026-10-11 路线图清理):之后都直接在安装好的 fnx_dv / fnx_sw(pi 0.79.10)上实测,插件加载、事件、工具注册、重试与压缩设置均以实测为准(阶段 6、8);只剩模型侧 bash 是否弹批准未验证,见探测 8
 - [x] 把 §10.3 中 6 条未验证事实逐条标为"已验证"或"不成立,已改" ✅(2026-10-11 路线图清理) 04 号 §10.3 已更新:#3 跨 tab 投递已验证(阶段 6–8 broker 按名字向别的 tab 投递);#6 L4 不做(按 E4 先 L1 + L2);#7 blocked、#8 模型侧 bash 批准仍未验证(下方合并跟踪);#9 另外三个智能体暂不接入
 
@@ -325,7 +325,7 @@ pi 侧接入(不调用模型):
 - [x] 审计:两次投递各一次(QUEUED → DISPATCHING → DELIVERED → QUEUE_RELEASED),文字与模板填入 uart 后逐字一致;全程约 6 秒;broker 日志无错误
 - [x] 模型证据:两边 TUI 状态栏 `(SophNet) DeepSeek-Flash`;fnx 会话文件每条 assistant 消息记录 provider=sophnet、model=DeepSeek-Flash 和 token 用量
 - [x] 临时工作目录保持为空
-- [ ] 观察:两边调用 `a2a_send` 后都多输出了一段"已发送"总结,不影响通信;正式使用时可在模板里加约束
+- [x] 观察:两边调用 `a2a_send` 后都多输出了一段"已发送"总结,不影响通信;正式使用时可在模板里加约束 ✅ 2026-10-13:插件在发送成功的工具结果里加一句"不需要再说明或总结,直接结束这一轮"(不改模板)。真实链路实测(`real_fnx_scale.py --ips 1`,5 次模型调用):发送后那句话由改动前的中位数 74 字 / 52 个输出 token(阶段 7、8 历史记录 205 次)降到 21.5 字 / 12 个(2 次,样本少,仅供参考)。**已知限制(用户 2026-10-13 决定接受)**:工具返回后 pi 仍会再调一次模型,这次调用省不掉;pi 支持工具返回 `terminate: true` 跳过它,但会使最后一条消息成为工具调用,插件的空闲判断(只认 stop / aborted)将一直报 working,需要连同空闲判断一起改并重新验证,暂不做
 - [x] `sw_test_fail` 用真实模型补跑(用户要求,会话 `a2a_s6b`,状态目录 `~/a2a_stage6_run2`)✅ 为了确定性地走到这条边,本轮用 `a2a topology set-template` 把 `dv_done` 的结尾改为"直接用 a2a_send 回复测试失败"(只改这一轮的拓扑,有 `TOPOLOGY_CHANGED` 审计)。fnx_sw 调 `a2a_send(sw_test_fail)`,fnx_dv 回复"收到";审计两次投递各一次,文字逐字一致,约 3 秒;工作目录为空;fnx 会话文件记录 sophnet / DeepSeek-Flash。插件为修复后的版本
 - [ ] 正式使用:让 `fnx_sw` 收到固定句式后真的开始驱动与 HAL 开发、让 `fnx_dv` 在 UVM 验证完成时调用 `a2a_send(dv_done)`(模板换成真实工作指令)
 
@@ -336,7 +336,7 @@ pi 侧接入(不调用模型):
 - [x] 真实 fnx 集成测试不再删除已常驻安装的插件(结束时还原原内容)
 - [x] 将来考虑:机制级防重复需要稳定的业务事件 ID 幂等;toolCallId 不行(模型重试是新的调用、新的 ID) ✅ 2026-10-12:插件在每次处理新输入时(before_agent_start)生成幂等键 `<UTC 秒>-<UUID>`,`a2a send --idempotency-key`;Router 按 (发送方, 边, 键) 去重,先写意图再补齐,任一步崩溃后重试都只有一条消息;重复调用返回原 msg_id(`duplicate: true`)并记 `SEND_DEDUPLICATED`。依据 pi 0.79.10 源码:自动重试走 `agent.continue()`,不重新触发 before_agent_start。已知限制:agent 忙时人工插入的排队输入也走 continue,与当前输入共用一个键
 - [x] 已知局限(不作为待办):`HERDR_WRITE` 正则可能误拦文档 / 搜索命令,也能被变量、别名绕过;它是软限制,不是安全边界 ✅ 已写进 README 插件一节的已知局限。真正的隔离需要 L4(另建 OS 用户或沙箱),按 E4 暂不做(2026-10-11)
-- [x] 将来考虑:插件加载时缓存可用的边,拓扑新增边要重启 agent 才可见,删除的边仍显示但会被 Router 拒绝;留到动态拓扑阶段 ✅ 2026-10-12:插件在 before_agent_start(每轮开始处理前)重新读取出边,有变化就同名重新注册 `a2a_send`,出边变空时只停用它(其他启用的工具不变),读取失败沿用上一次的。依据 fnx 自带 pi 0.79.10 源码:同名注册是替换、已有名字保持启用状态、before_agent_start 里改的工具本轮生效。单元测试用按该行为模拟的假 pi;真实 fnx 中"运行中加边后下一轮可见"需要调用模型,并入第 327 行那次模型测试
+- [x] 将来考虑:插件加载时缓存可用的边,拓扑新增边要重启 agent 才可见,删除的边仍显示但会被 Router 拒绝;留到动态拓扑阶段 ✅ 2026-10-12:插件在 before_agent_start(每轮开始处理前)重新读取出边,有变化就同名重新注册 `a2a_send`,出边变空时只停用它(其他启用的工具不变),读取失败沿用上一次的。依据 fnx 自带 pi 0.79.10 源码:同名注册是替换、已有名字保持启用状态、before_agent_start 里改的工具本轮生效。单元测试用按该行为模拟的假 pi;**2026-10-13 真实验证**(`tests/stress/real_fnx_probes.py`,1 次模型调用):fnx_dv 运行中 `a2a topology add-edge dv_extra`,下一轮开始时 `a2a_send` 的可选边为 `[dv_done, dv_extra]`;切换到带 bash 的配置后,刷新时 read / bash / edit / write 等其他工具保持启用
 
 修复后测试:Mac 单元 445 个通过(跳过 32:31 个集成 + 1 个需本机 fnx);插件单元 14 个在 Mac 通过;VM 全套 445 个通过、跳过 14 个(插件单元测试,VM 无 node),其中真实 herdr 集成测试 31 个全部通过。已常驻安装的插件更新为修复后的版本(运行中的 `a2a_s6` 两个 agent 仍是旧版,重启后才加载新版)。
 

@@ -121,6 +121,7 @@ class PiExtension(unittest.TestCase):
         self.assertEqual((message.src, message.edge_id, message.text),
                          ("dv_uart", "dv_done", TOPOLOGY["edges"][0]["template"].format(ip="uart")))
         self.assertIn(message.msg_id, out["content"][0]["text"])
+        self.assertIn("不需要再说明或总结", out["content"][0]["text"])          # 路线图 327
 
     def test_router_rejection_is_reported_as_a_tool_error(self):
         # 冒充:声称是 dv_uart,但 pane 不是登记的那个 -> Router 拒绝,工具报错,不入队
