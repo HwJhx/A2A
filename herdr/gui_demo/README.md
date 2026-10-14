@@ -48,6 +48,7 @@ gui_demo/bin/deploy-vm.sh
 GUI 建 agent 时不会安装插件。要让 agent 用 `a2a_send` 互发消息,先在 VM 上给 fnx_dv、fnx_sw **分别**在线安装(详见 `../a2a/README.md` 的"pi 插件"一节):
 
 ```bash
+export PATH=$HOME/.local/lib/node-v22.20.0-linux-arm64/bin:$PATH   # 安装要用 npm
 ~/.forenyx/fnx_dv/bin/fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
 ~/.forenyx/fnx_sw/bin/fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
 ```

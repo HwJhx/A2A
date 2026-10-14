@@ -789,3 +789,15 @@ Codex 确认项目级相对路径基准一项关闭。
 | 清理与边界 | 完成 | fnx_dv / fnx_sw 两份 agent settings 均与测试前备份逐字节一致；fnx_dv agent `extensions/` 不存在；`/tmp/a2a_xc_proj`、变异副本、VM 备份和 Mac `/private/tmp/a2a_xc_mutation_*.sh` 已删除。未触碰禁用 Herdr 会话、未读取 `auth.json` 或密钥、未调用模型。 |
 
 结论:§12 所述在线安装防重、`file://` 来源、项目级作用域和嵌套扩展冲突在 VM 的独立复测中均符合预期；防护测试能检出 agent 级与项目级 guard 被移除的变异。
+
+### 12.13 VM 正式在线安装(2026-10-14)
+
+用户提交 `e78a165`、推送标签 `a2a-plugin-v0.1.0`(指向 `e78a165`)后,在 VM 上:
+
+- 第一次 `fnx_dv / fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0`:克隆成功,但 pi 随后在克隆目录跑 `npm install`,登录 shell 的 PATH 里没有 npm(只有 `~/.local/bin/node` 软链接)→ `Error: Executable not found in $PATH: "npm"`,settings 未写入(与备份 `cmp` 一致)。
+- 临时把 `~/.local/lib/node-v22.20.0-linux-arm64/bin`(GUI 启动脚本用的同一份 Node)加进 PATH 重装:两者都 `Installed`,`list` 显示该包,克隆在 `<agent>/git/github.com/HwJhx/A2A`、HEAD `e78a165`、`git status` 干净(无 `node_modules` / lock)。settings 除新增 `packages` 外与安装前一致。
+- `a2a plugin status`:两者均 `online_package`(列出 settings 来源与克隆目录)。
+- 卸载写法(在 fnx_sw 上实测后装回):`remove git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0` 与不带标签的 `remove git:github.com/HwJhx/A2A` 都能卸载,并删除克隆目录。
+- 加载:在单独的 tmux socket、临时目录里启动 fnx_dv、fnx_sw(不输入任何内容、不调用模型,用量 0.0%),启动画面 `[Extensions]` 均显示 `HwJhx/A2A:herdr/a2a/pi-extension/a2a.ts`;随后结束 tmux、删除临时目录与备份。
+- 文档更新:README 的卸载写法、"PATH 里必须有 npm";`gui_demo/README.md`、`验收步骤.md` §0 的安装命令前加 PATH。
+- 待用户:在 GUI 页面二把 `a2a_test` 的 4 个 agent 停止再重启,加载插件。

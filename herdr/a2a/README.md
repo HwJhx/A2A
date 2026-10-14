@@ -239,13 +239,13 @@ fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
 fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
 fnx_dv list                                             # 查看已安装的包
 fnx_dv install git:github.com/HwJhx/A2A@<新标签>        # 升级到新版本
-fnx_dv remove  <安装时的来源>                           # 卸载(带标签时的确切写法待推送后实测确认)
+fnx_dv remove  git:github.com/HwJhx/A2A                 # 卸载(带不带 @标签 都行,会删掉克隆目录)
 ```
 
 - pi 把仓库克隆到 `<agent 目录>/git/github.com/HwJhx/A2A`,并在 `<agent 目录>/settings.json` 的 `packages` 里记一条;按标签固定版本,`fnx_dv update --extensions` 不会把它挪到新标签。
 - git 标签是可以被移动的;要严格可复现,可改用提交号固定版本(`fnx_dv install git:github.com/HwJhx/A2A@<commit SHA>`),或在 GitHub 上保护 release 标签。
 - 只装插件(TypeScript)这一半。插件发送时调用的 Python 后端(`a2a send`)的位置来自 pane 的环境变量(`A2A_SRC`、`A2A_PYTHON`,由 `a2a agent spawn` 注入),不随插件安装;**插件与后端的版本要对应**。
-- 插件只用 Node 自带模块,没有 npm 依赖。
+- 插件只用 Node 自带模块,没有 npm 依赖;但 pi 克隆后总会在仓库里跑一次 `npm install`,**PATH 里必须有 npm**,否则报 `Executable not found in $PATH: "npm"`、不记入 settings。VM 上 npm 不在登录 shell 的 PATH 里,安装时临时加上:`PATH=$HOME/.local/lib/node-v22.20.0-linux-arm64/bin:$PATH fnx_dv install …`(只有 install / update 需要,运行 fnx 不需要)。
 - 推送前可用本地路径验证清单:`fnx_dv install /path/to/A2A`(不复制,只在 settings 里记路径),验证完 `fnx_dv remove /path/to/A2A`。2026-10-14 在 VM 上这样验证过:fnx_dv 启动画面 `[Extensions]` 里显示 `a2a.ts`。
 
 **开发与自动测试:软链接**(链到仓库里的同一个文件,修改插件后所有智能体下次启动即生效;实测 fnx 能加载软链接形式的扩展,启动画面 `[Extensions]` 里显示为 `a2a.ts`):
