@@ -52,6 +52,8 @@ export const GATE_POLL_MS = intEnv("GUI_DEMO_GATE_POLL_MS", 2000, 200, 600_000);
 export const HANDSHAKE_DELAY_MS = intEnv("GUI_DEMO_HANDSHAKE_DELAY_MS", 0, 0, 60_000);
 // 仅测试用:关服时在释放资源后、退出前停一会儿,用来稳定复现"关服期间待完成的握手醒过来"
 export const SHUTDOWN_DELAY_MS = intEnv("GUI_DEMO_SHUTDOWN_DELAY_MS", 0, 0, 60_000);
+// 仅测试用:删除工程在"停完会话、删拓扑之前"停一会儿,用来稳定复现"删除过程中拓扑文件被替换"
+export const DELETE_PAUSE_MS = intEnv("GUI_DEMO_DELETE_PAUSE_MS", 0, 0, 60_000);
 
 // 仅测试用:让新建工程在指定步骤失败,验证回滚
 export const FAIL_AT = process.env.GUI_DEMO_FAIL_AT ?? "";

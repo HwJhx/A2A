@@ -118,7 +118,7 @@ test("两个连接同时打开同一个 agent:都能收到输出,都不被挤掉
 
 test("agent 停止后后端丢弃输入(只读);重启后同一个连接自动接回、输入恢复", async () => {
   const dv = await connect("dv_uart");
-  assert.equal((await call("POST", `/api/projects/${P.id}/agents/dv_uart/stop`)).status, 200);
+  { const s = await call("POST", `/api/projects/${P.id}/agents/dv_uart/stop`); assert.equal(s.status, 200, JSON.stringify(s.json)); }
   await sleep(2600); // 输入闸门每 2 秒刷新
   send(dv, { t: "in", d: "echo GATELEAK7" });
   send(dv, { t: "in", d: "\r" });
@@ -126,7 +126,7 @@ test("agent 停止后后端丢弃输入(只读);重启后同一个连接自动�
   assert.ok(!capture("dv_uart").includes("GATELEAK7"), "agent 停止时输入不应进到窗口(pane 的 shell)");
   assert.ok(!dv.closed, "停止期间连接应保持");
 
-  assert.equal((await call("POST", `/api/projects/${P.id}/agents/dv_uart/restore`)).status, 200);
+  { const r = await call("POST", `/api/projects/${P.id}/agents/dv_uart/restore`); assert.equal(r.status, 200, JSON.stringify(r.json)); }
   await sleep(2600);
   send(dv, { t: "in", d: "AFTERRESTORE9" });
   assert.ok(await until(() => fakeLog("dv_uart").includes("AFTERRESTORE9"), 15000), "重启后输入应送到新的 agent");
@@ -158,7 +158,7 @@ test("GUI 停止 agent:请求一返回就发的输入也被丢弃(不进 pane �
   assert.ok(!shellPart.includes("GATELEAK8"), `停止返回后立刻发的输入不应进到 shell:\n${shellPart}`);
   assert.ok(!shellPart.includes("Q7Q"), `停止过程中的输入不应进到 shell:\n${shellPart}`);
   assert.ok(during > 0);
-  assert.equal((await call("POST", `/api/projects/${P.id}/agents/dv_uart/restore`)).status, 200);
+  { const r = await call("POST", `/api/projects/${P.id}/agents/dv_uart/restore`); assert.equal(r.status, 200, JSON.stringify(r.json)); }
   // 重启后栅栏解除会立刻触发一次查询,不必等满一个周期
   let ok = false;
   for (let i = 0; i < 20 && !ok; i++) {

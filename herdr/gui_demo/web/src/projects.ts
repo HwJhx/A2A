@@ -109,7 +109,11 @@ function openDelete(p: Project, grid: HTMLElement): void {
   const cancel = h("button", { type: "button" }, "取消");
   const dlg = modal(`删除工程"${p.name}"?`, [
     h("p", {}, "将停止并删除:该工程的所有 agent、herdr 会话 ", h("code", {}, p.session), "、broker,以及工程的 a2a 状态(消息记录、审计日志)。"),
-    h("p", {}, "不会删除项目路径 ", h("code", {}, p.path), "(里面是 agent 的工作文件)。"),
+    ...(p.topology
+      ? [h("p", {}, "还会删除拓扑文件 ", h("code", {}, p.topology), " 及其备份 topology.yaml.bak;",
+        "topology.yaml.lock(空的锁文件)保留。")]
+      : []),
+    h("p", {}, "不会删除项目路径 ", h("code", {}, p.path), " 下各 agent 的工作目录。"),
     msg,
   ], [cancel, ok]);
   cancel.addEventListener("click", () => dlg.close());

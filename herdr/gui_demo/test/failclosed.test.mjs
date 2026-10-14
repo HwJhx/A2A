@@ -47,7 +47,8 @@ test("删除工程时 herdr session list 失败:报错,工程与状态目录保�
   fail("session list");
   const del = await call("DELETE", `/api/projects/${P.json.id}`);
   assert.equal(del.status, 500, JSON.stringify(del.json));
-  assert.ok(fs.existsSync(path.join(b.home, "projects", P.json.id, "state", "topology.yaml")), "状态目录必须保留");
+  assert.ok(fs.existsSync(path.join(b.home, "projects", P.json.id, "state", "audit.jsonl")), "状态目录必须保留");
+  assert.ok(fs.existsSync(P.json.topology), "拓扑文件必须保留");
   fail();
   assert.ok(herdrSessionNames().includes(P.json.session));
   assert.deepEqual((await call("GET", "/api/projects")).json.map((p) => p.id), [P.json.id]);
@@ -166,7 +167,7 @@ test("同工程有手动启动的 broker(身份对不上):不回收它,GUI 的 b
   await stopBackend(first);
   // 用与 GUI 相同的环境手动起一个 broker,但没有 GUI 的身份标记
   const state = path.join(first.home, "projects", P.json.id, "state");
-  const env = { ...process.env, A2A_STATE_DIR: state, A2A_TOPOLOGY: path.join(state, "topology.yaml"), HERDR_SESSION: P.json.session,
+  const env = { ...process.env, A2A_STATE_DIR: state, A2A_TOPOLOGY: P.json.topology, HERDR_SESSION: P.json.session,
     PYTHONPATH: process.env.GUI_DEMO_A2A_SRC ?? "/Users/jhx/Documents/code/personal/pi_agent/A2A/herdr/a2a/src", PYTHONDONTWRITEBYTECODE: "1" };
   delete env.GUI_DEMO_BROKER_ID;
   const manual = spawn("python3", ["-m", "a2a.cli", "broker", "run", "--session", P.json.session], { env, stdio: "ignore" });

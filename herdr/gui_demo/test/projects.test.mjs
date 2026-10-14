@@ -31,8 +31,8 @@ function workDir() {
 }
 
 const A2A_SRC = process.env.GUI_DEMO_A2A_SRC ?? "/Users/jhx/Documents/code/personal/pi_agent/A2A/herdr/a2a/src";
-function a2aRaw(state, args) {
-  const env = { ...process.env, A2A_STATE_DIR: state, A2A_TOPOLOGY: path.join(state, "topology.yaml"),
+function a2aRaw(state, args, topology) {
+  const env = { ...process.env, A2A_STATE_DIR: state, A2A_TOPOLOGY: topology,
     PYTHONPATH: A2A_SRC, PYTHONDONTWRITEBYTECODE: "1" };
   return execFileSync("python3", ["-m", "a2a.cli", ...args], { env, encoding: "utf8" });
 }
@@ -69,14 +69,18 @@ test("新建两个工程:各自的 herdr 会话、宿主 tmux、broker、拓扑;
   // 拓扑:project_id = 工程 id,workspace_label = 工程名;两个工程互不串
   const stA = path.join(b.home, "projects", A.json.id, "state");
   const stB = path.join(b.home, "projects", B.json.id, "state");
-  const show = (st) => JSON.parse(a2aRaw(st, ["topology", "show"])).topology;
-  assert.equal(show(stA).project_id, A.json.id);
-  assert.equal(show(stA).workspace_label, "工程甲");
-  assert.equal(show(stB).project_id, B.json.id);
-  a2aRaw(stA, ["topology", "add-ip", "uart"]);
-  assert.deepEqual(show(stA).ips, ["uart"]);
-  assert.deepEqual(show(stB).ips, []);
-  a2aRaw(stA, ["topology", "remove-ip", "uart"]);
+  // 拓扑在各自的项目路径下(21 号文档 §11)
+  assert.equal(A.json.topology, path.join(pa, "topology.yaml"));
+  assert.equal(B.json.topology, path.join(pb, "topology.yaml"));
+  assert.ok(!fs.existsSync(path.join(stA, "topology.yaml")), "状态目录里不应再有拓扑");
+  const show = (st, topo) => JSON.parse(a2aRaw(st, ["topology", "show"], topo)).topology;
+  assert.equal(show(stA, A.json.topology).project_id, A.json.id);
+  assert.equal(show(stA, A.json.topology).workspace_label, "工程甲");
+  assert.equal(show(stB, B.json.topology).project_id, B.json.id);
+  a2aRaw(stA, ["topology", "add-ip", "uart"], A.json.topology);
+  assert.deepEqual(show(stA, A.json.topology).ips, ["uart"]);
+  assert.deepEqual(show(stB, B.json.topology).ips, []);
+  a2aRaw(stA, ["topology", "remove-ip", "uart"], A.json.topology);
 
   // 删除 A
   const del = await call("DELETE", `/api/projects/${A.json.id}`);

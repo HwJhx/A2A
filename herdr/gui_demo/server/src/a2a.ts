@@ -9,11 +9,16 @@ export const PROJECT_ID = /^p[0-9a-f]{8}$/;
 export interface ProjectRef {
   id: string;
   session: string;
+  /** 拓扑文件的绝对路径。新建的工程放在 <项目路径>/topology.yaml(21 号文档 §11);旧记录没有这个字段。 */
+  topology?: string;
 }
 
 export const projectDir = (id: string) => path.join(DATA_DIR, "projects", id);
 export const stateDir = (id: string) => path.join(projectDir(id), "state");
+/** 旧位置:状态目录里的 topology.yaml。旧格式的工程记录(没有 topology 字段)仍用它。 */
 export const topologyPath = (id: string) => path.join(stateDir(id), "topology.yaml");
+/** 工程实际使用的拓扑文件:记录里有就用记录里的,没有就用旧位置。 */
+export const topologyOf = (p: ProjectRef) => p.topology ?? topologyPath(p.id);
 export const sessionName = (id: string) => `${SESSION_PREFIX}${id}`;
 
 const PY_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../py");
@@ -28,7 +33,7 @@ export function projectEnv(p: ProjectRef): NodeJS.ProcessEnv {
     if (!k.startsWith("A2A_") && !k.startsWith("HERDR_")) env[k] = v;
   }
   env.A2A_STATE_DIR = stateDir(p.id);
-  env.A2A_TOPOLOGY = topologyPath(p.id);
+  env.A2A_TOPOLOGY = topologyOf(p);
   env.HERDR_SESSION = p.session;
   env.PYTHONPATH = A2A_SRC;
   env.PYTHONDONTWRITEBYTECODE = "1";
@@ -63,12 +68,12 @@ export function a2aError(r: RunResult): string {
   return parsed?.error ?? (r.stderr.trim() || r.stdout.trim() || `退出码 ${r.code}`);
 }
 
-/** 三者一致性校验:状态目录属于这个工程、拓扑 project_id 等于工程 id、会话名符合规则。 */
+/** 一致性校验:会话名符合规则、拓扑文件就是工程记录里的那个、拓扑 project_id 等于工程 id。 */
 export async function checkProject(p: ProjectRef): Promise<void> {
   projectEnv(p); // 会话名规则
   const r = await pyTool(p, ["show"]);
   if (r.code !== 0) throw new Error(`读不了工程 ${p.id} 的拓扑:${a2aError(r)}`);
   const info = parseJson(r.stdout) as { project_id?: string; path?: string } | undefined;
   if (info?.project_id !== p.id) throw new Error(`工程 ${p.id} 的拓扑 project_id 是 ${info?.project_id}`);
-  if (info?.path !== topologyPath(p.id)) throw new Error(`工程 ${p.id} 的拓扑路径不对:${info?.path}`);
+  if (info?.path !== topologyOf(p)) throw new Error(`工程 ${p.id} 的拓扑路径不对:${info?.path}`);
 }

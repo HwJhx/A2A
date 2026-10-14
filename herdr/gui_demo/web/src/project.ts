@@ -65,7 +65,8 @@ class AgentPage {
     root.append(
       back,
       h("header", { class: "page2-head" }, h("h1", {}, project.name),
-        h("p", { class: "muted" }, "herdr 会话 ", h("code", {}, project.session), " · 项目路径 ", h("code", {}, project.path))),
+        h("p", { class: "muted" }, "herdr 会话 ", h("code", {}, project.session), " · 项目路径 ", h("code", {}, project.path),
+          " · 拓扑 ", h("code", {}, project.topology ?? "(旧工程:在数据目录的 state/topology.yaml)"))),
       h("div", { class: "page2" }, this.nav,
         h("section", { class: "main" }, h("div", { class: "main-head" }, this.title, add), this.banner, this.list)),
     );

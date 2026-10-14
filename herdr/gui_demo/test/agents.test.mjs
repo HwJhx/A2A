@@ -140,7 +140,7 @@ test("队列里有未投递的消息时删除 IP:报错,agent 与窗口都保留
   sh("tmux", ["new-session", "-d", "-s", windowName("dv_q"), "sleep", "600"]);
   const brokerPid = (await call("GET", "/api/projects")).json.find((x) => x.id === P.id).broker.pid;
   const state = path.join(b.home, "projects", P.id, "state");
-  const env = { ...process.env, A2A_STATE_DIR: state, A2A_TOPOLOGY: path.join(state, "topology.yaml"), HERDR_SESSION: P.session,
+  const env = { ...process.env, A2A_STATE_DIR: state, A2A_TOPOLOGY: P.topology, HERDR_SESSION: P.session,
     PYTHONPATH: A2A_SRC, PYTHONDONTWRITEBYTECODE: "1", A2A_PROJECT_ID: P.id, A2A_ROLE: "sw", A2A_IP: "q",
     HERDR_PANE_ID: registry().sw_q.pane_id };
   process.kill(brokerPid, "SIGSTOP"); // 冻住 broker:消息留在队列里(进程没退出,不会被重启)

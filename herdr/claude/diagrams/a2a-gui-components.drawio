@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="组件图">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1300" pageHeight="820" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="browser" value="浏览器 · Web GUI(Mac)" style="swimlane;startSize=30;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="560" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="p1" value="页面一:工程列表&#xa;新建 / 删除 / 恢复工程" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="browser">
+          <mxGeometry x="20" y="40" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2" value="页面二:智能体页&#xa;增删 IP、停止 / 重启、xterm 终端" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="browser">
+          <mxGeometry x="300" y="40" width="240" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="projdir" value="工程目录(项目路径,如 ~/projects/SoC-A)" style="swimlane;startSize=30;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="700" y="20" width="560" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="topo" value="topology.yaml&#xa;角色、IP、通信边、消息模板(可动态修改)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="projdir">
+          <mxGeometry x="20" y="40" width="250" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="workdirs" value="agent 工作目录&#xa;dv_uart/ dv_spi/ sw_uart/ sw_spi/" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="1" parent="projdir">
+          <mxGeometry x="290" y="40" width="250" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="backend" value="GUI 后端(Node,VM)" style="swimlane;startSize=30;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="200" width="560" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="pm" value="工程管理&#xa;(一个工程 = 一个 herdr 会话)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="backend">
+          <mxGeometry x="20" y="40" width="240" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="tb" value="终端桥&#xa;窗口 tmux + node-pty + WebSocket" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="backend">
+          <mxGeometry x="300" y="40" width="240" height="55" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a2a" value="a2a(Python 后端,VM)" style="swimlane;startSize=30;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="700" y="200" width="560" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="router" value="Router&#xa;身份核验、推算目标" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;" vertex="1" parent="a2a">
+          <mxGeometry x="20" y="40" width="160" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="broker" value="broker&#xa;按目标排队、确认投递" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;" vertex="1" parent="a2a">
+          <mxGeometry x="200" y="40" width="160" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="life" value="生命周期&#xa;ip add / remove、恢复" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;" vertex="1" parent="a2a">
+          <mxGeometry x="380" y="40" width="160" height="55" as="geometry" />
+        </mxCell>
+
+        <mxCell id="session" value="herdr 会话(一个工程一个,如 guidemo_p1234abcd)" style="swimlane;startSize=30;html=1;fillColor=#f5f5f5;strokeColor=#333333;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="430" width="1220" height="330" as="geometry" />
+        </mxCell>
+        <mxCell id="ws" value="workspace:SoC-A(= 工程)" style="swimlane;startSize=30;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=13;" vertex="1" parent="session">
+          <mxGeometry x="20" y="40" width="1180" height="270" as="geometry" />
+        </mxCell>
+        <mxCell id="tabdv" value="tab:验证智能体(角色 dv)" style="swimlane;startSize=30;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="ws">
+          <mxGeometry x="20" y="40" width="560" height="210" as="geometry" />
+        </mxCell>
+        <mxCell id="dvuart" value="pane:dv_uart&#xa;fnx_dv + a2a 插件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="tabdv">
+          <mxGeometry x="20" y="50" width="240" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="dvspi" value="pane:dv_spi&#xa;fnx_dv + a2a 插件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="tabdv">
+          <mxGeometry x="300" y="50" width="240" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="tabsw" value="tab:软件智能体(角色 sw)" style="swimlane;startSize=30;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="ws">
+          <mxGeometry x="600" y="40" width="560" height="210" as="geometry" />
+        </mxCell>
+        <mxCell id="swuart" value="pane:sw_uart&#xa;fnx_sw + a2a 插件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="tabsw">
+          <mxGeometry x="20" y="50" width="240" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="swspi" value="pane:sw_spi&#xa;fnx_sw + a2a 插件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="tabsw">
+          <mxGeometry x="300" y="50" width="240" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" value="HTTP API" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="p1" target="pm">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="WebSocket" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="p2" target="tb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="调用 a2a 命令(建工程、增删 IP…)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="pm" target="life">
+          <mxGeometry x="-0.35" relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="20" y="267" />
+              <mxPoint x="20" y="170" />
+              <mxPoint x="1160" y="170" />
+            </Array>
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e4" value="创建 workspace / tab / pane&#xa;并在 pane 里启动 agent" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.92;entryY=0;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="life" target="session">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="herdr agent attach&#xa;(每个 agent 一个窗口 tmux)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.344;entryY=0;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="tb" target="session">
+          <mxGeometry x="-0.55" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="a2a_send(dv_done)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;strokeColor=#9673a6;strokeWidth=2;fontColor=#9673a6;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="dvuart" target="router">
+          <mxGeometry x="-0.3" relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="220" y="395" />
+              <mxPoint x="800" y="395" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e7" value="herdr agent prompt&#xa;投递给同 IP 的 sw_uart" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;strokeColor=#9673a6;strokeWidth=2;fontColor=#9673a6;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="broker" target="swuart">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="980" y="395" />
+              <mxPoint x="860" y="395" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" value="读拓扑" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.32;entryY=1;entryDx=0;entryDy=0;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="router" target="topo">
+          <mxGeometry x="0.55" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="legend" value="&lt;b&gt;概念对应&lt;/b&gt;:workspace = 一个工程;tab = 一类智能体(角色);pane = 某个 IP 的一个 agent,名字固定为“角色_IP”。&lt;br&gt;通信只能沿拓扑里的边、在同一 IP 内进行(dv_uart ↔ sw_uart),不会跨 IP。" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="770" width="1220" height="50" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -4,7 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { a2a, a2aError, checkProject, parseJson, projectDir, pyTool, sessionName, stateDir } from "./a2a.js";
 import { brokerStatus, reapOrphans, startBroker, stopBroker } from "./broker.js";
-import { DATA_DIR, FAIL_AT, FAIL_ONCE, HOME, LAUNCHERS, PROJECTS_FILE } from "./config.js";
+import { DATA_DIR, DELETE_PAUSE_MS, FAIL_AT, FAIL_ONCE, HOME, LAUNCHERS, PROJECTS_FILE } from "./config.js";
+import { sleep } from "./proc.js";
 
 const failedOnce = new Set<string>(); // 仅测试用:GUI_DEMO_FAIL_ONCE 每个步骤只失败一次
 import { herdrRunning, herdrSessions, hostTmux, killTmux, startHerdr, stopHerdr, tmuxSessions, windowTmuxPrefix } from "./herdr.js";
@@ -16,6 +17,8 @@ export interface Project {
   session: string;
   createdAt: string;
   description?: string;
+  /** 拓扑文件的绝对路径;旧记录没有这个字段(拓扑在状态目录里) */
+  topology?: string;
 }
 
 export class UserError extends Error {
@@ -103,6 +106,31 @@ function checkPath(raw: unknown): string {
   return real;
 }
 
+/** 拓扑文件放在 <项目路径>/topology.yaml(21 号文档 §11)。topology.yaml、.bak 已存在就报错(可能属于别的工程,
+ *  或上次删除没清掉);.lock 是 a2a 的空锁文件,存在时必须是普通文件(加锁会跟随软链接),沿用它、从不删除。 */
+function checkTopologySlot(projectPath: string): string {
+  const file = path.join(projectPath, "topology.yaml");
+  for (const p of [file, `${file}.bak`]) {
+    if (lexists(p)) throw new UserError(`项目路径下已有 ${path.basename(p)}(可能属于别的工程,或删除时没清掉),请删掉或换一个路径`, 409);
+  }
+  const lock = `${file}.lock`;
+  if (lexists(lock) && !fs.lstatSync(lock).isFile()) {
+    throw new UserError(`项目路径下的 topology.yaml.lock 不是普通文件,请删掉或换一个路径`, 409);
+  }
+  return file;
+}
+
+/** 只有"不存在"(ENOENT)才返回 false;权限等其他错误报错,不往下做(fail-closed)。 */
+function lexists(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new UserError(`检查 ${p} 失败:${(e as Error).message}`, 500);
+  }
+}
+
 function checkName(raw: unknown): string {
   const name = typeof raw === "string" ? raw.trim() : "";
   // eslint-disable-next-line no-control-regex
@@ -126,9 +154,10 @@ export function createProject(input: { name?: unknown; path?: unknown; descripti
     const description = checkDescription(input.description);
     if (loadProjects().some((p) => p.name === name)) throw new UserError(`已有同名工程:${name}`);
     const projectPath = checkPath(input.path);
+    const topologyFile = checkTopologySlot(projectPath);
     const id = `p${crypto.randomBytes(4).toString("hex")}`;
-    const project: Project = { id, name, path: projectPath, session: sessionName(id), createdAt: new Date().toISOString(),
-      ...(description ? { description } : {}) };
+    const project: Project = { id, name, path: projectPath, session: sessionName(id), topology: topologyFile,
+      createdAt: new Date().toISOString(), ...(description ? { description } : {}) };
     if ((await herdrSessions()).has(project.session)) throw new UserError(`herdr 会话 ${project.session} 已存在`, 409);
 
     const undo: Array<() => Promise<unknown>> = [];
@@ -151,6 +180,12 @@ export function createProject(input: { name?: unknown; path?: unknown; descripti
         },
         ips: [], edges: EDGES,
       };
+      // 先登记回滚再写拓扑:init 可能在文件已原子写入之后才失败(比如目录 fsync 出错)。
+      // 回滚时在锁内核对 project_id 是本次的新 id 才删,文件不存在也算成功;.lock 不删。
+      undo.push(async () => {
+        const r = await pyTool(project, ["remove", id, "--missing-ok"]);
+        if (r.code !== 0) throw new Error(`删不了本次建的拓扑 ${topologyFile}:${a2aError(r)}`);
+      });
       const init = await pyTool(project, ["init", JSON.stringify(topology)]);
       if (init.code !== 0) throw new Error(`写拓扑失败:${a2aError(init)}`);
       await checkProject(project);
@@ -183,11 +218,20 @@ export function createProject(input: { name?: unknown; path?: unknown; descripti
   });
 }
 
-/** 删除工程:停 broker → purge 所有 agent → 关窗口 tmux → 停删 herdr 会话 → 删状态目录 → 去掉登记。不删项目路径。 */
+/** 删除工程(21 号文档 §11.2):
+ *  1. 只读归属检查:项目路径下的 topology.yaml(及 .bak)属于本工程,否则什么都不动;
+ *  2. 停 broker → purge 所有 agent → 关窗口 tmux → 停删 herdr 会话;
+ *  3. 在 a2a 的锁内再核对并删 topology.yaml(.bak 对得上才删,否则警告;.lock 不删);核对不过就保留状态与记录;
+ *  4. 删状态目录 → 去掉登记。不删项目路径下的 agent 工作目录。
+ *  旧格式的工程(拓扑在状态目录里)跳过 1、3,拓扑随状态目录一起删。 */
 export function deleteProject(id: string): Promise<{ warnings: string[] }> {
   return serial(async () => {
     const project = getProject(id);
     const warnings: string[] = [];
+    if (project.topology) {
+      const r = await pyTool(project, ["check", id]);
+      if (r.code !== 0) throw new UserError(`${a2aError(r)};工程未删除`, 409);
+    }
     await stopBroker(id);
     if (await herdrRunning(project.session)) {
       const list = await a2a(project, ["agent", "list"]);
@@ -205,6 +249,17 @@ export function deleteProject(id: string): Promise<{ warnings: string[] }> {
       await stopHerdr(id, project.session);
     } catch (e) {
       throw new UserError(`删除未完成,工程与状态目录保留以便重试:${(e as Error).message}`, 500);
+    }
+    if (project.topology) {
+      if (DELETE_PAUSE_MS) {
+        console.log(`测试:删除停顿 ${id}`); // 测试据此在"归属检查之后、删拓扑之前"替换文件
+        await sleep(DELETE_PAUSE_MS);
+      }
+      const r = await pyTool(project, ["remove", id]);
+      if (r.code !== 0) {
+        throw new UserError(`${a2aError(r)};拓扑文件没删,工程记录与状态目录保留(会话已停,可在卡片上"恢复")`, 409);
+      }
+      warnings.push(...((parseJson(r.stdout) as { warnings?: string[] } | undefined)?.warnings ?? []));
     }
     fs.rmSync(projectDir(id), { recursive: true, force: true });
     saveProjects(loadProjects().filter((p) => p.id !== id));

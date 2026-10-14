@@ -33,7 +33,15 @@ gui_demo/bin/deploy-vm.sh
 
 数据目录 `~/.a2a_gui_demo/`(权限 0700):`projects.json`(工程列表)、`projects/<id>/state/`(各工程的 a2a 状态)、`server.log`、`server.pid`(内容是"pid 启动时间",`start` / `stop` 核对身份,陈旧的不会被误认)、`admin.sock`(`login-url` 用)。
 
-`bin/start` 默认最多等 120 秒就绪(工程多时启动要逐个拉起 broker),可用 `GUI_DEMO_START_TIMEOUT=秒` 调整;超时会结束后台进程再报错。删除工程会删它的状态目录,**不删项目路径**(里面是 agent 的工作目录)。
+`bin/start` 默认最多等 120 秒就绪(工程多时启动要逐个拉起 broker),可用 `GUI_DEMO_START_TIMEOUT=秒` 调整;超时会结束后台进程再报错。
+
+**拓扑文件(角色、IP、通信边、消息模板)在工程的项目路径下**:`<项目路径>/topology.yaml`,旁边有 a2a 生成的 `topology.yaml.bak`(上一版备份)和 `topology.yaml.lock`(空锁文件)。页面二标题下方显示它的路径。动态修改方法见 `验收步骤.md` §8。
+
+- 新建工程时项目路径下已有 `topology.yaml` 或 `.bak` 会报错(不覆盖,也挡住两个工程共用一个路径);`.lock` 必须是普通文件。
+- 删除工程会删掉它的状态目录、`topology.yaml` 与 `.bak`(核对过 `project_id` 属于本工程才删),**保留 `.lock` 和各 agent 的工作目录**。
+- agent 的工作目录就在项目路径下,模型用 bash 能读到、改到 `topology.yaml`(改了会被 a2a 自动重新加载);跨 IP 发消息仍然做不到。
+- 项目路径若是 git 仓库:提交 `topology.yaml`,把 `topology.yaml.bak`、`topology.yaml.lock` 加进 `.gitignore`。
+- 这项改动之前建的工程,拓扑仍在旧位置 `~/.a2a_gui_demo/projects/<id>/state/topology.yaml`,照常可用。
 
 ## 使用提示
 
@@ -69,7 +77,7 @@ cd ~/gui_demo_run && npm test
 | `server/src/config.ts` | 配置(环境变量 `GUI_DEMO_*`,大多只给测试用) |
 | `server/src/http.ts` | HTTP 路由、静态文件、认证与 Origin 校验、WebSocket 入口 |
 | `server/src/auth.ts`、`admin.ts` | 一次性令牌与会话 cookie;单实例锁与 admin.sock |
-| `server/src/a2a.ts`、`server/py/topology_tool.py` | 工程环境(`A2A_STATE_DIR` 等)与 a2a 调用;建拓扑 |
+| `server/src/a2a.ts`、`server/py/topology_tool.py` | 工程环境(`A2A_STATE_DIR`、`A2A_TOPOLOGY` 等)与 a2a 调用;建拓扑、核对归属、在 a2a 的锁内删拓扑 |
 | `server/src/projects.ts`、`herdr.ts`、`broker.ts` | 工程新建 / 删除 / 恢复;herdr 会话与 tmux;broker 子进程 |
 | `server/src/agents.ts`、`fence.ts` | agent 新增 / 停止 / 重启 / 删除 IP;操作期间撤销终端写权限 |
 | `server/src/windows.ts`、`terminal.ts` | 每个 agent 的窗口 tmux;终端桥(node-pty、输入闸门、名额) |

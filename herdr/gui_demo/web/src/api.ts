@@ -13,6 +13,7 @@ export interface Project {
   session: string;
   createdAt: string;
   description?: string;
+  topology?: string;
   herdr?: boolean | null;
   broker?: { running: boolean; pid: number | null; restarts: number };
 }
