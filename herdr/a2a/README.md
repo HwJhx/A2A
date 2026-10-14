@@ -226,7 +226,29 @@ a2a agent recover --session <会话> [--ip gpio] [--include-stopped]
 
 在 a2a 管理的 fnx pane 里生效(由 `a2a agent spawn` 注入的 `A2A_*` 环境变量判断),普通使用 fnx 时什么都不做。
 
-安装(软链接到仓库里的同一个文件,修改插件后所有智能体下次启动即生效;实测 fnx 能加载软链接形式的扩展,启动画面 `[Extensions]` 里显示为 `a2a.ts`):
+有两种安装方式,**同一个 fnx 只能用其中一种**(两种都装会加载两份插件:`a2a_send` 注册两次,working / idle 也会上报两次)。防护:`a2a plugin status` 同时读 `<agent 目录>/settings.json` 的 `packages`,指向本仓库的在线包(各种 git 写法,或解析到本仓库的本地路径)报为 `online_package`,两种都装时给出 `duplicate`;已有在线包时 `a2a plugin install` 拒绝;settings 读不了时 install 也拒绝(fail-closed)。**反方向挡不住**:先装了软链接、再用 `fnx_dv install` 在线安装,pi 的命令不经过 a2a,只能靠 `a2a plugin status` 发现,请先 `a2a plugin uninstall`。
+
+pi 还会加载**项目级**配置:fnx 启动目录下的 `.forenyx/`(fnx 的 configDir;`settings.json` 的 `packages`、`git/` 与 `npm/` 里的安装副本、`extensions/` 里的扩展,装法是 `fnx_dv install -l …`)。软链接装在 agent 级,对所有项目生效,a2a 无法知道有哪些项目,所以**不带参数时只保证 agent 级**(`status` 输出 `project_scope` 提示);用 `--project-dir <项目目录>`(可重复)让 `status` / `install` 一并检查这些项目:项目级已有本插件时 `install` 拒绝,`status` 列出 `project_packages`,与 agent 级同时存在时报 `duplicate`。建议:不要在项目级安装本插件。
+
+检查是**宁多勿少**的,可能误报、保守地拒绝安装(不会因此重复加载):`extensions/` 里的入口按 pi 两套发现规则的并集算(fnx 实际用的包管理器规则,加上 SDK loader 的规则;点开头的文件、fnx 忽略规则排除的文件也算);在线安装副本按 `package.json` 的 name(`a2a-pi-plugin`)识别,无关的同名包也会被当成本插件;`git/` 下只扫到 4 层,更深的 git 命名空间镜像(如多级子组)扫不到。误报时请人工确认后处理。
+
+**正式部署:在线安装(pi 包)**。仓库根目录的 `package.json` 是 pi 包清单(`"pi": {"extensions": ["./herdr/a2a/pi-extension/a2a.ts"]}`)。每个 fnx 有自己的 agent 目录,要**分别安装**:
+
+```bash
+fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
+fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
+fnx_dv list                                             # 查看已安装的包
+fnx_dv install git:github.com/HwJhx/A2A@<新标签>        # 升级到新版本
+fnx_dv remove  <安装时的来源>                           # 卸载(带标签时的确切写法待推送后实测确认)
+```
+
+- pi 把仓库克隆到 `<agent 目录>/git/github.com/HwJhx/A2A`,并在 `<agent 目录>/settings.json` 的 `packages` 里记一条;按标签固定版本,`fnx_dv update --extensions` 不会把它挪到新标签。
+- git 标签是可以被移动的;要严格可复现,可改用提交号固定版本(`fnx_dv install git:github.com/HwJhx/A2A@<commit SHA>`),或在 GitHub 上保护 release 标签。
+- 只装插件(TypeScript)这一半。插件发送时调用的 Python 后端(`a2a send`)的位置来自 pane 的环境变量(`A2A_SRC`、`A2A_PYTHON`,由 `a2a agent spawn` 注入),不随插件安装;**插件与后端的版本要对应**。
+- 插件只用 Node 自带模块,没有 npm 依赖。
+- 推送前可用本地路径验证清单:`fnx_dv install /path/to/A2A`(不复制,只在 settings 里记路径),验证完 `fnx_dv remove /path/to/A2A`。2026-10-14 在 VM 上这样验证过:fnx_dv 启动画面 `[Extensions]` 里显示 `a2a.ts`。
+
+**开发与自动测试:软链接**(链到仓库里的同一个文件,修改插件后所有智能体下次启动即生效;实测 fnx 能加载软链接形式的扩展,启动画面 `[Extensions]` 里显示为 `a2a.ts`):
 
 ```bash
 a2a plugin install   --agent-dir ~/.forenyx/fnx_dv   # 建 agent/extensions/a2a.ts -> pi-extension/a2a.ts

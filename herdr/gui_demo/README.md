@@ -43,6 +43,15 @@ gui_demo/bin/deploy-vm.sh
 - 项目路径若是 git 仓库:提交 `topology.yaml`,把 `topology.yaml.bak`、`topology.yaml.lock` 加进 `.gitignore`。
 - 这项改动之前建的工程,拓扑仍在旧位置 `~/.a2a_gui_demo/projects/<id>/state/topology.yaml`,照常可用。
 
+## 前提:fnx 装好 a2a 插件
+
+GUI 建 agent 时不会安装插件。要让 agent 用 `a2a_send` 互发消息,先在 VM 上给 fnx_dv、fnx_sw **分别**在线安装(详见 `../a2a/README.md` 的"pi 插件"一节):
+
+```bash
+~/.forenyx/fnx_dv/bin/fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
+~/.forenyx/fnx_sw/bin/fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
+```
+
 ## 使用提示
 
 - 新增 IP 会启动真实的 fnx_dv / fnx_sw;**启动本身不调用模型**。只有在终端里输入并按回车,或 agent 之间互发消息时才会调用模型。

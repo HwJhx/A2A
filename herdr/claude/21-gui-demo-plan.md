@@ -686,3 +686,106 @@ a2a 本来就把拓扑和状态分开:`A2A_TOPOLOGY` 与 `A2A_STATE_DIR` 是两�
 | 验收实例不受影响 | — | 原 pid 仍监听 8765、返回 200 | 一致 |
 
 结论:全部一致。部署到验收实例。
+
+## 12. a2a 插件改为在线安装(2026-10-14)
+
+### 12.1 背景
+
+验收时发现 VM 上的 fnx_dv、fnx_sw 没装 a2a 插件:自动测试按"不改用户环境"的规矩,开始时用 `a2a plugin install`(软链接)临时装上、结束时卸载;GUI 建 agent 也不装插件。没有插件时 fnx 没有 `a2a_send` 工具,用户输入 `/a2a dv_done`(fnx 里没有这个斜杠命令,pi 把它当普通提示词交给模型)后,模型自己翻 VM 上的文件、用 bash 调 `python3 -m a2a.cli send` 发了出去(pane 环境变量里有 agent 身份,Router 照样放行),约 45 秒、多次模型调用;sw_spi 的模型还用到了我测试时留下的旧代码快照 `~/a2a_snap`(已按用户同意删除)。
+
+用户要求:正式部署按 pi 生态的方式**在线安装**插件;仓库是公开的 `github.com/HwJhx/A2A`,版本标签 `a2a-plugin-v0.1.0`。
+
+### 12.2 改动
+
+- 仓库根目录新增 `package.json`(pi 包清单):`keywords: ["pi-package"]`、`"pi": {"extensions": ["./herdr/a2a/pi-extension/a2a.ts"]}`、`private: true`、无依赖(插件只用 Node 自带模块)。
+- 安装方式(fnx 把 pi 的包管理命令原样暴露:`fnx_dv install / remove / list / update`):每个 fnx 有自己的 agent 目录,**分别安装** `fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0`、`fnx_sw install …`。
+- `a2a plugin install`(软链接)保留,用于开发与自动测试;两种方式不能同时用在同一个 fnx 上(会加载两份插件)。
+- 文档:`herdr/a2a/README.md` 的"pi 插件"一节、`gui_demo/README.md` 新增"前提:fnx 装好 a2a 插件"、`gui_demo/验收步骤.md` §0 第 4 条。
+
+### 12.3 验证
+
+- VM 能访问 GitHub(`git ls-remote https://github.com/HwJhx/A2A.git` 成功);仓库里没有大文件(视频、录屏未纳入 git)。
+- 本地路径验证(不联网、不调用模型):备份 `~/.forenyx/fnx_dv/agent/settings.json` → `fnx_dv install /Users/…/A2A`:settings 的 `packages` 多一条,`fnx_dv list` 列出;用 8767 开发后端建工程、新增真实 fnx_dv 的 `dv_uart`,启动画面 `[Extensions]` 里显示 `a2a.ts` → 删工程、停后端 → `fnx_dv remove /Users/…/A2A`(之后 settings 留下空的 `"packages": []`)→ 用备份还原,与安装前逐字节一致。
+- **未验证**:从 GitHub 按标签在线安装(要等用户提交、打标签、推送);带标签时 `fnx_dv remove` 的确切写法;插件版本与后端版本不一致时的表现。
+
+### 12.4 已知限制
+
+- 在线安装只装插件;Python 后端位置来自 pane 环境变量(`a2a agent spawn` 注入),版本要对应。
+- (已改,见 §12.5)`a2a plugin status` 原先只检查 `extensions/` 目录,看不到在线安装的那份。
+- 模型仍可用 bash 绕过插件直接调 a2a 命令行(只要启动时没关内置工具);Router 只核对发送方身份,跨 IP 仍不可能。
+
+### 12.5 Codex 审核在线安装(2026-10-14)
+
+阻断无。确认:根目录 `package.json` 的单文件 `pi.extensions` 清单符合 pi 0.79.10 规则、只加载 A2A 插件;git 安装时 `npm install` 在克隆目录运行,当前无依赖、脚本、workspace,不会装嵌套的 GUI 包;`private` / `UNLICENSED` 不影响;fnx 命令与升级说明准确;pi 按仓库身份匹配 remove 来源,带标签的来源可用于 remove(推送后仍实测)。
+
+| # | 问题 | 判断 | 处理与验证 |
+| --- | --- | --- | --- |
+| 应修 | `plugin.py` 的 status / install 只检查 `extensions/`,不看 settings 的 `packages`:先在线安装再查 status 显示 `not_installed`,随后软链接 install 成功 → 两份插件同时加载 | 真问题 | 新增 `online_packages()`:读 settings 的 `packages`(字符串或带 `source` 的对象),识别指向本仓库的来源——各种 git 写法统一成"主机/路径"比较,本地路径按 settings 所在目录**按字面**拼接规整后取真实路径与仓库根目录 / 插件文件比较;settings 读不了或格式不对抛错(fail-closed)。status 报 `online_package`、两种都装时报 `duplicate`;已有在线包时 install 拒绝。反方向(先软链接后在线安装)挡不住,README 写明。单元测试新增 6 个(git 各种写法与对象形式、本地绝对 / 相对路径、无关包不拦、两份并存报 duplicate、settings 坏了 fail-closed);Mac 629 个通过(51 个需要 herdr 的跳过);VM 上插件测试 + 真实 fnx 的 `RealFnxPlugin` 19 个通过。真实 fnx_dv 实测:在线安装后 status 为 `online_package`、软链接 install 被拒(退出码 6、没建 `extensions/`),之后 settings 逐字节还原。 |
+| 将来考虑 | 标签可以被移动 | 是 | README 写明:严格可复现可用提交号固定,或保护 release 标签 |
+
+测试自己的问题:第一次相对路径用例失败——测试临时目录在 `/var`(指向 `/private/var` 的软链接)下,我用 `Path.resolve()` 先展开软链接再处理 `..`,层数算错;改为与 pi 一致的"按字面拼接规整、再取真实路径"。
+
+### 12.6 Codex 复核在线安装修改(2026-10-14)
+
+阻断无。应修 2 项,都是真问题:
+
+| # | 问题 | 处理与验证 |
+| --- | --- | --- |
+| 1 | `_git_identity` 手工归一化不覆盖 pi 接受的全部写法(HTTPS 的 `#tag`、含斜杠的 `@branch/name`、带端口的 SSH、大写协议),会漏检 | 查了 pi 0.79.10 的实现(`parseGitUrl` 用 hosted-git-info,还处理 scp 写法、`#ref`、`@ref` 等),决定**不再追写法**:主要改为**按安装结果识别**——扫描 pi 实际的安装位置 `<agent>/git/**`(克隆)与 `<agent>/npm/node_modules/*`,`package.json` 的 `name` 等于本仓库的 `a2a-pi-plugin` 就算已在线安装(跳过克隆里的 `node_modules`、`.git`),与来源写法无关。按写法识别保留作补充,并补上:协议不分大小写、去掉 `#ref`、`@ref` 只截仓库名之后(分支里的斜杠在后面的段)、端口、路径只取"用户/仓库"两段。 |
+| 2 | 所有 `scheme://` 都当远程,pi 把 `file://` 当本地路径,会漏检;本地路径 `resolve` 抛 `OSError` 时 `continue` | `file://` 先转成本地路径再按本地规则判断;本地路径改用 `os.path.realpath`(不会因路径不存在而抛错),不再有"出错就跳过"的分支;目标目录的 `package.json` name 为 `a2a-pi-plugin` 也算本仓库。settings 读不了仍拒绝(fail-closed)。 |
+
+测试:单元测试改 / 增 4 个(Codex 列的各种写法、`file://` 指向仓库与插件文件、按安装副本识别——git 克隆、别的主机上的镜像、npm 安装,来源写成解析不了的怪写法也能认出;别的包及其依赖里的同名包不算;`package.json` 的 name、`pi.extensions`、关键字与代码里的常量一致)。Mac 632 个通过(51 个需 herdr 的跳过);VM 插件测试 + `RealFnxPlugin` 22 个通过。变异检查 4 个都被抓到:不扫描已安装副本、git 识别不去 `#标签`、不处理 `file://`、协议区分大小写。真实 fnx_dv:`fnx_dv install file:///Users/…/A2A`(pi 在 settings 里存成相对路径)→ `a2a plugin status` 为 `online_package`、软链接 install 被拒 → settings 逐字节还原。
+
+### 12.7 Codex 第三轮复核(2026-10-14)
+
+阻断无。确认扫描深度:正式 GitHub 路径 `<agent>/git/github.com/HwJhx/A2A` 深 3,npm 普通 / scoped 包深 1 / 2,`max_depth` 都覆盖。
+
+| # | 问题 | 判断 | 处理与验证 |
+| --- | --- | --- | --- |
+| 应修 | 只查 agent 级;pi 还加载项目级 `<cwd>/<configDir>/settings.json` 的 packages 与 `.../git`、`.../npm` 里的副本,项目级已在线安装时再装 agent 级软链接,该项目里仍加载两份 | 真问题(查了 pi 0.79.10:`projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json")`,`getGitInstallRoot / getNpmInstallRoot("project") = join(cwd, CONFIG_DIR_NAME, …)`;fnx_dv、fnx_sw 的 configDir 都是 `.forenyx`,只看 cwd、不向上找) | 软链接在 agent 级、对所有项目生效,a2a 不知道有哪些项目,所以:`status` / `install` 新增可重复的 `--project-dir`,按 pi 同样的布局检查 `<项目>/<configDir>/`(configDir 取 fnx `libexec/package.json` 的 `piConfig.configDir`,缺省 `.pi`)——settings 的 packages、`git/`、`npm/` 副本、`extensions/` 里的 `a2a.ts` 与注册 `a2a_send` 的扩展;项目级有本插件时 install 拒绝,status 列 `project_packages`、两级同时存在报 `duplicate`;项目目录不存在或 settings 读不了时拒绝(fail-closed)。不带 `--project-dir` 时 status 输出 `project_scope` 提示"未检查项目级",README 写明只保证 agent 级。单元测试新增 4 个、CLI 测试加 `--project-dir` 用例;Mac 全套通过(51 个需 herdr 的跳过);VM 插件测试 + `RealFnxPlugin` 26 个通过;变异 3 个都被抓到(install 不查项目级、项目级不看 extensions、configDir 固定 `.pi`)。真实 fnx_dv:在临时目录 `fnx_dv install -l <仓库>`(写到 `<临时目录>/.forenyx/settings.json`)→ `status --project-dir` 列出、`install --project-dir` 被拒;agent 级 settings 未变,临时目录已删。 |
+| 将来考虑 | `max_depth=4` 不覆盖任意深的 git 命名空间(如 GitLab 子组);按 `package.json` name 识别可能把无关同名包误判、保守拒绝 | 是,影响小 | 记录;需要时再核对 `repository` 字段 / `pi.extensions` 清单 |
+
+### 12.8 Codex 第四轮复核(2026-10-14)
+
+阻断无;认可"不带 `--project-dir` 只保证 agent 级"的边界。
+
+| # | 问题 | 判断 | 处理 |
+| --- | --- | --- | --- |
+| 应修 | 项目级相对来源 pi 按项目 cwd 解析,代码按 `<项目>/<configDir>` 解析,`../A2A` 会漏检 | **不成立**(按 fnx 自带的 pi 0.79.10 核实):`getBaseDirForScope(scope)` 对 `"project"` 返回 `join(this.cwd, CONFIG_DIR_NAME)`、对 `"user"` 返回 `agentDir`;写 settings(`normalizePackageSourceForSettings`:`relative(baseDir, …)`)与加载(`resolveLocalExtensionSource(…, baseDir)`、已安装路径查找 `resolvePathFromBase(parsed.path, baseDir)`)都用它。§12.7 的真实实测也对得上:在 `/tmp/a2a_projlvl_xc` 项目级安装后 settings 存的是 `../../../Users/…`(3 层,从 `<项目>/.forenyx` 算;从项目根目录算只要 2 层)。 | 不改代码;补回归测试固定这一规则:settings 写 `../A2A_link`,只在 `<项目>/../A2A_link` 建指向本仓库的软链接时不算(那是"按项目根目录"的解释),在 `<项目>/A2A_link` 建时才算。 |
+| 将来考虑 | 同 §12.7 | — | 已记录 |
+
+### 12.9 Codex 第五轮复核(2026-10-14)
+
+上一轮"项目级相对路径基准"一项 Codex 确认关闭(它看错了返回值;基准确为 `<项目>/<configDir>`)。不带 `--project-dir` 只保证 agent 级的边界认可。
+
+| # | 问题 | 判断 | 处理与验证 |
+| --- | --- | --- | --- |
+| 应修 | `_conflicts` 只扫 `extensions/` 顶层 `.ts/.js`;pi 还加载 `extensions/<子目录>/index.ts`、子目录 `package.json` 的 `pi.extensions` 入口,漏检后仍可装软链接造成重复加载 | 真问题,且 agent 级与项目级共用此函数,两处都漏(核对 pi 0.79.10 `discoverExtensionsInDir` / `resolveExtensionEntries`:顶层 `.ts/.js` 文件含软链接;子目录含目录软链接,按 清单入口 → `index.ts` → `index.js`;`extensions/` 本身有清单或 index 时只用它们) | 新增 `_dir_entries`、`_extension_entries` 按上述规则枚举入口;`_conflicts` 对每个入口判断"真实路径是本仓库插件"或"文本注册 `a2a_send`";宁多勿少(不跳过点开头条目)。`a2a.ts` 本身仍由调用方按 state 判断。单元测试新增 2 个(子目录 index.ts / index.js / 子目录清单 / extensions 本身清单 × agent 级与项目级各一遍;子目录里软链接到本仓库插件的 index.ts;pi 不加载的嵌套文件与 .md 不算)。Mac 639 个通过(51 个需 herdr 的跳过);VM 插件测试 + `RealFnxPlugin` 29 个通过;变异 4 个都被抓到(不看子目录、不看 extensions 本身清单、不看 index.js、不认本仓库插件真实路径)。 |
+
+### 12.10 Codex 第六轮复核(2026-10-14)
+
+Codex 确认项目级相对路径基准一项关闭。
+
+| # | 问题 | 判断 | 处理与验证 |
+| --- | --- | --- | --- |
+| 应修 | `_extension_entries` 对 `extensions/` 根目录有 index / 清单时提前返回;pi 的 `discoverExtensionsInDir` 不看根目录清单、总是加载顶层全部 `.ts/.js` → `index.ts` + `other.ts` 并存时漏检 `other.ts`;根清单测试可能误报 | **部分成立**。核对 fnx 内 pi 0.79.10:fnx CLI 实际走包管理器的 `collectAutoExtensionEntries`(agent 级与项目级 `extensions/` 都是,见 `addResources("extensions", collectAutoExtensionEntries(…))`),它**先**看根目录清单 / index、有则只用它们——即原实现与实际运行路径一致,`other.ts` 实际不会加载,根清单也不是误报;Codex 引用的 `discoverExtensionsInDir` 只被 `discoverAndLoadExtensions` 调用,而后者在 fnx 里没有调用方(SDK 导出接口)。但两套规则都是 pi 的正式行为,取并集只会多拒绝、不会漏检。 | 改为两套规则的并集:根目录清单 / index 入口 + 顶层全部 `.ts/.js` + 各子目录入口。根清单测试保留(对实际路径成立)。新增回归 `index.ts` + `other.ts` 并存时 `other.ts` 被检出。Mac 全套通过(51 个需 herdr 的跳过);VM 插件测试 + `RealFnxPlugin` 30 个通过;变异 2 个都被抓到(恢复"根有 index 就提前返回"、不看根目录清单)。 |
+
+### 12.11 Codex 第七轮复核(2026-10-14):可以提交
+
+阻断无、应修无。Codex 按本机 pi 0.79.10 源码确认:fnx 包管理器的 `collectAutoExtensionEntries` 先解析 `extensions/` 根目录清单或 index,有入口就返回,否则扫描顶层 `.ts/.js` 与一级子目录入口,agent / project 两级都调用它;并集实现与之一致,也覆盖 SDK `discoverExtensionsInDir` 的规则。前提"接受并记录保守误报边界"已写入 `herdr/a2a/README.md`:并集扫描会把 fnx 忽略、SDK loader 可能发现的入口(点开头、忽略规则排除的文件)也算冲突;按 `package.json` name 识别可能误判无关同名包;`git/` 只扫 4 层。这些都只会保守地拒绝安装,不会造成重复加载。
+
+### 12.12 codex-test 交叉验证(2026-10-14)
+
+独立复测环境:OrbStack VM `ubuntu` / Ubuntu 22.04.5 LTS / Python 3.10.12。运行前 Mac 与 VM 的 `plugin.py`、`cli.py`、`test_plugin.py`、`test_integration_lifecycle.py`、根 `package.json` SHA-256 一致；未修改工作区实现或测试文件。
+
+| 项目 | 结果 | 证据 |
+| --- | --- | --- |
+| VM 插件单元 + 真实 fnx 生命周期 | 通过，30/30，失败 0、跳过 0 | 从 `/mnt/mac/Users/jhx/Documents/code/personal/pi_agent/A2A/herdr/a2a` 清除项目下 `__pycache__` 后运行 `PYTHONPATH=/mnt/mac/Users/jhx/Documents/code/personal/pi_agent/A2A/herdr/a2a/src PYTHONDONTWRITEBYTECODE=1 A2A_INTEGRATION=1 A2A_INTEGRATION_FNX=1 python3 -m unittest -v tests.test_plugin tests.test_integration_lifecycle.RealFnxPlugin`；实际输出 `Ran 30 tests in 9.911s`、`OK`。真实 fnx 用例通过；没有发送 prompt、没有调用模型。 |
+| fnx_dv agent 级、本地路径 | 通过 | `fnx_dv install <仓库路径>` 后 `a2a plugin status --agent-dir ~/.forenyx/fnx_dv` 为 `online_package`；`a2a plugin install` 退出码 6 并拒绝重复安装，`agent/extensions/` 未创建；用同一路径 `fnx_dv remove` 后还原 settings，`cmp` 逐字节一致。 |
+| fnx_dv agent 级、`file://` 来源 | 通过 | `fnx_dv install file://<仓库绝对路径>` 后 status 为 `online_package`；软链接 install 退出码 6；用同一 file URL remove，settings 经 `cmp` 逐字节还原。 |
+| fnx_dv 项目级 package | 通过 | 在 `/tmp/a2a_xc_proj` 中 `fnx_dv install <仓库路径> -l --approve` 写入 `.forenyx/settings.json`；status `--project-dir` 列出 `project_packages`，重复软链接 install 退出码 6；不带 `--project-dir` 的 status 输出 `project_scope` 提示。临时项目首次未被信任时，未加 `--approve` 的安装被 fnx 明确拒绝；加该显式选项后才写入。agent 级 settings 未变。 |
+| 嵌套扩展冲突 | 通过 | 删除临时项目的 package 项后创建 `.forenyx/extensions/x/index.ts`，内容注册 `name: "a2a_send"`；status 将其列入 `project_packages`，install 以退出码 6 拒绝。 |
+| 变异检查 | 通过，2 处均被目标测试捕获 | 在 `/tmp/a2a_xc_mutation_repo` 隔离源码副本里临时关闭 online package guard，`test_install_refuses_when_already_installed_online` 的 9 个子用例均因未抛 `PluginError` 失败；关闭 project guard 后，`test_project_level_package_blocks_install` 出现 3 个“未拒绝”断言失败。后者在首个失败后继续跑后续子场景，额外出现 1 个夹具目录已存在错误；目标防护失败已明确捕获。两处修改均用 trap 恢复并与备份 `cmp` 一致，隔离副本最终与原 `plugin.py` `cmp` 一致。 |
+| 清理与边界 | 完成 | fnx_dv / fnx_sw 两份 agent settings 均与测试前备份逐字节一致；fnx_dv agent `extensions/` 不存在；`/tmp/a2a_xc_proj`、变异副本、VM 备份和 Mac `/private/tmp/a2a_xc_mutation_*.sh` 已删除。未触碰禁用 Herdr 会话、未读取 `auth.json` 或密钥、未调用模型。 |
+
+结论:§12 所述在线安装防重、`file://` 来源、项目级作用域和嵌套扩展冲突在 VM 的独立复测中均符合预期；防护测试能检出 agent 级与项目级 guard 被移除的变异。
