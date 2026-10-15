@@ -327,12 +327,109 @@ export function parseCommandArgs(args: string): CommandArgs {
   return { kind: "usage" };
 }
 
-/** /a2a 列边:每条边一段,"边 → 目标"一行,消息另起并缩进(模板自带的换行逐行缩进),段间空一行 */
-export function formatEdges(edges: Edge[]): string {
-  return edges.map((e) => {
-    const body = String(e.text).split(/\r\n|\r|\n/).map((line) => `    ${line}`).join("\n");
-    return `  ${e.edge_id} → ${e.dst}\n${body}`;
+/**
+ * 显示宽度,**只会比 pi 算得宽,不会更窄**:pi(visibleWidth)按字素簇和 East Asian Width 计宽,
+ * 宽字符(W/F)都在 U+1100 及以后;这里把 U+1100 及以后的每个码点都算 2 列、之前的算 1 列,
+ * 一个字素簇按其码点之和计。估宽了只会让插件早一点折行,不会让 pi 再折一次。
+ */
+export function charWidth(cluster: string): number {
+  let n = 0;
+  for (const ch of cluster) n += (ch.codePointAt(0) ?? 0) < 0x1100 ? 1 : 2;
+  return n;
+}
+
+const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/** 按字素簇切分(emoji 组合序列、带附加符号的字母不会被拆开) */
+export const graphemes = (text: string) => Array.from(segmenter.segment(text), (s) => s.segment);
+
+export const textWidth = (text: string) => graphemes(text).reduce((n, g) => n + charWidth(g), 0);
+
+/**
+ * 把一段文字按 width 列折行:英文单词尽量不拆(比一行还长才拆),宽字符逐字可断,字素簇不拆;
+ * 折行处的空格丢掉;句末标点(,。)」等)不放在行首,连同前一个字一起换到下一行。width 不是正数时不折行。
+ */
+export function wrapText(text: string, width: number): string[] {
+  if (!(width > 0)) return [text];
+  const tokens: string[] = [];                                  // 连续的可见 ASCII 并成一个单词,其余每个字素簇一个
+  for (const g of graphemes(text)) {
+    const last = tokens[tokens.length - 1];
+    if (/^[\x21-\x7e]$/.test(g) && last !== undefined && /^[\x21-\x7e]+$/.test(last)) tokens[tokens.length - 1] = last + g;
+    else tokens.push(g);
+  }
+  const lines: string[] = [];
+  let line: string[] = [];
+  let used = 0;
+  const flush = () => {
+    while (line.length > 0 && /^\s+$/u.test(line[line.length - 1])) line.pop();
+    lines.push(line.join("")); line = []; used = 0;
+  };
+  for (const tok of tokens) {
+    const w = textWidth(tok);
+    if (/^\s+$/u.test(tok)) {
+      if (used === 0 && lines.length > 0) continue;             // 续行行首的空格丢掉
+      if (used + w > width) { flush(); continue; }
+      line.push(tok); used += w;
+      continue;
+    }
+    if (used + w <= width) { line.push(tok); used += w; continue; }
+    const prev = line[line.length - 1];
+    if (NO_LINE_START.test(tok) && line.length >= 2 && !/^\s+$/u.test(prev) && textWidth(prev) + w <= width) {
+      line.pop();                                                // 前一个字带着标点一起换行
+      flush();
+      line = [prev, tok]; used = textWidth(prev) + w;
+      continue;
+    }
+    if (w <= width) { flush(); line = [tok]; used = w; continue; }
+    for (const g of graphemes(tok)) {                            // 比一行还长的单词:逐字拆
+      const gw = charWidth(g);
+      if (used + gw > width && used > 0) flush();
+      line.push(g); used += gw;
+    }
+  }
+  if (line.length > 0 || lines.length === 0) flush();
+  return lines;
+}
+
+const NO_LINE_START = /^[,.;:!?)\]}，。、；：！？）】」』》〉…—]$/u;
+
+/** 配色:pi 的 ctx.ui.theme(fg / bold);没有时原样输出 */
+export type Style = { fg?: (color: string, text: string) => string; bold?: (text: string) => string };
+
+const EDGE_INDENT = " ";
+const BODY_LABEL = "消息内容: ";
+const BODY_INDENT = "   ";
+
+/**
+ * /a2a 列边:每条边一段,段间空一行:
+ *    边1: ● dv_done → sw_spi
+ *      消息内容: spi ip 我已经完成了……
+ *                (折行与模板自带的换行都对齐到"消息内容: "之后)
+ * width:可用列数(终端宽减去 pi 的左右留白);不知道时不折行,交给 pi。
+ */
+export function formatEdges(edges: Edge[], opts: { width?: number; style?: Style } = {}): string {
+  // 主题没有这个颜色时 pi 会抛错:配色只是锦上添花,出错就用原文
+  const safe = (f: () => string, t: string) => { try { return f(); } catch { return t; } };
+  const fg = (color: string, t: string) => (opts.style?.fg ? safe(() => opts.style!.fg!(color, t), t) : t);
+  const bold = (t: string) => (opts.style?.bold ? safe(() => opts.style!.bold!(t), t) : t);
+  // 可用列数:留 1 列余量;太窄(少于 10 列)就不折,交给 pi
+  const roomAfter = (indent: number) => (opts.width && opts.width - indent - 1 >= 10 ? opts.width - indent - 1 : 0);
+  const bodyHang = textWidth(BODY_INDENT + BODY_LABEL);
+  return edges.map((e, i) => {
+    const label = `边${i + 1}:`;
+    const headHang = textWidth(`${EDGE_INDENT}${label} `);
+    const head = wrapText(`● ${e.edge_id} → ${e.dst}`, roomAfter(headHang))   // 边名很长时标题也折行,对齐到"边N: "之后
+      .map((l, j) => (j === 0 ? `${EDGE_INDENT}${fg("muted", label)} ` : " ".repeat(headHang)) + bold(fg("accent", l)));
+    const lines = String(e.text).replace(/\t/g, "   ").split(/\r\n|\r|\n/)
+      .flatMap((para) => wrapText(para, roomAfter(bodyHang)));
+    const body = lines.map((l, j) => (j === 0 ? `${BODY_INDENT}${fg("muted", BODY_LABEL)}` : " ".repeat(bodyHang)) + fg("text", l));
+    return [...head, ...body].join("\n");
   }).join("\n\n");
+}
+
+/** 列边时可用的列数:终端宽度减去 pi 消息的左右留白(各 1 列) */
+export function listWidth(): number | undefined {
+  const cols = process.stdout?.columns;
+  return typeof cols === "number" && cols > 0 ? cols - 2 : undefined;
 }
 
 type Level = "info" | "warning" | "error";
@@ -416,6 +513,7 @@ export function makeSendCommand(cfg: Config, readiness: Readiness, list: () => E
         if (ctx?.hasUI !== false && ctx?.ui?.notify) ctx.ui.notify(text, level);
         else console.error(text);
       };
+      const view = { width: listWidth(), style: ctx?.ui?.theme as Style | undefined };
       const parsed = parseCommandArgs(args);
       if (parsed.kind === "usage") {
         notify("[a2a] 用法:/a2a 列出可用的边;/a2a <边> 发送(只接受一个边 id)", "error");
@@ -430,13 +528,13 @@ export function makeSendCommand(cfg: Config, readiness: Readiness, list: () => E
       }
       if (parsed.kind === "list") {
         if (edges.length === 0) notify("[a2a] 没有可用的通信边", "warning");
-        else notify(`[a2a] 可用的边(/a2a <边> 发送):\n\n${formatEdges(edges)}`, "info");
+        else notify(`[a2a] 可用的边 ${edges.length} 条(/a2a <边> 发送):\n\n${formatEdges(edges, view)}`, "info");
         return;
       }
       const edge = edges.find((e) => e.edge_id === parsed.edge);
       if (!edge) {
         notify(`[a2a] 没有这条边:${parsed.edge},未发送。` + (edges.length > 0
-          ? `\n可用的边:\n\n${formatEdges(edges)}` : "当前没有可用的通信边"), "error");
+          ? `\n可用的边 ${edges.length} 条:\n\n${formatEdges(edges, view)}` : "当前没有可用的通信边"), "error");
         return;
       }
       if (!(await readiness.commandStart())) {

@@ -514,13 +514,22 @@ class RealFnxCommand(RealFnxPlugin):
     def test_slash_command_sends_without_the_model(self):
         panes = self.spawn_pair()
         client.pane_run(panes["dv"], "/a2a")
-        lines = self.wait_screen(panes["dv"], "uart ip 我已经完成了uvm验证").splitlines()
+        lines = self.wait_screen(panes["dv"], "消息内容: uart ip 我已经完成了uvm验证").splitlines()
         head = next(i for i, l in enumerate(lines) if "dv_done → sw_uart" in l)
-        body = next(i for i, l in enumerate(lines) if "uart ip 我已经完成了uvm验证" in l)
-        self.assertEqual(lines[head].strip(), "dv_done → sw_uart")          # 边名单独一行
-        self.assertEqual(body, head + 1)                                    # 消息紧跟在下一行
+        self.assertEqual(lines[head].strip(), "边1: ● dv_done → sw_uart")    # 边单独一行,带序号
+        body = lines[head + 1]                                              # 消息紧跟在下一行
         indent = lambda l: len(l) - len(l.lstrip())
-        self.assertGreater(indent(lines[body]), indent(lines[head]))        # 且缩进更深
+        self.assertTrue(body.lstrip().startswith("消息内容: uart ip"), body)
+        self.assertGreater(indent(body), indent(lines[head]))
+        rest = []                                                           # 折行:续行对齐到"消息内容: "之后
+        for l in lines[head + 2:]:
+            if not l.strip():
+                break
+            self.assertEqual(indent(l), indent(body) + len("消息内容: ") + len("消息内容"), l)   # 中文占 2 列
+            rest.append(l.strip())
+        full = STAGE6_EDGES[0]["template"].format(ip="uart")
+        shown = body.strip()[len("消息内容: "):] + "".join(rest)
+        self.assertEqual(shown.replace(" ", ""), full.replace(" ", ""))     # 内容完整,没被截断
         client.pane_run(panes["dv"], "/a2a dv_done")
         text = self.wait_screen(panes["dv"], "已发送给 sw_uart")
         spool = Spool(self.state / "spool")

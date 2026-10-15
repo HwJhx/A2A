@@ -353,7 +353,8 @@ class PiExtension(unittest.TestCase):
         for run in out["runs"]:
             (note,) = run["notes"]
             self.assertEqual(note["level"], "info")
-            self.assertIn("dv_done → sw_uart\n    uart ip 我已经完成了uvm验证。", note["text"])   # 边名一行,消息另起缩进
+            self.assertIn("可用的边 1 条", note["text"])
+            self.assertIn(" 边1: ● dv_done → sw_uart\n   消息内容: uart ip 我已经完成了uvm验证。", note["text"])
             self.assertNotIn("「", note["text"])
         self.assertEqual(self.spool.pending(), [])
         self.assertEqual(calls, [])                                # 只列边:不上报状态

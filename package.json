@@ -1,6 +1,6 @@
 {
   "name": "a2a-pi-plugin",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "description": "A2A 通信插件:给 pi 类智能体(fnx_dv、fnx_sw 等)注册 a2a_send 工具,按拓扑里的通信边发送固定句式消息。需要配套的 a2a Python 后端(herdr/a2a)。",
   "keywords": ["pi-package"],

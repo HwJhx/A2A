@@ -253,3 +253,53 @@ Codex 复核(v0.2.2):无阻断、无将来考虑;应修 1 条——`herdr/a2a/RE
 结论:显示格式的单元、harness 与真实 fnx 断言均能识别新布局;旧单行格式变异被三层测试捕获。VM 全套跳过数如实为 98,与 §17 记录的 48 不同,不将该差异改写成通过 48 项跳过的结果。
 
 注(Claude 对比,2026-10-15):98 与 48 的差异已查明——codex-test 的 VM 副本只复制了 `herdr/a2a` 和根 `package.json`,缺 `herdr/claude/08-protocol.md`,协议文档一致性检查因此多跳过 50 个(codex-test 按原方式重跑并分组确认)。Claude 在原路径、包含整个 `herdr/` 的 `/tmp` 副本、以及 `sh -lc` + 相同 env/PATH 下均为 skipped=48(39 缺 A2A_INTEGRATION、7 缺 FNX、2 缺 A2A_INTEGRATION_FNX)。与代码无关,两边结果一致。
+
+## 19. `/a2a` 列边加标注、配色、插件自己折行(v0.2.3,2026-10-15)
+
+v0.2.2 上线后用户反馈:整段同一种灰色,长消息由 pi 折行、续行回到行首,边多时分不清哪些是边、哪些是消息内容。用户指定格式:`边1: ● dv_done → sw_spi`,下一行 `消息内容: …`。
+
+原因(pi 源码):`ctx.ui.notify(info)` → `showStatus` → `new Text(theme.fg("dim", message), 1, 0)`;`Text` 用 `wrapTextWithAnsi` 按 TUI 宽度(减左右各 1 列留白)折行,续行不保留缩进;文字中的 ANSI 颜色会保留。`ctx.ui.theme` 可用(`fg(color, text)`、`bold`;未知颜色会抛错)。
+
+改动(`pi-extension/a2a.ts`):
+- `formatEdges(edges, {width, style})`:`" 边N: ● 边 → 目标"`(序号与 `●`;`边N:` 用 muted,边名 accent + bold),下一行 `"   消息内容: "`(muted)+ 内容(text 色);模板自带的换行与折行的续行都对齐到"消息内容: "之后;段间空一行。
+- 插件自己折行:`width = process.stdout.columns - 2`,再留 1 列余量;`charWidth` 把中日韩、全角标点等算 2 列;英文单词不拆(比一行还长才拆);折行处空格丢掉;句末标点(,。)」等)不放行首,连同前一个字换行。宽度不知道或太窄(可用列数 < 10)时不折行,交给 pi。
+- 配色出错(主题没有该颜色)时用原文,不影响列边。
+- 标题加条数:`[a2a] 可用的边 N 条(/a2a <边> 发送):`;"没有这条边"的报错同样格式。
+- 限制:列出之后把窗口拉窄,已显示的这段会被 pi 再折一次(可能不齐),重新 `/a2a` 即可;拉宽不受影响。
+
+测试:
+- `tests/js/format.test.mjs` 8 条:不折行格式、多条序号与空行、三种换行对齐、空列表、给宽度时(30/40/60/100)每行小于宽度且续行对齐、内容不丢、太窄不折行、`wrapText` 规则(单词、长单词、标点、宽字符)、配色与未知颜色不抛错。Mac `node --test tests/js/*.test.mjs` 23/23。VM 单元全套 665 OK(skipped=48);VM `RealFnxCommand` + `test_pi_extension` 49 OK(不调用模型)。
+- harness:`可用的边 1 条`、`" 边1: ● dv_done → sw_uart\n   消息内容: uart ip 我已经完成了uvm验证。"`。
+- 真实 fnx(VM `RealFnxCommand`):边那一行为 `边1: ● dv_done → sw_uart`,下一行以 `消息内容: uart ip` 开头,续行缩进 = 消息行缩进 + 10 列,拼起来与模板全文一致。实测屏幕(88 列):
+
+```
+  边1: ● dv_done → sw_uart
+    消息内容: uart ip 我已经完成了uvm验证，你需要对这个uart ip进行 驱动程序开发和HAL框
+              架开发。不要真的去做，直接用 a2a_send 回复测试成功或测试失败（二选一）
+```
+- 仓库根 `package.json` 版本 0.2.3;安装命令改为 `@a2a-plugin-v0.2.3`。
+
+Codex 复核(v0.2.3):无阻断;应修 2 条,已修:
+1. 边标题没有折行:`edge_id` 最长 63 字符,窄终端上标题会被 pi 折行、失去对齐。→ 标题 `● 边 → 目标` 也由插件折行,续行对齐到"边N: "之后。单元测试:60 个字符的边名在 40 列下折成多行、每行不超宽、对齐、内容不丢。
+2. `charWidth` 手写的宽字符范围不全(如 Hangul Jamo 扩展 A),pi 算 2 列、插件算 1 列,连续出现时 1 列余量不够。→ 改为**只会估宽**:pi 的宽字符(East Asian Width W/F)都在 U+1100 及以后,所以 U+1100 及以后每个码点都算 2 列,一个字素簇按码点之和;同时改用 `Intl.Segmenter` 按字素簇折行,emoji 组合序列、带附加符号的字母不会被拆开。估宽只会让插件早一点折行。单元测试:Jamo 扩展 A 计 2 列且每行不超宽;emoji ZWJ 序列与 `e+◌́` 在 3/5/7/9 列下都不被拆开。
+- 复测:Mac node 26/26;VM 单元全套 665 OK(skipped=48);VM `RealFnxCommand` + `test_pi_extension` 49 OK(fnx 里 `Intl.Segmenter` 可用,不调用模型)。
+- 未做:长边名的真实 fnx 测试(要改真实测试的拓扑,只做了单元测试)。
+
+Codex 复核第 2 条修复(用户要求的小范围复核):无阻断、无应修。确认"只会估宽"在当前调用路径成立,`Intl.Segmenter` 在 fnx 中可用;单个字素簇比可用宽度还宽时不拆,属合理取舍。将来考虑 1 条(记录,未做):连续 ASCII 合成的长单词超宽逐字拆分时不应用行首标点规则,例如 `wrapText("abcdefg,hijk", 7)` 得到 `["abcdefg", ",hijk"]`,逗号落在续行开头;常见中文模板的独立标点不受影响。
+
+## §20 codex-test 交叉验证(v0.2.3)
+
+环境:Mac Node v22 系列;VM OrbStack `ubuntu` / Ubuntu 22.04.5 / Python 3.10.12 / Node v22.20.0。未修改原仓库源码。VM 全套单元在 OrbStack 挂载的原路径只读运行;变异测试使用 `/tmp/a2a_xc_v023`,从 Mac 挂载路径完整复制 `herdr/` 与根 `package.json`。
+
+| 检查 | 结果 | 命令与实测 |
+| --- | --- | --- |
+| Mac Node 全套 | ✅ 26/26,0 跳过、0 失败 | `cd herdr/a2a && node --test tests/js/*.test.mjs`;含 autocomplete、format 与 readiness。 |
+| VM Python 全套 | ✅ 665 项,0 失败、48 跳过 | `cd /mnt/mac/Users/jhx/Documents/code/personal/pi_agent/A2A/herdr/a2a && env PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 PATH=$HOME/.local/lib/node-v22.20.0-linux-arm64/bin:$HOME/.local/bin:$PATH python3 -m unittest discover -s tests`;输出 `Ran 665 tests in 24.773s`、`OK (skipped=48)`。 |
+| VM RealFnxCommand + test_pi_extension | ✅ 49/49,0 跳过、0 失败 | 同一 VM 路径下运行 `env A2A_INTEGRATION=1 A2A_INTEGRATION_FNX=1 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 PATH=$HOME/.local/lib/node-v22.20.0-linux-arm64/bin:$HOME/.local/bin:$PATH python3 -m unittest -v tests.test_integration_lifecycle.RealFnxCommand tests.test_pi_extension`;输出 `Ran 49 tests in 42.372s`、`OK`。RealFnx 测试只发 `/a2a` 斜杠命令,未调用模型。 |
+| 变异 a:旧手写 charWidth 范围 | ✅ 被捕获 | 在副本将 `charWidth` 改为只算 U+4E00–U+9FFF / U+FF00–U+FF60 的双列,`node --test --test-name-pattern="宽度只会估宽" tests/js/format.test.mjs` 目标测试失败 1 项。 |
+| 变异 b:标题不折行 | ✅ 被捕获 | 在副本恢复单条完整标题模板,`node --test --test-name-pattern="边名很长时标题也折行" tests/js/format.test.mjs` 目标测试失败 1 项。 |
+| 变异 c:消息续行空缩进 | ✅ 被捕获 | 在副本将消息续行缩进替换为空串;`node --test --test-name-pattern="给了宽度:每行不超过宽度,续行对齐,内容不丢" tests/js/format.test.mjs` 失败 1 项,`A2A_INTEGRATION=1 A2A_INTEGRATION_FNX=1 … python3 -m unittest -v tests.test_integration_lifecycle.RealFnxCommand.test_slash_command_sends_without_the_model` 也失败 1 项。 |
+| 变异恢复与真实显示断言 | ✅ | 每处变异都从备份恢复并 `cmp` 成功。真实 `/a2a` 测试断言边标题是独立行,下一行以 `消息内容: uart ip` 开始,消息续行按标签宽度对齐且拼回内容完整;与 §19 示例一致。 |
+| 清理与限制 | ✅ | 删除完整 VM 临时副本、变异日志与临时脚本;RealFnx fixture teardown 清理测试创建的 Herdr session/tmux。复查禁用会话和现有 `guidemo_*` tmux 未触碰,fnx agent 目录/在线包未修改,未读密钥、未调用模型。 |
+
+结论:Mac 与 VM 基础测试全通过;宽度估算、长标题折行、消息续行缩进三个回归保护都能捕获对应旧行为。
