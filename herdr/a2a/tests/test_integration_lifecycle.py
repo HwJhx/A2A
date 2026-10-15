@@ -530,6 +530,20 @@ class RealFnxCommand(RealFnxPlugin):
         self.assertIn(self.status("dv_uart"), ("idle", "done"))
         self.sessions_have_no_model_calls()
 
+    def test_autocomplete_shows_the_version_instead_of_the_source(self):
+        # 只打字、不回车:不提交、不调用模型。-e 加载的扩展 pi 标为 [t],改写后应为 [v<版本>]
+        version = json.loads((HERE.parents[2] / "package.json").read_text())["version"]
+        panes = self.spawn_pair()
+        client.pane_send_text(panes["dv"], "/a2")
+        try:
+            text = self.wait_screen(panes["dv"], f"[v{version}]")
+            line = next(l for l in text.splitlines() if f"[v{version}]" in l)
+            self.assertIn("a2a", line)
+            self.assertNotIn("[t]", line)
+        finally:
+            client.pane_send_keys(panes["dv"], "backspace", "backspace", "backspace")
+        self.sessions_have_no_model_calls()
+
     def test_slow_command_shows_working_until_it_finishes(self):
         # 占住 IP 的排空锁(独占,不写排空标记):Router 入队时等共享锁,命令就会卡住几秒
         from a2a import ipdrain

@@ -27,6 +27,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export type Edge = { edge_id: string; dst: string; text: string };
 type Config = { python: string; env: NodeJS.ProcessEnv; sendTimeoutMs: number };
@@ -347,6 +348,51 @@ export function formatOutcome(outcome: SendOutcome, edge: string, dst: string): 
 }
 
 export const COMMAND = "a2a";
+export const COMMAND_DESCRIPTION = "手动发送 a2a 消息,不经过模型。/a2a 列出可用的边;/a2a <边> 立即发送";
+const PACKAGE_NAME = "a2a-pi-plugin";
+
+/** 插件版本:仓库根目录 package.json(pi 包清单)的 version;读不到或不是本包时返回 null。 */
+export function pluginVersion(manifest?: string): string | null {
+  try {
+    const path = manifest ?? fileURLToPath(new URL("../../../package.json", import.meta.url));
+    const data = JSON.parse(readFileSync(path, "utf8"));
+    return data?.name === PACKAGE_NAME && typeof data.version === "string" && data.version ? data.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * pi 0.79.10 的命令补全会在扩展命令的说明前加安装来源标签(InteractiveMode.prefixAutocompleteDescription,
+ * 在线安装时是 `[u:git:github.com/HwJhx/A2A@<标签>]`),没有设置项能关掉。这里只改写**本插件的 /a2a 这一项**:
+ * 光标前是 `/…`(还没输入空格,即补全命令名的阶段),条目 value 恰为 "a2a",且说明以本插件的说明结尾;
+ * 把它换成 `[v<版本>] <说明>`。其他命令、别的扩展注册的同名命令(说明不同)、参数补全都原样不动。
+ */
+export function rewriteSuggestions(result: any, beforeCursor: string, version: string): any {
+  if (!result || !Array.isArray(result.items) || !beforeCursor.startsWith("/") || beforeCursor.includes(" ")) {
+    return result;
+  }
+  let changed = false;
+  const items = result.items.map((item: any) => {
+    if (item?.value !== COMMAND || typeof item.description !== "string"
+        || !item.description.endsWith(COMMAND_DESCRIPTION)) return item;
+    changed = true;
+    return { ...item, description: `[v${version}] ${COMMAND_DESCRIPTION}` };
+  });
+  return changed ? { ...result, items } : result;
+}
+
+/** ctx.ui.addAutocompleteProvider 的包装:继承原 provider(其他方法与字段原样可用),只改 getSuggestions 的结果。 */
+export function makeAutocompleteWrapper(version: string) {
+  return (current: any) => {
+    const wrapped = Object.create(current);
+    wrapped.getSuggestions = async (lines: string[], cursorLine: number, cursorCol: number, options: any) => {
+      const result = await current.getSuggestions(lines, cursorLine, cursorCol, options);
+      return rewriteSuggestions(result, (lines?.[cursorLine] ?? "").slice(0, cursorCol), version);
+    };
+    return wrapped;
+  };
+}
 
 /**
  * /a2a 的处理(pi 0.79.10:输入以 / 开头时 AgentSession.prompt() 最先查扩展命令,命中就执行并返回,
@@ -355,7 +401,7 @@ export const COMMAND = "a2a";
  */
 export function makeSendCommand(cfg: Config, readiness: Readiness, list: () => Edge[], cache: { edges: Edge[] }) {
   return {
-    description: "手动发送 a2a 消息,不经过模型。/a2a 列出可用的边;/a2a <边> 立即发送",
+    description: COMMAND_DESCRIPTION,
     getArgumentCompletions(prefix: string) {
       const items = cache.edges.filter((e) => e.edge_id.startsWith((prefix ?? "").trim()))
         .map((e) => ({ value: e.edge_id, label: e.edge_id, description: `→ ${e.dst}` }));
@@ -433,7 +479,17 @@ export default function (pi: any) {
     return undefined;
   });
   // 没有 herdr pane 时不注册命令:无法协调就绪状态,不允许"不上报就发送"(22 号方案 §9)
-  if (readiness) pi.registerCommand(COMMAND, makeSendCommand(cfg, readiness, list, cache));
+  if (readiness) {
+    pi.registerCommand(COMMAND, makeSendCommand(cfg, readiness, list, cache));
+    // 补全里把 pi 加的来源标签换成版本号。pi 切换会话 / 重新加载时会清空所有包装再发 session_start,
+    // 所以每次 session_start 都登记(文档 extensions.md「Autocomplete Providers」的用法);改写是幂等的
+    const version = pluginVersion();
+    if (version) {
+      pi.on("session_start", (_event: any, ctx: any) => {
+        ctx?.ui?.addAutocompleteProvider?.(makeAutocompleteWrapper(version));
+      });
+    }
+  }
 }
 
 const TOOL = "a2a_send";

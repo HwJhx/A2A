@@ -6,6 +6,7 @@
 //   node plugin_harness.mjs <插件路径> rounds <步骤列表 JSON>   每步先改拓扑文件,再触发 before_agent_start
 //   node plugin_harness.mjs <插件路径> commands <参数列表 JSON>   依次执行 /a2a <参数>,记录 notify
 //   node plugin_harness.mjs <插件路径> completions <前缀列表 JSON> [warm]  补全(warm:先触发一次 before_agent_start)
+//   node plugin_harness.mjs <插件路径> autocomplete <输入行列表 JSON>   session_start 登记的补全包装改写结果
 import { copyFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -117,6 +118,25 @@ if (action === "describe") {
 } else if (action === "completions") {
   if (rest[1] === "warm") for (const handler of handlers.before_agent_start ?? []) await handler({ prompt: "x" }, {});
   result = Object.fromEntries(JSON.parse(rest[0]).map((p) => [p, commands.a2a.getArgumentCompletions(p)]));
+} else if (action === "autocomplete") {
+  // 触发 session_start(假 ui 记录 addAutocompleteProvider),再用登记的包装套一个假的内置 provider,
+  // 按 rest[0] 里的每行文字(光标在行尾)取补全
+  const wrappers = [];
+  const ctx = { ui: { addAutocompleteProvider: (f) => wrappers.push(f) } };
+  for (const handler of handlers.session_start ?? []) await handler({}, ctx);
+  const base = {
+    async getSuggestions(lines, line, col) {
+      return { prefix: lines[line].slice(0, col), items: [
+        { value: "a2a", label: "a2a", description: `[u:git:github.com/HwJhx/A2A@x] ${commands.a2a?.description}` },
+        { value: "about", label: "about", description: "Show info" }] };
+    },
+  };
+  let provider = base;
+  for (const wrap of wrappers) provider = wrap(provider);
+  result = { wrappers: wrappers.length, suggestions: {} };
+  for (const line of JSON.parse(rest[0])) {
+    result.suggestions[line] = (await provider.getSuggestions([line], 0, line.length, {})).items;
+  }
 } else if (action === "is_herdr_write") {
   result = Object.fromEntries(JSON.parse(rest[0]).map((c) => [c, mod.isHerdrWrite(c)]));
 }

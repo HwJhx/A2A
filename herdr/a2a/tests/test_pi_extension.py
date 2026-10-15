@@ -97,7 +97,7 @@ class PiExtension(unittest.TestCase):
         # 说明里列出每条边按本 IP 渲染后的完整文字,模型据此区分"测试成功 / 测试失败"
         self.assertIn("sw_test_pass:发给 dv_gpio,内容是「gpio 测试成功。你只回复收到即可」", tool["description"])
         self.assertIn("sw_test_fail:发给 dv_gpio,内容是「gpio 测试失败。你只回复收到即可」", tool["description"])
-        self.assertEqual(sorted(out["events"]), sorted(["tool_call", "agent_start", "agent_end", "session_before_compact", "before_agent_start"]))
+        self.assertEqual(sorted(out["events"]), sorted(["tool_call", "agent_start", "agent_end", "session_before_compact", "before_agent_start", "session_start"]))
 
     def test_does_nothing_outside_an_a2a_pane(self):
         out, _ = self.harness(self.env(A2A_ROLE=None), "describe")
@@ -111,7 +111,7 @@ class PiExtension(unittest.TestCase):
 
     def test_identity_outside_the_topology_registers_no_tool_but_keeps_the_guard(self):
         out, err = self.harness(self.env(A2A_IP="spi", HERDR_PANE_ID="w1:p9"), "describe")
-        self.assertEqual((out["tools"], sorted(out["events"])), ([], sorted(["tool_call", "agent_start", "agent_end", "session_before_compact", "before_agent_start"])))
+        self.assertEqual((out["tools"], sorted(out["events"])), ([], sorted(["tool_call", "agent_start", "agent_end", "session_before_compact", "before_agent_start", "session_start"])))
         self.assertIn("读取可用通信边失败", err)
 
     # ---- 发送 ----------------------------------------------------------
@@ -418,12 +418,27 @@ class PiExtension(unittest.TestCase):
         self.assertIn("a2a queue sw_uart", note["text"])
         self.assertEqual(self.reported(calls), [("working", 1), ("idle", 2)])
 
-    def test_readiness_timing_node_tests(self):
-        # 就绪状态机的确定性时序测试(tests/js/readiness.test.mjs,node --test)
-        run = subprocess.run([NODE, "--test", str(HERE / "js" / "readiness.test.mjs")],
-                             capture_output=True, text=True, timeout=120)
+    def test_node_unit_tests(self):
+        # tests/js/*.test.mjs:就绪状态机的确定性时序、补全来源标签改写(node --test)
+        files = sorted(str(f) for f in (HERE / "js").glob("*.test.mjs"))
+        self.assertGreaterEqual(len(files), 2)
+        run = subprocess.run([NODE, "--test", *files], capture_output=True, text=True, timeout=120)
         self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-2000:])
         self.assertIn("# fail 0", run.stdout.replace("ℹ", "#"))
+
+    def test_session_start_registers_the_autocomplete_rewrite(self):
+        out, _ = self.harness(self.env(), "autocomplete", json.dumps(["/a", "/a2a d", "hello"]))
+        self.assertEqual(out["wrappers"], 1)
+        mine, other = out["suggestions"]["/a"]
+        self.assertTrue(mine["description"].startswith("[v"), mine)
+        self.assertNotIn("github.com", mine["description"])
+        self.assertEqual(other["description"], "Show info")
+        self.assertIn("github.com", out["suggestions"]["/a2a d"][0]["description"])   # 参数阶段不改
+        self.assertIn("github.com", out["suggestions"]["hello"][0]["description"])
+
+    def test_no_autocomplete_rewrite_without_a_herdr_pane(self):
+        out, _ = self.harness(self.env(HERDR_PANE_ID=None), "autocomplete", json.dumps(["/a"]))
+        self.assertEqual(out["wrappers"], 0)
 
     def test_failed_working_report_means_not_sent(self):
         out, err, calls = self.commands(["dv_done"], mode="fail")

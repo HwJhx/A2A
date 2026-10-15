@@ -236,7 +236,7 @@ a2a agent recover --session <会话> [--ip gpio] [--include-stopped]
 | `/a2a dv_done` | 立即发送;显示 `[a2a] 已发送给 sw_uart(msg_id=…)` |
 | `/a2a <不存在的边>` / 多个参数 | 红字提示并列出可用的边,**不发送** |
 
-- 不调用模型、不耗 token;提示只显示在终端,**不进入模型上下文**(模型下一轮不知道你手动发过;对方的回复照常投递进来)。输入 `/a2a ` 后可补全边名。
+- 不调用模型、不耗 token;提示只显示在终端,**不进入模型上下文**(模型下一轮不知道你手动发过;对方的回复照常投递进来)。输入 `/a2a ` 后可补全边名。命令补全列表里的 `[u:git:github.com/HwJhx/A2A@a2a-plugin-v0.2.1]` 是 pi 按安装来源自动加的标签(`getAutocompleteSourceTag`;git 来源显示 主机/路径@标签,本地路径按安装级别显示 `[u]` / `[p]` / `[t]`)。没有设置项能关掉它;插件(v0.2.1 起)在 `session_start` 用 pi 支持的 `ctx.ui.addAutocompleteProvider()` 包装内置补全,**只把本插件 `/a2a` 这一项**的标签换成版本号,显示为 `a2a  [v0.2.1] 手动发送 a2a 消息…`(版本取仓库根 `package.json`);其他命令、别的扩展的同名命令、重复安装产生的 `/a2a:1`、参数补全都不改。
 - 不去重:手动发送每次都真的发。提示"发送结果未知"时**不要直接重发**,先 `a2a queue <对方>` 或查审计日志核实。
 - 模型正在工作时也能用(命令立即执行,不排队)。
 - 状态协调:命令开始时先向 herdr 上报 working,发完再报 idle,broker 不会在命令进行中往这个 pane 投递;**上报 working 失败就不发送**(提示稍后重试)。模型、压缩与命令共用同一个判断:只有"模型确定已结束且没有命令在途"才报 idle。
@@ -256,10 +256,10 @@ pi 还会加载**项目级**配置:fnx 启动目录下的 `.forenyx/`(fnx 的 co
 **正式部署:在线安装(pi 包)**。仓库根目录的 `package.json` 是 pi 包清单(`"pi": {"extensions": ["./herdr/a2a/pi-extension/a2a.ts"]}`)。每个 fnx 有自己的 agent 目录,要**分别安装**:
 
 ```bash
-fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
-fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.1.0
+fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.2.1
+fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.2.1
 fnx_dv list                                             # 查看已安装的包
-fnx_dv install git:github.com/HwJhx/A2A@<新标签>        # 升级到新版本
+fnx_dv install git:github.com/HwJhx/A2A@<新标签>        # 升级:替换 settings 里原来那一条(实测 v0.1.0 → v0.2.0),不会变成两条
 fnx_dv remove  git:github.com/HwJhx/A2A                 # 卸载(带不带 @标签 都行,会删掉克隆目录)
 ```
 

@@ -171,3 +171,51 @@
 | 清理与限制 | ✅ | 临时状态、拓扑、变异副本、日志和脚本已删除；测试生成的会话和 tmux 均无残留。检查时另见 fnx_dv `agent/sessions/--tmp-a2a_ne_check--`，它不属于本轮测试命名且来源未核实，因此未触碰。未触碰禁用的 Herdr 会话，未修改 fnx agent 安装目录/在线包，未读取 `auth.json` 或密钥，未调用模型。 |
 
 结论:所测 Python 模板写入拒绝、Router 入队前二次检查、插件 readiness 状态机及真实 fnx `/a2a` 命令行为符合预期。最终安全全量集成覆盖了所有不需要普通 shell 输入的用例；仅排除 `TestRealFnxLaunch` 两项以遵守只允许 `/a2a` 的约束。
+
+## 14. VM 升级到 a2a-plugin-v0.2.0(2026-10-15)
+
+用户提交 `7529519`、推送标签 `a2a-plugin-v0.2.0`(指向 `7529519`)后,在 VM 上(npm 临时加进 PATH):
+
+- `fnx_dv / fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.2.0`:都 `Installed`;settings 的 `packages` **只剩新的一条**(替换了 v0.1.0,没有两份);克隆目录 HEAD `7529519`;settings 除 `packages` 外与升级前一致。这次 npm 在克隆目录生成了未跟踪的 `package-lock.json`,不影响加载。
+- 在单独的 tmux、临时目录里启动 fnx_dv、fnx_sw(不输入、不调用模型,用量 0.0%):`[Extensions]` 均为 `HwJhx/A2A:herdr/a2a/pi-extension/a2a.ts`;结束后删除临时目录与 fnx 为它建的空会话目录。
+- 后端版本:验收实例 `~/gui_demo_run` 的 `A2A_SRC` 指向 Mac 仓库 `herdr/a2a/src`(当前提交),与插件版本一致。
+- 文档:安装命令改为 `@a2a-plugin-v0.2.0`(a2a README、gui_demo README、验收步骤 §0);a2a README 写明升级是替换;验收步骤新增 §3.1 手动发送 `/a2a`。
+- 待用户:在 GUI 页面二把 `a2a_test` 的 agent 停止再重启,加载新插件后试 `/a2a`。
+- 用户实测(GUI 终端):输入 `/a` 时补全列表出现 `a2a`,说明文字前带 `[u:git:github.com/HwJhx/A2A@a2a-plugin-v0.2.0]`。这是 pi 的 `getAutocompleteSourceTag` 按安装来源生成的(git 来源固定显示 主机/路径@标签;本地路径只显示 `[u]`),插件无法修改。用户希望只显示版本号;可选方案是改用本地路径安装(升级改为 git checkout),用户决定**保持在线安装,不改**。
+
+### 14.1 Codex 复核来源标签分析(2026-10-15)
+
+| # | 级别 | 问题 | 判断 | 处理 |
+| --- | --- | --- | --- | --- |
+| 1 | 阻断 | "来源标签插件改不了"不准确:`registerCommand` 确实没有 sourceInfo 选项、也没有关闭标签的设置,但扩展 API 有 `ctx.ui.addAutocompleteProvider()`,可包装内置补全、改写 `/a2a` 项的 description | **成立,我的结论错了**(只查了 `registerCommand` 选项与标签生成函数,漏看了补全包装接口)。核对 fnx 内 pi 0.79.10:`setupAutocompleteProvider()` 先建内置 provider(其中斜杠命令的 description 已被 `prefixAutocompleteDescription` 加上 `[tag]`),再依次套上 `autocompleteProviderWrappers`;`addAutocompleteProvider(factory)` 登记包装后**立即**重建 provider,注册时机不受限;文档 extensions.md「Autocomplete Providers」为正式接口。 | README 与本节更正。用户此前在"改用本地路径安装 / 保持不改"之间选了不改,是基于错误前提;现在有第三种做法(不改安装方式、插件改写显示),交用户决定是否实现。 |
+| 2 | 应修 | "本地路径安装显示 [u]"要限定 scope:用户级 `[u]`、项目级 `install -l` 为 `[p]`、临时 CLI 扩展 `[t]`;相对、绝对路径与 `file://` 都按本地来源 | 成立(`getAutocompleteSourceTag`:scope user→u、project→p、其他→t;非 npm、非 git 的来源只返回前缀) | README 已改。 |
+
+## 15. 补全里只显示版本号(v0.2.1,2026-10-15)
+
+用户决定实现 §14.1 的第三种做法:不改安装方式,插件改写 `/a2a` 补全项的显示。
+
+- `a2a.ts`:`COMMAND_DESCRIPTION` 常量;`pluginVersion()` 读仓库根 `package.json`(`name` 必须是 `a2a-pi-plugin`,读不到返回 null,此时不登记改写);`rewriteSuggestions(result, beforeCursor, version)` 只在光标前以 `/` 开头且没有空格(补全命令名阶段)时,把 `value === "a2a"` 且说明以 `COMMAND_DESCRIPTION` 结尾的条目改为 `[v<版本>] <说明>`;`makeAutocompleteWrapper` 用 `Object.create(current)` 继承原 provider,只覆盖 `getSuggestions`。默认导出里,有 herdr pane(命令已注册)且读到版本时,在每次 `session_start` 调 `ctx.ui.addAutocompleteProvider`(pi 重置扩展界面时会清空包装再发 `session_start`;改写幂等)。
+- 仓库根 `package.json` 的 `version` 从 `0.1.0` 改为 `0.2.1`——发 v0.2.0 时漏改,v0.2.0 标签里仍是 0.1.0。
+- 测试:`tests/js/autocomplete.test.mjs` 6 个(只改本插件项;`[u]`/`[p]`/`[t]`/npm/无标签都能换;别的扩展的同名命令、`a2a:1`、参数阶段、非斜杠、空结果不动;幂等;继承原 provider 的方法、字段与 this,不改原对象;版本读取);`test_pi_extension.py` 新增 2 个(`session_start` 登记一个包装且改写正确、没有 pane 不登记),node 测试改为运行 `tests/js/*.test.mjs`;`RealFnxCommand` 新增真实 fnx 用例:输入框只打 `/a2`、不回车,屏幕上 a2a 一行显示 `[v0.2.1]`、没有 `[t]`,之后退格删掉,会话无模型调用。Mac 全套、VM 单元全套通过;VM `RealFnxPlugin` + `RealFnxCommand` 4 个通过;变异 4 个都被抓到(不核对说明、参数阶段也改、不登记包装、`a2a:1` 也改)。
+- 文档:README 补全标签说明、安装命令改 `@a2a-plugin-v0.2.1`;验收步骤 §3.1 加"补全显示版本号"。
+
+### 15.1 Codex 审核 v0.2.1(2026-10-15)
+
+阻断无、应修无。确认:`addAutocompleteProvider` 是受支持的 API;`Object.create(current)` 保留原 provider 的方法、字段与 this;会话切换 / 重载时 pi 清空包装后重绑,不会堆叠或丢失;匹配条件足够精确;`import.meta.url` 到仓库根 `package.json` 的相对路径在真实 fnx 可用,git checkout 目录结构相同。
+
+将来考虑:补一个 `/new` 或 `/reload` 后再次触发 `session_start` 的回归测试,确认包装仍恰好一层。记录,暂不做(pi 当前流程正确,不影响验收)。
+
+## §16 codex-test 交叉验证(v0.2.1)
+
+环境:OrbStack VM `ubuntu` / Ubuntu 22.04.5 / Python 3.10.12 / Node v22.20.0。运行前 Mac 与 VM 可见工作区对比 10 个文件 SHA-256 全部一致:`package.json`、`herdr/a2a/README.md`、`herdr/a2a/pi-extension/a2a.ts`、`herdr/a2a/tests/js/autocomplete.test.mjs`、`herdr/a2a/tests/js/plugin_harness.mjs`、`herdr/a2a/tests/test_pi_extension.py`、`herdr/a2a/tests/test_integration_lifecycle.py`、`herdr/gui_demo/README.md`、`herdr/gui_demo/验收步骤.md`、本方案文档。测试在 VM 的隔离副本 `/tmp/a2a_xc_v021` 中运行;没有修改仓库源码、测试或 fnx agent 安装目录/在线包。
+
+| 检查 | 结果 | 实测记录 |
+| --- | --- | --- |
+| Python 全套 | ✅ 665 项:567 通过、98 跳过、0 失败 | `cd /tmp/a2a_xc_v021/herdr/a2a && env PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v`;输出 `Ran 665 tests in 24.091s`、`OK (skipped=98)`。 |
+| Node 插件测试 | ✅ 15/15,0 失败、0 跳过 | `cd /tmp/a2a_xc_v021 && node --test herdr/a2a/tests/js/*.test.mjs`;包括 autocomplete 6 项及 readiness 9 项。Node 有 `MODULE_TYPELESS_PACKAGE_JSON` 性能提示,测试通过。 |
+| 指定真实 fnx 集成类 | ✅ 4/4,0 失败、0 跳过 | `cd /tmp/a2a_xc_v021/herdr/a2a && env A2A_INTEGRATION=1 A2A_INTEGRATION_FNX=1 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_integration_lifecycle.RealFnxPlugin tests.test_integration_lifecycle.RealFnxCommand`;含扩展加载、`/a2a` 命令、版本补全与 working 状态用例。 |
+| 真实 fnx 输入框手验 | ✅ | 在新建临时 Herdr session 中以 `--no-extensions -e /tmp/a2a_xc_v021/herdr/a2a/pi-extension/a2a.ts` 加载插件。只打 `/a2` 未回车,屏幕显示 `→ a2a [v0.2.1] …`,没有 `[t]`;退格后打 `/a2a ` 未回车,边名补全仍显示 `dv_done → sw_uart`;最后退格清空。首次临时脚本因 import path 配置错误在启动 Herdr/agent 前退出,修正脚本后复测成功。 |
+| 变异检查 | ✅ 2 处均被测试捕获并恢复 | 隔离副本把 `[v${version}]` 改为 `[t${version}]`,autocomplete 用例 3 项失败;另一变异移除斜杠前缀限制,用例 1 项失败。两次均恢复并 `cmp` 确认与原文件一致,最终 SHA-256 与 Mac 相同。 |
+| 清理与限制 | ✅ | 删除 `/tmp/a2a_xc_v021` 和本地临时脚本;真实 fnx 为临时工作目录创建的空 session 目录已仅用 `rmdir` 清除。测试和手验创建的 Herdr session/tmux 已清理;复查未见本轮 `a2av021` 残留。既有 `guidemo_*` tmux 与其他 Herdr session 保持原样。未触碰禁用 session,未读取密钥,未向 fnx 提交普通文本或回车,未调用模型。 |
+
+结论:命令名阶段的 `/a2a` 补全显示版本号,而参数补全保留边名;单元、Node、指定真实 fnx 集成及两处变异验证均符合预期。
