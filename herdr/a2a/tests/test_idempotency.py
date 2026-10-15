@@ -155,6 +155,55 @@ class Idempotency(RouterBase):
         retry = self.send(k=k)                                     # 记录仍是 intent:恢复后补齐,msg_id 不变
         self.assert_exactly_one(retry.msg_id)
 
+    # ---- 22 号方案 §10:不安全模板与幂等路径 ----------------------------------
+    def test_unsafe_template_with_a_key_is_rejected_and_leaves_no_intent(self):
+        from test_router import write_legacy_template
+        write_legacy_template(self.topo_path, "dv_done", "!ls")
+        k = key()
+        with self.assertRaises(SendRejected) as ctx:
+            self.send(k=k)
+        self.assertEqual(ctx.exception.code, "unsafe_template")
+        self.assertEqual(self.queued(), [])
+        self.assertFalse(list((self.router.state_dir / "idempotency").rglob("*.json")))
+
+    def test_intent_recovery_rechecks_after_the_template_became_unsafe(self):
+        from test_router import write_legacy_template
+        k = key()
+        self.crash_at("after_intent")
+        with self.assertRaises(Crash):
+            self.send(k=k)
+        self.router.crash_hook = None
+        write_legacy_template(self.topo_path, "dv_done", "/a2a x")
+        with self.assertRaises(SendRejected) as ctx:            # 补做时重新鉴权
+            self.send(k=k)
+        self.assertEqual(ctx.exception.code, "unsafe_template")
+        self.assertEqual(self.queued(), [])
+
+    def test_unsafe_snapshot_in_an_old_intent_is_not_enqueued(self):
+        # 旧版本留下的 intent:快照文本本身不安全(当前拓扑是安全的)。用快照入队前也要检查
+        k = key()
+        self.crash_at("after_intent")
+        with self.assertRaises(Crash):
+            self.send(k=k)
+        self.router.crash_hook = None
+        [path] = list((self.router.state_dir / "idempotency").rglob("*.json"))
+        record = json.loads(path.read_text())
+        record["message"]["text"] = "\ufeff!ls"
+        path.write_text(json.dumps(record, ensure_ascii=False))
+        with self.assertRaises(SendRejected) as ctx:
+            self.send(k=k)
+        self.assertEqual(ctx.exception.code, "unsafe_template")
+        self.assertEqual(self.queued(), [])
+
+    def test_replay_of_an_enqueued_message_still_returns_the_receipt(self):
+        from test_router import write_legacy_template
+        k = key()
+        first = self.send(k=k)
+        write_legacy_template(self.topo_path, "dv_done", "/a2a x")       # 之后模板变成不安全的
+        again = self.send(k=k)
+        self.assertEqual((again.msg_id, again.duplicate), (first.msg_id, True))
+        self.assert_exactly_one(first.msg_id)
+
     def test_concurrent_threads_with_the_same_key_enqueue_once(self):
         k = key()
         routers = [Router(self.store, self.registry, self.spool, self.audit, session=SESSION) for _ in range(8)]

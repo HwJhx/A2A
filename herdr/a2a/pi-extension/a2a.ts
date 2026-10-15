@@ -16,7 +16,10 @@
  *   状态上报        主动向 herdr 上报 working / idle(`herdr pane report-agent`),不依赖 herdr 从屏幕识别
  *                   "Working"——pane 很小时屏幕上看不到,broker 投递会被判为不确定(阶段 8 A 档)。
  *                   原则:只在确定 pi 已经结束时报 idle,不确定时保持 working(设计见
- *                   herdr/claude/16-stage8-report-state-plan.md §2)。
+ *                   herdr/claude/16-stage8-report-state-plan.md §2)。模型、压缩与 /a2a 命令的状态
+ *                   由同一个就绪状态机汇总(22 号方案 §8–§10)。
+ *   /a2a 命令       用户手动发送,不经过模型:`/a2a` 列出可用的边,`/a2a <边>` 立即发送并在终端显示结果
+ *                   (22 号方案)。只在终端显示,不进入模型上下文;不带幂等键(手动发送每次都真的发)。
  *
  * 只用 Node 内置模块与可擦除的类型标注:pi 用 jiti 加载,单元测试用 node 直接加载。
  */
@@ -168,21 +171,31 @@ export function compactionReserve(env: NodeJS.ProcessEnv, cwd: string | undefine
   return reserve;
 }
 
-export type Reporter = { report(state: "working" | "idle", attempts: number): Promise<boolean>; seq(): number };
+export type Reporter = {
+  /** valid:每次尝试之前检查,返回 false 就放弃(不算失败、不打日志)——用于 idle 的重试(22 号方案 §8.1) */
+  report(state: "working" | "idle", attempts: number, valid?: () => boolean): Promise<boolean>;
+  seq(): number;
+};
 
 /** 调用 `herdr pane report-agent`;序号在本进程内严格递增。失败只记日志,不抛异常。 */
 export function makeReporter(herdrBin: string, paneId: string, env: NodeJS.ProcessEnv,
-                             log: (msg: string) => void = (m) => console.error(m)): Reporter {
+                             log: (msg: string) => void = (m) => console.error(m),
+                             run?: (args: string[]) => Promise<boolean>): Reporter {
   let seq = 0;
-  const once = (state: string) => new Promise<boolean>((resolve) => {
-    seq += 1;
-    execFile(herdrBin, ["pane", "report-agent", paneId, "--source", "a2a", "--agent", "pi", "--state", state,
-                        "--seq", String(seq)], { env, timeout: REPORT_TIMEOUT_MS }, (error) => resolve(!error));
-  });
+  // run 只供单元测试替换真正的 herdr 调用(时序测试要可控);默认 execFile,超时 1 秒
+  const call = run ?? ((args: string[]) => new Promise<boolean>((resolve) => {
+    execFile(herdrBin, args, { env, timeout: REPORT_TIMEOUT_MS }, (error) => resolve(!error));
+  }));
+  const once = (state: string) => {
+    seq += 1;                                  // 调用时同步递增:先调用的序号一定更小
+    return call(["pane", "report-agent", paneId, "--source", "a2a", "--agent", "pi", "--state", state,
+                 "--seq", String(seq)]);
+  };
   return {
     seq: () => seq,
-    async report(state, attempts) {
+    async report(state, attempts, valid) {
       for (let i = 0; i < attempts; i++) {
+        if (valid && !valid()) return true;    // 状态已变:这次 idle 不再需要
         if (await once(state)) return true;
       }
       log(`[a2a] 向 herdr 上报 ${state} 失败(pane ${paneId},已试 ${attempts} 次)。` +
@@ -218,9 +231,67 @@ export function idleIsCertain(messages: any[], contextWindow: number | undefined
   return tokens < (contextWindow - reserve) * IDLE_MARGIN;
 }
 
-export function registerStateReporting(pi: any, reporter: Reporter): void {
+/**
+ * 就绪状态机(22 号方案 §8.1、§10):把模型、压缩与 /a2a 命令汇总成一个"能否报 idle"的判断。
+ *   quiet     模型这一侧确定已结束:agent_start / 压缩开始置 false;agent_end 判定为确定结束时置 true;
+ *             压缩结束不置 true(扩展看不到交互模式的 compactionQueuedMessages,也收不到 compaction_end,
+ *             无法确定压缩之后是否真正收尾),等之后的 agent_end。初始为 true(fnx 刚启动时空闲)。
+ *   inflight  正在执行的 /a2a 命令数。
+ * 只有 quiet && inflight == 0 时报 idle;idle 的每次重试前重新检查。序号在调用 herdr 时同步递增,
+ * herdr 丢弃序号更旧的上报。
+ */
+export type Readiness = {
+  agentStart(): Promise<void>;
+  agentEnd(certain: boolean): Promise<void>;
+  compactStart(): Promise<void>;
+  /** 返回 false:working 上报失败,调用方不应发送(fail-closed) */
+  commandStart(): Promise<boolean>;
+  commandEnd(): Promise<void>;
+};
+
+export function makeReadiness(reporter: Reporter): Readiness {
+  let quiet = true;
+  let inflight = 0;
+  let working: Promise<boolean> | null = null;     // 第一条命令的 working 上报;重叠的命令共用它
+  const idleAllowed = () => quiet && inflight === 0;
+  const reportIdle = async () => {
+    if (idleAllowed()) await reporter.report("idle", 3, idleAllowed);
+  };
+  return {
+    async agentStart() {
+      quiet = false;
+      await reporter.report("working", 2);       // 等上报完成再让模型开始(合计约 2 秒上限)
+    },
+    async agentEnd(certain) {
+      if (!certain) return;                      // 不确定:保持 working
+      quiet = true;
+      await reportIdle();                        // 有命令在途时推迟到最后一条命令结束
+    },
+    async compactStart() {
+      quiet = false;
+      await reporter.report("working", 2);
+    },
+    async commandStart() {
+      inflight += 1;
+      if (inflight === 1) working = reporter.report("working", 2);
+      const ok = await working!;
+      if (!ok) {
+        inflight -= 1;
+        await reportIdle();                      // 上报可能已被 herdr 接受只是没回应:回到 idle,失败只记日志
+      }
+      return ok;
+    },
+    async commandEnd() {
+      inflight -= 1;
+      await reportIdle();
+    },
+  };
+}
+
+export function registerStateReporting(pi: any, reporter: Reporter): Readiness {
+  const readiness = makeReadiness(reporter);
   pi.on("agent_start", async () => {
-    await reporter.report("working", 2);       // 等上报完成再让模型开始(合计约 2 秒上限)
+    await readiness.agentStart();
   });
   pi.on("agent_end", async (event: any, ctx: any) => {
     let contextWindow: number | undefined;
@@ -235,15 +306,102 @@ export function registerStateReporting(pi: any, reporter: Reporter): void {
     } catch {
       reserve = null;
     }
-    if (idleIsCertain(event?.messages, contextWindow, reserve)) {
-      await reporter.report("idle", 3);
-    }
-    // 否则保持 working:可能自动重试或压缩;重试 / 续跑时会再次 agent_start,结束时再判断
+    // 不确定时保持 working:可能自动重试或压缩;重试 / 续跑时会再次 agent_start,结束时再判断
+    await readiness.agentEnd(idleIsCertain(event?.messages, contextWindow, reserve));
   });
   pi.on("session_before_compact", async () => {
-    await reporter.report("working", 2);       // 防御:万一仍发生压缩;压缩结束时不报 idle
+    await readiness.compactStart();            // 防御:万一仍发生压缩;压缩结束时不报 idle
     return undefined;
   });
+  return readiness;
+}
+
+// ---- /a2a 命令(22 号方案)-------------------------------------------------
+export type CommandArgs = { kind: "list" } | { kind: "send"; edge: string } | { kind: "usage" };
+
+export function parseCommandArgs(args: string): CommandArgs {
+  const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return { kind: "list" };
+  if (parts.length === 1) return { kind: "send", edge: parts[0] };
+  return { kind: "usage" };
+}
+
+export function formatEdges(edges: Edge[]): string {
+  return edges.map((e) => `  ${e.edge_id} → ${e.dst}:「${e.text}」`).join("\n");
+}
+
+type Level = "info" | "warning" | "error";
+
+/** 发送结果给人看的提示。级别:已发送 info,确定没发 error,结果未知 warning。 */
+export function formatOutcome(outcome: SendOutcome, edge: string, dst: string): { level: Level; text: string } {
+  if (outcome.kind === "sent") {
+    const r = outcome.receipt;
+    return { level: "info", text: `[a2a] 已发送给 ${r.dst}(msg_id=${r.msg_id}):「${r.text}」` };
+  }
+  if (outcome.kind === "rejected") {
+    return { level: "error", text: `[a2a] 已拒绝,消息没有发送:${outcome.code}: ${outcome.reason}` };
+  }
+  return { level: "warning",
+           text: `[a2a] 发送结果未知:消息可能已经发出,也可能没有。不要直接重发(手动发送不去重,可能重复);`
+             + `先用 a2a queue ${dst} 或在审计日志中查 edge_id=${edge} 核实。原因:${outcome.reason}` };
+}
+
+export const COMMAND = "a2a";
+
+/**
+ * /a2a 的处理(pi 0.79.10:输入以 / 开头时 AgentSession.prompt() 最先查扩展命令,命中就执行并返回,
+ * 不调用模型、不触发 before_agent_start / agent_start;ctx.ui.notify 只在聊天区显示一行,不进会话与模型上下文)。
+ * cache:最近一次读到的出边,只用于补全(避免每敲一个字都启动 Python);发送前总是现读。
+ */
+export function makeSendCommand(cfg: Config, readiness: Readiness, list: () => Edge[], cache: { edges: Edge[] }) {
+  return {
+    description: "手动发送 a2a 消息,不经过模型。/a2a 列出可用的边;/a2a <边> 立即发送",
+    getArgumentCompletions(prefix: string) {
+      const items = cache.edges.filter((e) => e.edge_id.startsWith((prefix ?? "").trim()))
+        .map((e) => ({ value: e.edge_id, label: e.edge_id, description: `→ ${e.dst}` }));
+      return items.length > 0 ? items : null;
+    },
+    async handler(args: string, ctx: any) {
+      const notify = (text: string, level: Level) => {
+        if (ctx?.hasUI !== false && ctx?.ui?.notify) ctx.ui.notify(text, level);
+        else console.error(text);
+      };
+      const parsed = parseCommandArgs(args);
+      if (parsed.kind === "usage") {
+        notify("[a2a] 用法:/a2a 列出可用的边;/a2a <边> 发送(只接受一个边 id)", "error");
+        return;
+      }
+      let edges: Edge[];
+      try {
+        edges = list();
+      } catch (err) {
+        notify(`[a2a] 读取可用通信边失败,未发送:${(err as Error).message}`, "error");
+        return;
+      }
+      if (parsed.kind === "list") {
+        if (edges.length === 0) notify("[a2a] 没有可用的通信边", "warning");
+        else notify(`[a2a] 可用的边(/a2a <边> 发送):\n${formatEdges(edges)}`, "info");
+        return;
+      }
+      const edge = edges.find((e) => e.edge_id === parsed.edge);
+      if (!edge) {
+        notify(`[a2a] 没有这条边:${parsed.edge},未发送。` + (edges.length > 0
+          ? `可用的边:\n${formatEdges(edges)}` : "当前没有可用的通信边"), "error");
+        return;
+      }
+      if (!(await readiness.commandStart())) {
+        notify("[a2a] 无法向 herdr 上报状态,未发送;请稍后重试", "error");
+        return;
+      }
+      try {
+        const outcome = await runSend(cfg, edge.edge_id);    // 不带幂等键:手动发送每次都真的发
+        const { level, text } = formatOutcome(outcome, edge.edge_id, edge.dst);
+        notify(text, level);
+      } finally {
+        await readiness.commandEnd();
+      }
+    },
+  };
 }
 
 export default function (pi: any) {
@@ -251,9 +409,9 @@ export default function (pi: any) {
   if (!cfg) return;
 
   const paneId = process.env.HERDR_PANE_ID;
-  if (paneId) {
-    registerStateReporting(pi, makeReporter(process.env.A2A_HERDR_BIN || "herdr", paneId, process.env));
-  }
+  const readiness = paneId
+    ? registerStateReporting(pi, makeReporter(process.env.A2A_HERDR_BIN || "herdr", paneId, process.env))
+    : null;
 
   pi.on("tool_call", async (event: any) => {
     if (event.toolName !== "bash") return undefined;
@@ -264,14 +422,18 @@ export default function (pi: any) {
     return undefined;
   });
 
+  const cache = { edges: [] as Edge[] };       // 最近一次读到的出边(只用于 /a2a 的补全)
+  const list = () => (cache.edges = listEdges(cfg));
   let runKey = newRunKey();                   // 加载时先有一个;每次开始处理新输入时换新
-  const tool = makeSendTool(pi, cfg, undefined, () => runKey);
+  const tool = makeSendTool(pi, cfg, list, () => runKey);
   tool.load();
   pi.on("before_agent_start", async () => {
     runKey = newRunKey();
     tool.refresh();
     return undefined;
   });
+  // 没有 herdr pane 时不注册命令:无法协调就绪状态,不允许"不上报就发送"(22 号方案 §9)
+  if (readiness) pi.registerCommand(COMMAND, makeSendCommand(cfg, readiness, list, cache));
 }
 
 const TOOL = "a2a_send";

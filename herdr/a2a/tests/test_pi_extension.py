@@ -15,6 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from a2a.audit import AuditLog
 from a2a.identity import AgentIdentity
 from a2a.registry import Registry
@@ -336,6 +338,110 @@ class PiExtension(unittest.TestCase):
     def test_description_says_call_once_and_do_not_retry_unknown(self):
         out, _ = self.harness(self.env(), "describe")
         self.assertIn("每次通知只调用一次", out["tools"][0]["description"])
+
+    # ---- /a2a 命令(22 号方案)-----------------------------------------------
+    def commands(self, args_list, mode="ok", **env):
+        herdr, log = self.fake_herdr(mode)
+        log.unlink(missing_ok=True)
+        out, err = self.harness(self.env(A2A_HERDR_BIN=herdr, **env), "commands", json.dumps(args_list))
+        calls = [line.split() for line in log.read_text().splitlines()] if log.exists() else []
+        return out, err, calls
+
+    def test_command_lists_edges_without_sending(self):
+        out, _, calls = self.commands(["", "   "])
+        self.assertEqual(out["registered"], ["a2a"])
+        for run in out["runs"]:
+            (note,) = run["notes"]
+            self.assertEqual(note["level"], "info")
+            self.assertIn("dv_done → sw_uart", note["text"])
+        self.assertEqual(self.spool.pending(), [])
+        self.assertEqual(calls, [])                                # 只列边:不上报状态
+
+    def test_command_sends_through_the_router_and_reports_working_then_idle(self):
+        out, _, calls = self.commands(["dv_done"])
+        (note,) = out["runs"][0]["notes"]
+        self.assertEqual(note["level"], "info")
+        self.assertIn("已发送给 sw_uart", note["text"])
+        (message,) = self.spool.pending("sw_uart")
+        self.assertEqual((message.src, message.edge_id), ("dv_uart", "dv_done"))
+        self.assertIn(message.msg_id, note["text"])
+        self.assertEqual(self.reported(calls), [("working", 1), ("idle", 2)])
+
+    def test_each_manual_send_really_sends(self):
+        # 不带幂等键:同一进程里连发两次就是两条消息
+        out, _, _ = self.commands(["dv_done", "dv_done"])
+        self.assertEqual([n["notes"][0]["level"] for n in out["runs"]], ["info", "info"])
+        self.assertEqual(len(self.spool.pending("sw_uart")), 2)
+        self.assertFalse((self.state / "idempotency").exists())
+
+    def test_unknown_edge_or_extra_arguments_send_nothing(self):
+        out, _, calls = self.commands(["no_such_edge", "sw_test_pass", "dv_done extra"])
+        unknown, wrong_role, usage = (r["notes"][0] for r in out["runs"])
+        self.assertEqual(unknown["level"], "error")
+        self.assertIn("没有这条边:no_such_edge", unknown["text"])
+        self.assertIn("dv_done → sw_uart", unknown["text"])          # 附上可用的边
+        self.assertEqual(wrong_role["level"], "error")                 # 别的角色的边不在出边里
+        self.assertEqual(usage["level"], "error")
+        self.assertIn("用法", usage["text"])
+        self.assertEqual(self.spool.pending(), [])
+        self.assertEqual(calls, [])
+
+    def test_router_rejection_is_shown_as_not_sent(self):
+        data = yaml.safe_load((self.state / "topology.yaml").read_text())
+        data["edges"][0]["template"] = "/a2a sw_test_pass"          # 旧拓扑里的不安全模板(手工编辑)
+        (self.state / "topology.yaml").write_text(yaml.safe_dump(data, allow_unicode=True))
+        out, _, calls = self.commands(["dv_done"])
+        (note,) = out["runs"][0]["notes"]
+        self.assertEqual(note["level"], "error")
+        self.assertIn("没有发送:unsafe_template", note["text"])
+        self.assertEqual(self.spool.pending(), [])
+        self.assertEqual(self.reported(calls), [("working", 1), ("idle", 2)])
+
+    def test_failure_to_read_edges_sends_nothing(self):
+        out, _, calls = self.commands(["dv_done"], A2A_PYTHON="/bin/false")
+        (note,) = out["runs"][0]["notes"]
+        self.assertEqual(note["level"], "error")
+        self.assertIn("读取可用通信边失败", note["text"])
+        self.assertEqual(calls, [])
+
+    def test_unknown_outcome_is_a_warning_that_says_not_to_resend(self):
+        # 读出边正常,send 失败(退出码 1、不是 Router 的拒绝):结果未知
+        wrapper = self.state / "python_send_fails.sh"
+        wrapper.write_text(f'#!/bin/sh\nfor a in "$@"; do [ "$a" = send ] && {{ echo boom >&2; exit 1; }}; done\n'
+                           f'exec {sys.executable} "$@"\n')
+        wrapper.chmod(0o755)
+        out, _, calls = self.commands(["dv_done"], A2A_PYTHON=str(wrapper))
+        (note,) = out["runs"][0]["notes"]
+        self.assertEqual(note["level"], "warning")
+        self.assertIn("发送结果未知", note["text"])
+        self.assertIn("不要直接重发", note["text"])
+        self.assertIn("a2a queue sw_uart", note["text"])
+        self.assertEqual(self.reported(calls), [("working", 1), ("idle", 2)])
+
+    def test_readiness_timing_node_tests(self):
+        # 就绪状态机的确定性时序测试(tests/js/readiness.test.mjs,node --test)
+        run = subprocess.run([NODE, "--test", str(HERE / "js" / "readiness.test.mjs")],
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-2000:])
+        self.assertIn("# fail 0", run.stdout.replace("ℹ", "#"))
+
+    def test_failed_working_report_means_not_sent(self):
+        out, err, calls = self.commands(["dv_done"], mode="fail")
+        (note,) = out["runs"][0]["notes"]
+        self.assertEqual(note["level"], "error")
+        self.assertIn("无法向 herdr 上报状态,未发送", note["text"])
+        self.assertEqual(self.spool.pending(), [])
+        self.assertEqual([s for s, _ in self.reported(calls)], ["working", "working", "idle", "idle", "idle"])
+
+    def test_no_command_without_a_herdr_pane(self):
+        out, _, _ = self.commands([], HERDR_PANE_ID=None)
+        self.assertEqual(out["registered"], [])
+
+    def test_completions_use_the_cached_edges(self):
+        out, _ = self.harness(self.env(), "completions", json.dumps(["", "dv", "x"]))
+        self.assertEqual([i["value"] for i in out[""]], ["dv_done"])  # 加载时读过一次出边
+        self.assertEqual([i["value"] for i in out["dv"]], ["dv_done"])
+        self.assertIsNone(out["x"])
 
     # ---- 拦截 ----------------------------------------------------------
     def test_blocks_direct_herdr_writes_from_bash(self):

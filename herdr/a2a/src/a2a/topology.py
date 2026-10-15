@@ -223,6 +223,32 @@ def _required_slug(value: Any, field: str) -> str:
     return value
 
 
+# pi 交互模式提交输入前用 JS String.prototype.trim() 去掉首尾空白(WhiteSpace + LineTerminator),
+# 再把以 "/" 开头的当命令(/quit、扩展命令、/skill:…)、以 "!" 开头的当 bash 执行。
+# 这里的字符集 = JS trim 的字符集,检查时再并上 Python str.isspace():宁多勿少(22 号方案 §9)。
+_JS_TRIM_CHARS = frozenset("\t\n\v\f\r \u00a0\u1680\u2028\u2029\u202f\u205f\u3000\ufeff"
+                           + "".join(chr(c) for c in range(0x2000, 0x200B)))
+COMMAND_PREFIXES = ("/", "!")
+
+
+def command_prefix(text: str) -> Optional[str]:
+    """消息去掉开头空白后若以 "/" 或 "!" 开头,返回该字符;否则 None。
+    这样的消息投递到 pi 会被当成命令或 bash 执行,而不是交给模型。"""
+    i = 0
+    while i < len(text) and (text[i] in _JS_TRIM_CHARS or text[i].isspace()):
+        i += 1
+    return text[i] if i < len(text) and text[i] in COMMAND_PREFIXES else None
+
+
+def check_template_safe(template: str, where: str) -> None:
+    """写入拓扑时的检查(create / add_edge / set_template)。加载时不做,旧拓扑照常可用(22 号方案 §8、§10);
+    发送时 Router 对渲染后的消息再查一次。{ip} 填入的 IP 名字以小写字母开头,用任意合法名字渲染结果相同。"""
+    prefix = command_prefix(template.format(ip="x"))
+    if prefix:
+        raise TopologyError(f"{where}.template 不能以 {prefix!r} 开头(去掉开头空白后):"
+                            f"投递到 pi 时会被当成{'命令' if prefix == '/' else ' bash'}执行")
+
+
 def _validate_template(template: str, where: str) -> None:
     try:
         parts = list(string.Formatter().parse(template))
@@ -278,6 +304,8 @@ class TopologyStore:
         if not target.is_absolute():
             raise TopologyError(f"拓扑文件必须是绝对路径: {target}")
         topology = data if isinstance(data, Topology) else Topology.from_dict(data)
+        for edge in topology.edges.values():
+            check_template_safe(edge.template, f"edges[{edge.edge_id}]")
         lock = target.with_name(target.name + ".lock")
         with exclusive_lock(lock):
             if target.exists():
@@ -425,6 +453,9 @@ class TopologyStore:
             edges = _list_field(data, "edges")
             if any(isinstance(e, dict) and e.get("id") == edge_id for e in edges):
                 raise TopologyError(f"edge id 已存在: {edge_id}")
+            if isinstance(template, str):
+                _validate_template(template, f"edges[{edge_id}]")    # 先做格式校验,再按渲染结果查开头
+                check_template_safe(template, f"edges[{edge_id}]")
             edges.append({"id": edge_id, "from": source_role, "to": target_role, "template": template})
 
         return self.update(mutate)
@@ -443,6 +474,9 @@ class TopologyStore:
         def mutate(data: Dict[str, Any]) -> None:
             for edge in _list_field(data, "edges"):
                 if isinstance(edge, dict) and edge.get("id") == edge_id:
+                    if isinstance(template, str):
+                        _validate_template(template, f"edges[{edge_id}]")
+                        check_template_safe(template, f"edges[{edge_id}]")
                     edge["template"] = template
                     return
             raise TopologyError(f"通信边不存在: {edge_id}")

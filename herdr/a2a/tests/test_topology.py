@@ -135,6 +135,54 @@ class TopologyValidationTests(unittest.TestCase):
         self.assertIn("dv_done", topology.edges)
 
 
+class CommandPrefixTests(unittest.TestCase):
+    """22 号方案 §9:pi 提交前按 JS trim() 去掉开头空白,再把 / 当命令、! 当 bash。"""
+
+    def test_detects_slash_and_bang_after_js_and_python_whitespace(self):
+        from a2a.topology import command_prefix
+        for lead in ("", " ", "\t", "\n", "\r\n", "\ufeff", "\u00a0", "\u3000", "\u2028", "\u2029", "\u2003",
+                     "\u202f", "\u205f", "\u1680", "\v\f", "\x1c", " \ufeff\u3000 "):
+            for prefix in ("/", "!"):
+                with self.subTest(lead=repr(lead), prefix=prefix):
+                    self.assertEqual(command_prefix(f"{lead}{prefix}a2a dv_done"), prefix)
+        for text in ("uart 完成 /a2a", "完成!", "a/b", "\u200b/quit", "{ip}", "", "   "):
+            with self.subTest(text=repr(text)):
+                self.assertIsNone(command_prefix(text))       # 零宽空格 U+200B 不是 JS 空白,pi 不会去掉
+
+    def test_creating_or_editing_an_unsafe_template_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "topology.yaml"
+            for template in ("/a2a dv_done", "!ls", "  /quit", "\ufeff!rm", "\n!ls", "\u3000/skill:x"):
+                with self.subTest(template=repr(template)):
+                    bad = cfg(edges=[{"id": "bad", "from": "dv", "to": "sw", "template": template}])
+                    with self.assertRaisesRegex(TopologyError, "开头"):
+                        TopologyStore.create(path, bad)
+                    self.assertFalse(path.exists())
+            store = TopologyStore.create(path, CONFIG)
+            before = path.read_text()
+            for template in ("/a2a dv_done", "\ufeff!rm -rf x"):
+                with self.subTest(template=repr(template)):
+                    with self.assertRaisesRegex(TopologyError, "开头"):
+                        store.add_edge("sw_ack", "sw", "dv", template)
+                    with self.assertRaisesRegex(TopologyError, "开头"):
+                        store.set_template("dv_done", template)
+                    self.assertEqual(path.read_text(), before)
+            store.add_edge("sw_ack", "sw", "dv", "{ip} 收到 /a2a 与 ! 都在中间,没问题")
+            store.set_template("dv_done", "{ip} done!")
+
+    def test_existing_unsafe_template_still_loads_and_can_be_fixed(self):
+        # 加载不做此项检查:旧拓扑照常可用(Router 发送时拒绝),并能用 set_template 修正
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "topology.yaml"
+            legacy = cfg(edges=[{"id": "dv_done", "from": "dv", "to": "sw", "template": "/a2a sw_done"}])
+            path.write_text(yaml.safe_dump(legacy, allow_unicode=True))
+            store = TopologyStore(path)
+            self.assertEqual(store.current().get_edge("dv_done").template, "/a2a sw_done")
+            store.add_ip("spi")                                   # 不相关的修改不受影响
+            store.set_template("dv_done", "{ip} 完成")
+            self.assertEqual(TopologyStore(path).current().get_edge("dv_done").template, "{ip} 完成")
+
+
 class TopologyStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

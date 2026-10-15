@@ -396,8 +396,9 @@ STAGE6_EDGES = [
 class RealFnxPlugin(_Base):
     """阶段 6:真实 fnx 加载 a2a 插件。**不发任何提示词,不调用模型。**
 
-    插件用 `a2a plugin install` 以软链接装进 fnx 的 agent/extensions/(路线图 313),结束时 uninstall
-    (原本已安装的保持不动);检查扩展临时复制进去,结束时移除。
+    启动参数 `--no-extensions -e <仓库里的插件> -e <检查扩展>`:不加载 fnx 里已安装的任何扩展(包括在线安装的
+    a2a 包),只加载本仓库的开发版,也不往 fnx 的 agent 目录写任何东西(22 号方案实现时改;此前用
+    `a2a plugin install` 软链接,但 VM 上已在线安装插件后软链接安装会被拒绝)。
     """
 
     def make_launchers(self):
@@ -409,25 +410,20 @@ class RealFnxPlugin(_Base):
         def stage6(data):
             data["edges"] = STAGE6_EDGES
             for role in ("dv", "sw"):
-                data["roles"][role]["launch_args"] = ["--no-builtin-tools"]
+                data["roles"][role]["launch_args"] = ["--no-builtin-tools", *self.extension_args()]
         self.store.update(stage6)
         (self.state / "inspect.enabled").touch()
         self.work = self.state / "work"  # agent 的工作目录:测试结束时必须仍为空
         self.work.mkdir()
         for role in ("dv", "sw"):
-            fnx_dir = str(Path(FNX[role]).parents[1])
-            _, installed, _ = self.a2a_plain("plugin", "install", "--agent-dir", fnx_dir)
-            if installed.get("changed"):   # 先登记卸载再断言;原本已安装的保持不动;逆序执行:在删完检查扩展之后
-                self.addCleanup(self.a2a_plain, "plugin", "uninstall", "--agent-dir", fnx_dir)
-            self.assertEqual((installed["state"], Path(installed["source"])), ("linked", PLUGIN))
-            dest = Path(fnx_dir) / "agent" / "extensions" / INSPECT.name
-            self.addCleanup(dest.unlink, missing_ok=True)
-            shutil.copy(INSPECT, dest)
             # fnx 按工作目录在 agent/sessions/ 下建会话目录;没有发提示词,应当是空的
             sessions = Path(FNX[role]).parents[1] / "agent" / "sessions"
             self.addCleanup(self._rmdir_if_empty, sessions / ("-" + str(self.work).replace("/", "-") + "--"))
         # 清理按注册的逆序执行:先停掉 agent,再移除扩展文件和空目录
         self.addCleanup(self.purge_all)
+
+    def extension_args(self):
+        return ["--no-extensions", "-e", str(PLUGIN), "-e", str(INSPECT)]
 
     def a2a_plain(self, *argv):
         """不带 --session 的 a2a 命令(plugin 不需要会话)。"""
@@ -471,6 +467,107 @@ class RealFnxPlugin(_Base):
             self.assertTrue(os.path.isabs(herdr_bin) and os.access(herdr_bin, os.X_OK), herdr_bin)
         self.assertEqual(sorted(p.name for p in self.work.iterdir()), [])
         self.assertEqual(self.registry.get("sw_uart").lifecycle, "running")
+
+
+
+@unittest.skipUnless(ENABLED and FNX_ENABLED and HAVE_TOOLS and all(os.path.exists(p) for p in FNX.values()),
+                     "设置 A2A_INTEGRATION=1 与 A2A_INTEGRATION_FNX=1,并安装 fnx_dv / fnx_sw")
+class RealFnxCommand(RealFnxPlugin):
+    """22 号方案:在真实 fnx 的输入框里输入 `/a2a <边>` 回车。**不调用模型**:命令由插件处理,不进入模型;
+    也不启动 broker(投递会把消息打进对方 pane、触发对方的模型)。"""
+
+    test_fnx_loads_the_plugin_and_only_a2a_send_is_active = None   # 不继承父类的用例(这里没加载检查扩展)
+
+    def extension_args(self):
+        return ["--no-extensions", "-e", str(PLUGIN)]
+
+    def screen(self, pane_id):
+        return client.pane_read(pane_id, source="recent-unwrapped", lines=80)
+
+    def wait_screen(self, pane_id, needle, timeout=20):
+        deadline = time.monotonic() + timeout
+        text = ""
+        while time.monotonic() < deadline:
+            text = self.screen(pane_id)
+            if needle in text:
+                return text
+            time.sleep(0.3)
+        self.fail(f"{timeout} 秒内屏幕上没有出现 {needle!r}。屏幕:\n{text}")
+
+    def status(self, agent_id):
+        return client.agent_get(agent_id)["agent_status"]
+
+    def spawn_pair(self):
+        panes = {}
+        for role in ("dv", "sw"):
+            _, info, _ = self.a2a("agent", "spawn", role, "uart", "--cwd", str(self.work))
+            panes[role] = info["pane_id"]
+        self.wait_screen(panes["dv"], "a2a.ts")             # 插件已加载(启动画面 [Extensions])
+        return panes
+
+    def sessions_have_no_model_calls(self):
+        """fnx 的会话文件里不能有 assistant 消息(没有调用模型)。"""
+        sessions = Path(FNX["dv"]).parents[1] / "agent" / "sessions" / ("-" + str(self.work).replace("/", "-") + "--")
+        for f in sessions.glob("*.jsonl") if sessions.is_dir() else []:
+            self.assertNotIn('"role":"assistant"', f.read_text().replace(" ", ""), f)
+
+    def test_slash_command_sends_without_the_model(self):
+        panes = self.spawn_pair()
+        client.pane_run(panes["dv"], "/a2a")
+        self.wait_screen(panes["dv"], "dv_done → sw_uart")
+        client.pane_run(panes["dv"], "/a2a dv_done")
+        text = self.wait_screen(panes["dv"], "已发送给 sw_uart")
+        spool = Spool(self.state / "spool")
+        (message,) = spool.pending("sw_uart")
+        self.assertEqual((message.src, message.edge_id), ("dv_uart", "dv_done"))
+        self.assertIn(message.msg_id, text)
+        client.pane_run(panes["dv"], "/a2a nope")
+        self.wait_screen(panes["dv"], "没有这条边:nope")
+        self.assertEqual(len(spool.pending("sw_uart")), 1)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and self.status("dv_uart") not in ("idle", "done"):
+            time.sleep(0.3)
+        self.assertIn(self.status("dv_uart"), ("idle", "done"))
+        self.sessions_have_no_model_calls()
+
+    def test_slow_command_shows_working_until_it_finishes(self):
+        # 占住 IP 的排空锁(独占,不写排空标记):Router 入队时等共享锁,命令就会卡住几秒
+        from a2a import ipdrain
+        import threading
+        panes = self.spawn_pair()
+        self.assertIn(self.status("dv_uart"), ("idle", "done"))
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with ipdrain.drain_exclusive(self.state, "uart"):
+                held.set()
+                release.wait(30)
+        t = threading.Thread(target=hold)
+        t.start()
+        try:
+            self.assertTrue(held.wait(10))
+            client.pane_run(panes["dv"], "/a2a dv_done")
+            deadline = time.monotonic() + 10
+            seen = []
+            while time.monotonic() < deadline:
+                seen.append(self.status("dv_uart"))
+                if seen[-1] == "working":
+                    break
+                time.sleep(0.2)
+            self.assertEqual(seen[-1], "working", f"命令在途时应为 working,看到 {seen}")
+            time.sleep(2)
+            self.assertEqual(self.status("dv_uart"), "working")   # 仍在等锁
+            self.assertEqual(Spool(self.state / "spool").pending("sw_uart"), [])
+        finally:
+            release.set()
+            t.join(10)
+        self.wait_screen(panes["dv"], "已发送给 sw_uart")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and self.status("dv_uart") not in ("idle", "done"):
+            time.sleep(0.2)
+        self.assertIn(self.status("dv_uart"), ("idle", "done"))   # herdr 把未查看的结束显示为 done,都可投递
+        self.sessions_have_no_model_calls()
 
 
 if __name__ == "__main__":

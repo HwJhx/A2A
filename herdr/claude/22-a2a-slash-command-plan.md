@@ -124,3 +124,50 @@
 | --- | --- | --- | --- | --- |
 | 1 | 阻断 | `ctx.hasPendingMessages()` 只看 `session.pendingMessageCount`,不含交互模式独立维护的 `compactionQueuedMessages`(压缩期间提交的输入暂存于此,`compaction_end` 时才 flush);`session_compact` 在 `compaction_end` 之前被 await → 插件可能在 flush 前报 idle | 成立(已在 fnx 内 pi 0.79.10 找到 `compactionQueuedMessages` 的 push 与 flush)。扩展既看不到这个队列,也收不到 `compaction_end`,**无法可靠判断压缩之后是否真正收尾** | **撤回 §9 第 2 项**,恢复 16 号方案原规则:`session_compact` 不报 idle,`quiet` 保持 false,直到之后的 `agent_end` 确定结束。代价(已有限制,本命令没有让它更糟):不重试的成功压缩之后若没有新的模型轮次,herdr 一直认为该 agent 在 working,发给它的消息等到超时、告警,按 16 号 §2.2 重启该 agent 恢复;压缩之后用户随便输入一句让模型跑完一轮也能恢复。自动阈值压缩本来就只发生在插件已判定"不确定"(用量 ≥ 阈值 90%)而保持 working 的时候。README 写明。测试:压缩结束后无后续轮次 → 不报 idle;压缩中命令在途 → 命令结束也不报 idle;之后 agentStart/agentEnd(确定)→ idle。 |
 | 2 | 应修 | 检查前置到所有幂等查找之前,会让旧拓扑下已入队请求的同键重放被报成"未发送",破坏重放语义 | 成立(`_send_idempotent`:记录为 `enqueued` 时直接返回原回执,不重新鉴权) | 检查只作用于**新消息入队之前**:放进 `_authorize`(新发送与 intent 补做的重新鉴权都经过它),另外在 intent 补做**直接使用快照**入队之前也检查快照文本(防旧版本留下的 intent);`enqueued` 记录照旧返回原回执。拒绝写 REJECTED 审计、不写 QUEUED。测试:无幂等键的新发送、带键的新发送、intent 补做(快照与重新鉴权两条路)被拒;已有 `enqueued` 记录的重放仍返回原回执。 |
+
+## 11. 实现记录(2026-10-15)
+
+按 §2–§10 实现:
+
+- **Python 后端**
+  - `topology.py`:`command_prefix(text)`(JS `trim()` 字符集并上 `isspace()`,反复去掉开头后看 `/`、`!`)、`check_template_safe`;只在 `TopologyStore.create`、`add_edge`、`set_template` 调用,`Topology.from_dict`(加载、热重载)不调用。
+  - `router.py`:拒绝码 `unsafe_template`;`_authorize` 渲染后检查(新发送、intent 补做的重新鉴权都经过);intent 用快照入队前再查快照文本;`enqueued` 重放不经过检查,照旧返回原回执。协议文档 08 号拒绝码表补上。
+- **插件 `a2a.ts`**
+  - `makeReporter` 的 `report(state, attempts, valid?)`:每次尝试前检查 `valid()`,不满足就放弃(不算失败、不打日志);新增可选参数 `run` 只供单元测试替换真正的 herdr 调用。
+  - `makeReadiness(reporter)`:`quiet` + `inflight` 状态机;`registerStateReporting` 的 `agent_start` / `agent_end` / `session_before_compact` 都经过它,行为与阶段 8 相同。
+  - `/a2a` 命令:`parseCommandArgs`、`formatEdges`、`formatOutcome`、`makeSendCommand`;补全用缓存(加载时、每轮 refresh、每次执行命令时更新);没有 `HERDR_PANE_ID` 不注册。
+- **测试**
+  - 拓扑 / Router / 幂等:命令前缀字符集(含 BOM、NBSP、全角空格、U+2028、U+1680、`\x1c`;零宽空格 U+200B 不算)、写入拒绝与文件不变、旧拓扑加载并可修正、发送被拒不入队无 QUEUED 审计、修正后可发、带键新发送不留 intent、intent 补做两条路径被拒、`enqueued` 重放返回原回执。
+  - 插件:`tests/js/readiness.test.mjs` 9 个确定性时序用例(§8.2 的 7 项,加上 working 失败两种);`test_pi_extension.py` 新增 11 个(列边、发送经 Router 且上报 [working, idle]、两次发送两条消息不留幂等记录、非法边 / 别的角色的边 / 多参数不发、旧拓扑的 `unsafe_template` 显示未发送、读边失败、结果未知为 warning 并提示不要重发、working 失败不发、没有 pane 不注册、补全)。
+  - 真实 fnx(VM,`RealFnxCommand`,不调用模型、不启动 broker):输入框里 `/a2a` 列边、`/a2a dv_done` 入队且屏幕显示 msg_id、`/a2a nope` 不入队、之后状态回到 idle / done、会话文件里没有 assistant 消息;占住 IP 排空锁让命令卡住时 herdr 显示 working、队列为空,放开后发送完成、回到 idle / done。
+  - `RealFnxPlugin` 改为启动参数 `--no-extensions -e <开发版插件> -e <检查扩展>`:VM 上已在线安装插件,原来的软链接安装会被(21 号 §12 的防护)拒绝;新方式不往 fnx 目录写任何东西。已实测 `-ne` 不加载在线包、`-e` 只加载指定文件。
+  - 变异检查(都被抓到):agent_end 不管在途命令、命令不等 working、idle 重试不复查、working 失败仍发送、压缩不置 quiet=false、Router 不查前缀、快照不查前缀、set_template 不查、字符集不含 BOM。
+- **与方案的差异**:§7 第 2 项"命令拖长期间 broker 入站、最终 DELIVERED"没有用真实 fnx 做——投递会把消息打进 dv 的 pane、触发模型。改为验证 broker 依据的 herdr 状态:命令在途时为 working、结束后为 idle / done;broker 在 working 时等待、idle / done 时投递,由已有的投递测试覆盖。§7 第 4 项(模型运行中执行命令)只有单元测试,真实测试需要调用模型,未做。
+
+## 12. Codex 审核实现(2026-10-15)
+
+阻断无、应修无。Codex 确认:状态机与 pi 事件对应正确(压缩不提前报 idle);进入发送后 `runSend`、格式化与 notify 都在 try/finally 里,`commandEnd` 一定执行;working 失败不发送并回退 `inflight`;`command_prefix` 字符集正确;Router 两处检查与幂等语义吻合。
+
+| 将来考虑 | 判断 | 处理 |
+| --- | --- | --- |
+| `RealFnxPlugin` 改用 `-ne -e` 后不再验证"软链接安装后被 fnx 自动发现" | 是 | 记录为缺口:VM 上已在线安装插件,软链接安装会被防护拒绝,恢复这项测试需临时卸掉用户的在线包(改用户环境),暂不做。软链接安装本身的逻辑由 `test_plugin.py` 覆盖;fnx 能加载软链接扩展已在阶段 6 与 19 号方案实测过。 |
+| 检查只约束新入队;升级前已入队的不安全消息 broker 不再校验 | 是,影响小(现有拓扑没有这类模板) | README 写明边界与升级前核查方法:`a2a queue` 查看;排队中的消息不能直接裁定(`resolve` 只处理队列头的不确定 / 终态消息),先停接收方让它变成 `TARGET_MISSING`,再 `resolve … abandon`,然后恢复接收方。(初稿写成直接 `resolve … abandon`,核对 `rulings.plan` 后更正。) |
+
+## §13 codex-test 交叉验证(2026-10-15)
+
+环境:OrbStack VM `ubuntu` / Ubuntu 22.04.5 / Python 3.10.12。运行前 Mac/VM 的 11 个改动文件 SHA-256 全部一致:`README.md`、`pi-extension/a2a.ts`、`router.py`、`topology.py`、`plugin_harness.mjs`、`readiness.test.mjs`、`test_idempotency.py`、`test_integration_lifecycle.py`、`test_pi_extension.py`、`test_router.py`、`test_topology.py`。没有改源码或测试文件。
+
+| 检查 | 结果 | 实测记录 |
+| --- | --- | --- |
+| Python 单元全套 | ✅ 662 项，615 通过、0 失败、47 跳过 | 清除 `herdr/a2a` 下 `__pycache__` 后，在 VM `herdr/a2a` 运行 `env PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v`；输出 `Ran 662 tests in 23.683s`、`OK (skipped=47)`。 |
+| Node readiness | ✅ 9/9，0 失败、0 跳过 | 仓库根运行 `node --test herdr/a2a/tests/js/readiness.test.mjs`；9 个时序用例全部通过。Node 对 `.ts` 模块有 `MODULE_TYPELESS_PACKAGE_JSON` 性能提示，不影响结果。 |
+| 指定真实 fnx 插件与斜杠命令 | ✅ 3/3，0 失败、0 跳过 | `A2A_INTEGRATION=1 A2A_INTEGRATION_FNX=1 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_integration_lifecycle.RealFnxPlugin tests.test_integration_lifecycle.RealFnxCommand`；`Ran 3 tests in 28.761s`、`OK`。其中一项验证插件加载，两项只输入 `/a2a`、`/a2a dv_done`、`/a2a nope`，不启动 broker；会话文件断言没有 assistant 消息。未向真实 fnx 输入普通文字或调用模型。 |
+| 全量集成发现（FNX 开关关闭） | ✅ 47 项，39 通过、0 失败、8 跳过 | VM `herdr/a2a` 运行 `env -u A2A_INTEGRATION_FNX PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 A2A_INTEGRATION=1 python3 -m unittest discover -s tests -p 'test_integration_*.py' -v`；`Ran 47 tests in 335.348s`、`OK (skipped=8)`。此轮作为完整 discover 基线；8 项为真实 fnx 类被开关跳过。 |
+| 安全全量集成（FNX 开关开启） | ✅ 45/45，0 失败、0 跳过；排除 2 项 | 使用临时 `/mnt/mac/private/tmp/a2a_xc_safe_integration.py` 收集全部 `test_integration_*.py`，只排除 `TestRealFnxLaunch` 两项（它们会输入 `! echo ...`）；其余测试在 `A2A_INTEGRATION=1 A2A_INTEGRATION_FNX=1 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1` 下运行。输出 `collected=47 excluded_non_slash_real_fnx=2`、`Ran 45 tests in 404.468s`、`OK`。真实 fnx 的 lifecycle、recovery、IP ops、plugin 和 `RealFnxCommand` 均实际运行；真实 fnx pane 只收到测试中的 `/a2a` 命令，未调用模型。临时 runner 已删除。 |
+| 拓扑 CLI 拒绝危险模板 | ✅ 8/8 拒绝，拓扑文件逐次字节不变 | 临时拓扑与状态位于 `/tmp/a2a_xc_manual`。对 `add-edge` 和 `set-template` 分别测试 `/a2a x`、`!ls`、BOM+`!ls`、全角空格+`/quit`，每次 CLI 返回码 6，写前后文件字节完全相同。 |
+| 普通正文中的 `/` 与 `!` | ✅ | `set-template` 写入“正文中间 /a2a x 与 !ls 都是普通文字”返回码 0。 |
+| Router 最后防线 | ✅ | 手工把拓扑模板改为 `/a2a x`，以临时注册表身份运行真实 `a2a send dv_done` CLI；返回码 4，stderr 的 `rejected` 为 `unsafe_template`，`sw_uart` pending 队列为 0。 |
+| 变异检查 | ✅ 两处均被目标测试捕获 | 隔离副本中将 `a2a.ts` 的 `inflight === 1` 改为 `inflight > 0`；readiness 测试 8 通过、1 失败，重叠命令用例实际观察到两次 `working`，正确断言要求一次。另一隔离副本把 Python `command_prefix` 改为恒返回 `None`；`test_detects_slash_and_bang_after_js_and_python_whitespace` 的 34 个子用例失败。两处都使用 trap 恢复，`cmp` 与备份及原文件一致。 |
+| 清理与限制 | ✅ | 临时状态、拓扑、变异副本、日志和脚本已删除；测试生成的会话和 tmux 均无残留。检查时另见 fnx_dv `agent/sessions/--tmp-a2a_ne_check--`，它不属于本轮测试命名且来源未核实，因此未触碰。未触碰禁用的 Herdr 会话，未修改 fnx agent 安装目录/在线包，未读取 `auth.json` 或密钥，未调用模型。 |
+
+结论:所测 Python 模板写入拒绝、Router 入队前二次检查、插件 readiness 状态机及真实 fnx `/a2a` 命令行为符合预期。最终安全全量集成覆盖了所有不需要普通 shell 输入的用例；仅排除 `TestRealFnxLaunch` 两项以遵守只允许 `/a2a` 的约束。

@@ -226,6 +226,27 @@ a2a agent recover --session <会话> [--ip gpio] [--include-stopped]
 
 在 a2a 管理的 fnx pane 里生效(由 `a2a agent spawn` 注入的 `A2A_*` 环境变量判断),普通使用 fnx 时什么都不做。
 
+### `/a2a` 命令:手动发送,不经过模型(22 号方案)
+
+在 agent 终端的输入框里:
+
+| 输入 | 结果 |
+| --- | --- |
+| `/a2a` | 列出本角色可用的边(`边 → 接收方:「内容」`) |
+| `/a2a dv_done` | 立即发送;显示 `[a2a] 已发送给 sw_uart(msg_id=…)` |
+| `/a2a <不存在的边>` / 多个参数 | 红字提示并列出可用的边,**不发送** |
+
+- 不调用模型、不耗 token;提示只显示在终端,**不进入模型上下文**(模型下一轮不知道你手动发过;对方的回复照常投递进来)。输入 `/a2a ` 后可补全边名。
+- 不去重:手动发送每次都真的发。提示"发送结果未知"时**不要直接重发**,先 `a2a queue <对方>` 或查审计日志核实。
+- 模型正在工作时也能用(命令立即执行,不排队)。
+- 状态协调:命令开始时先向 herdr 上报 working,发完再报 idle,broker 不会在命令进行中往这个 pane 投递;**上报 working 失败就不发送**(提示稍后重试)。模型、压缩与命令共用同一个判断:只有"模型确定已结束且没有命令在途"才报 idle。
+- 只在 a2a 管理、且有 herdr pane 的 fnx 里注册;插件被装了两份时 pi 会生成 `/a2a:1`、`/a2a:2`(见下文防重复安装)。
+- 已知限制(沿用阶段 8 状态上报):压缩(手动 `/compact` 或自动压缩)成功后若没有新的模型轮次,herdr 会一直认为该 agent 在 working,发给它的消息等到超时、告警;随便给它输入一句让模型跑完一轮,或重启该 agent 即可恢复。插件看不到 pi 交互模式压缩期间暂存的输入,无法可靠判断压缩之后是否真正收尾,所以宁可保持 working。
+
+**拓扑模板不能以 `/` 或 `!` 开头**(去掉开头空白后,包括 BOM、全角空格等):消息原样打进对方的 pi,会被当成命令(`/quit`、`/a2a …`)或 bash(`!…`)执行。`a2a topology` 的新建、`add-edge`、`set-template` 拒绝这类模板;已有拓扑里若有(旧文件或手工编辑),照常加载,但发送时 Router 拒绝(`unsafe_template`,入队前,消息确定没发),用 `set-template` 修正即可。
+
+边界:检查只作用于**新入队**的消息;升级到带此检查的版本之前就已在队列里的消息,broker 投递时不会再检查。沿用旧的状态目录前,先用 `a2a queue <对方>` 看待投递消息的内容。若有以 `/` 或 `!` 开头的:正在排队的消息不能直接裁定(`a2a resolve` 只处理队列头上结果不确定或已终态的消息),先 `a2a agent stop` 停掉接收方,让这条消息投递失败(`TARGET_MISSING`,终态),再 `a2a resolve <msg_id> abandon --reason …` 放弃,然后 `a2a agent restore` 恢复接收方。
+
 有两种安装方式,**同一个 fnx 只能用其中一种**(两种都装会加载两份插件:`a2a_send` 注册两次,working / idle 也会上报两次)。防护:`a2a plugin status` 同时读 `<agent 目录>/settings.json` 的 `packages`,指向本仓库的在线包(各种 git 写法,或解析到本仓库的本地路径)报为 `online_package`,两种都装时给出 `duplicate`;已有在线包时 `a2a plugin install` 拒绝;settings 读不了时 install 也拒绝(fail-closed)。**反方向挡不住**:先装了软链接、再用 `fnx_dv install` 在线安装,pi 的命令不经过 a2a,只能靠 `a2a plugin status` 发现,请先 `a2a plugin uninstall`。
 
 pi 还会加载**项目级**配置:fnx 启动目录下的 `.forenyx/`(fnx 的 configDir;`settings.json` 的 `packages`、`git/` 与 `npm/` 里的安装副本、`extensions/` 里的扩展,装法是 `fnx_dv install -l …`)。软链接装在 agent 级,对所有项目生效,a2a 无法知道有哪些项目,所以**不带参数时只保证 agent 级**(`status` 输出 `project_scope` 提示);用 `--project-dir <项目目录>`(可重复)让 `status` / `install` 一并检查这些项目:项目级已有本插件时 `install` 拒绝,`status` 列出 `project_packages`,与 agent 级同时存在时报 `duplicate`。建议:不要在项目级安装本插件。

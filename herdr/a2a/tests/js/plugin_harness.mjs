@@ -4,6 +4,8 @@
 //   node plugin_harness.mjs <插件路径> tool_call <toolName> <input JSON>
 //   node plugin_harness.mjs <插件路径> events <事件列表 JSON>
 //   node plugin_harness.mjs <插件路径> rounds <步骤列表 JSON>   每步先改拓扑文件,再触发 before_agent_start
+//   node plugin_harness.mjs <插件路径> commands <参数列表 JSON>   依次执行 /a2a <参数>,记录 notify
+//   node plugin_harness.mjs <插件路径> completions <前缀列表 JSON> [warm]  补全(warm:先触发一次 before_agent_start)
 import { copyFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -25,7 +27,9 @@ const pi = {
   getActiveTools: () => (loading ? notInitialized() : [...active]),
   setActiveTools: (names) => (loading ? notInitialized() : (active = names.filter((n) => registry.has(n)))),
   on: (event, handler) => (handlers[event] ??= []).push(handler),
+  registerCommand: (name, options) => { commands[name] = options; },
 };
+const commands = {};
 const handlers = {};
 await mod.default(pi);
 loading = false;
@@ -96,6 +100,23 @@ if (action === "describe") {
       result.push({ ok: false, error: err.message });
     }
   }
+} else if (action === "commands") {
+  // rest[0]:JSON 列表,每项是 /a2a 后面的参数文本;记录每次 handler 的 notify
+  result = { registered: Object.keys(commands), runs: [] };
+  for (const args of JSON.parse(rest[0])) {
+    const notes = [];
+    const ctx = { hasUI: true, ui: { notify: (text, level) => notes.push({ text, level }) } };
+    let error = null;
+    try {
+      await commands.a2a.handler(args, ctx);
+    } catch (err) {
+      error = String(err);
+    }
+    result.runs.push({ args, notes, error });
+  }
+} else if (action === "completions") {
+  if (rest[1] === "warm") for (const handler of handlers.before_agent_start ?? []) await handler({ prompt: "x" }, {});
+  result = Object.fromEntries(JSON.parse(rest[0]).map((p) => [p, commands.a2a.getArgumentCompletions(p)]));
 } else if (action === "is_herdr_write") {
   result = Object.fromEntries(JSON.parse(rest[0]).map((c) => [c, mod.isHerdrWrite(c)]));
 }

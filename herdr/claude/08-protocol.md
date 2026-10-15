@@ -313,6 +313,7 @@ herdr 接受了但观察窗口内没看到目标开始处理 → **不记 `DELIV
 | `target_missing` | 目标没有登记;或登记在**另一个 herdr 会话**;或登记信息与发送方不属于同一 IP / 项目 |
 | `target_not_running` | 目标已登记,但 `lifecycle` 不是 `running` |
 | `bad_message` | 渲染后的消息为空、过长(默认 > 1000 字符)或含控制字符 |
+| `unsafe_template` | 渲染后的消息去掉开头空白(JS `trim()` 的字符集并上 Python `isspace()`)后以 `/` 或 `!` 开头:投递到 pi 会被当成命令或 bash 执行。拓扑写入时(create / add_edge / set_template)已拒绝这类模板,此项防旧拓扑与手工编辑;幂等键已入队的重放仍返回原回执(22 号方案 §9、§10) |
 | `ip_draining` | 发送方所在 IP 正在排空(`a2a ip remove` 进行中);同 IP 铁律下也就是目标所在 IP。检查与入队在 IP 排空锁(共享)里完成,见 `17-stage8-ip-add-remove-plan.md` §3.2 |
 | `bad_idempotency_key` | 幂等键格式不对(应为 `<UTC 秒>-<UUID>`),或时间在未来(容许 5 分钟偏差)。路线图 336,见 `19-roadmap-leftovers-plan.md` D 节 |
 | `idempotency_expired` | 幂等键超过有效期(7 天),不入队;过期键对应的记录可以清理,清理后同键再来仍因过期被拒 |

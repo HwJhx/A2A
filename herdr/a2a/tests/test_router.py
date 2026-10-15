@@ -290,6 +290,33 @@ class TestMessageText(RouterBase):
         self.assertEqual(self.router.send("dv_done", env_of("dv", "uart")).text, "uart {ok}")
 
 
+def write_legacy_template(store_path: Path, edge_id: str, template: str) -> None:
+    """模拟旧拓扑 / 手工编辑:绕过写入时检查,直接改 YAML(加载与热重载不检查模板开头)。"""
+    data = yaml.safe_load(store_path.read_text())
+    for edge in data["edges"]:
+        if edge["id"] == edge_id:
+            edge["template"] = template
+    store_path.write_text(yaml.safe_dump(data, allow_unicode=True))
+
+
+class TestUnsafeTemplate(RouterBase):
+    """22 号方案 §9、§10:渲染后以 / 或 ! 开头的消息在入队前拒绝。"""
+
+    def test_rejected_before_enqueue(self):
+        for template in ("/a2a dv_done", "!ls", "\ufeff!ls", "  /quit", "\u3000/skill:x"):
+            with self.subTest(template=repr(template)):
+                write_legacy_template(self.topo_path, "dv_done", template)
+                exc, event = self.assertRejected("unsafe_template", "dv_done", env_of("dv", "uart"))
+                self.assertEqual(self.queued(), [])
+                self.assertFalse(any(e.get("state") == QUEUED for e in self.audit.read()))
+
+    def test_fixed_template_sends_again(self):
+        write_legacy_template(self.topo_path, "dv_done", "/a2a x")
+        self.assertRejected("unsafe_template", "dv_done", env_of("dv", "uart"))
+        self.store.set_template("dv_done", "{ip} 完成")
+        self.assertEqual(self.router.send("dv_done", env_of("dv", "uart")).text, "uart 完成")
+
+
 class TestDynamicTopology(RouterBase):
     def test_template_change_takes_effect_without_restart(self):
         first = self.router.send("dv_done", env_of("dv", "uart"))

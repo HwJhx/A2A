@@ -42,7 +42,7 @@ from .identity import (
 from .messages import QUEUED, REJECTED, Message, new_msg_id, now_iso
 from .registry import Registry
 from .spool import MessageNotFoundError, Spool
-from .topology import Topology, TopologyStore
+from .topology import Topology, TopologyStore, command_prefix
 
 # 拒绝原因代码
 REJECT_IDENTITY = "identity"
@@ -56,6 +56,8 @@ REJECT_IP_DRAINING = "ip_draining"
 REJECT_BAD_KEY = "bad_idempotency_key"
 REJECT_IDEMPOTENCY_EXPIRED = "idempotency_expired"
 REJECT_IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+# 渲染后的消息去掉开头空白以 "/" 或 "!" 开头:投递到 pi 会被当成命令或 bash 执行(22 号方案 §9、§10)
+REJECT_UNSAFE_TEMPLATE = "unsafe_template"
 
 # 幂等键(路线图 336):插件每次开始处理新输入时生成 `<UTC 秒>-<UUID>`。超过有效期的键被拒绝;
 # 幂等记录就是判重的"墓碑",只有键已过期的记录才可以清理(清理后同键再来会因过期被拒)
@@ -226,7 +228,18 @@ class Router:
         problem = self._check_text(text)
         if problem:
             raise reject(REJECT_BAD_MESSAGE, problem, src=sender.agent_id, dst=dst)
+        self._check_command_prefix(ctx, sender, dst, text)
         return dst, text
+
+    @staticmethod
+    def _check_command_prefix(ctx: "_SendContext", sender: AgentIdentity, dst: str, text: str) -> None:
+        """入队之前的最后防线:拓扑只在写入时检查模板,旧拓扑或手工编辑的文件里仍可能有这样的模板。"""
+        prefix = command_prefix(text)
+        if prefix:
+            raise ctx.reject(REJECT_UNSAFE_TEMPLATE,
+                             f"消息去掉开头空白后以 {prefix!r} 开头,投递到 pi 会被当成"
+                             f"{'命令' if prefix == '/' else ' bash'}执行;请用 a2a topology 修改这条边的模板",
+                             src=sender.agent_id, dst=dst)
 
     def _enqueue(self, ctx: "_SendContext", sender: AgentIdentity, msg_id: str, dst: str, text: str, *,
                  revision: Optional[str] = None, on_enqueued: Optional[Callable[[Any], None]] = None) -> SendReceipt:
@@ -291,6 +304,8 @@ class Router:
             if stored is None:
                 ctx.msg_id = snap["msg_id"]     # 审计里的拒绝记录也用这条消息的 msg_id
                 dst, text = (snap["dst"], snap["text"]) if fresh else self._authorize(ctx, sender)
+                # 快照来自旧版本时可能没经过上面的检查;已入队(enqueued)的重放不走到这里,照旧返回原回执
+                self._check_command_prefix(ctx, sender, snap["dst"], snap["text"])
                 if (dst, text) != (snap["dst"], snap["text"]):
                     raise ctx.reject(REJECT_IDEMPOTENCY_CONFLICT,
                                      f"补齐入队时内容与第一次鉴权的不一致(第一次:{snap['dst']}「{snap['text']}」;"
