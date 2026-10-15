@@ -353,7 +353,8 @@ class PiExtension(unittest.TestCase):
         for run in out["runs"]:
             (note,) = run["notes"]
             self.assertEqual(note["level"], "info")
-            self.assertIn("dv_done → sw_uart", note["text"])
+            self.assertIn("dv_done → sw_uart\n    uart ip 我已经完成了uvm验证。", note["text"])   # 边名一行,消息另起缩进
+            self.assertNotIn("「", note["text"])
         self.assertEqual(self.spool.pending(), [])
         self.assertEqual(calls, [])                                # 只列边:不上报状态
 
@@ -419,9 +420,9 @@ class PiExtension(unittest.TestCase):
         self.assertEqual(self.reported(calls), [("working", 1), ("idle", 2)])
 
     def test_node_unit_tests(self):
-        # tests/js/*.test.mjs:就绪状态机的确定性时序、补全来源标签改写(node --test)
+        # tests/js/*.test.mjs:就绪状态机的确定性时序、补全来源标签改写、列边格式(node --test)
         files = sorted(str(f) for f in (HERE / "js").glob("*.test.mjs"))
-        self.assertGreaterEqual(len(files), 2)
+        self.assertGreaterEqual(len(files), 3)
         run = subprocess.run([NODE, "--test", *files], capture_output=True, text=True, timeout=120)
         self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-2000:])
         self.assertIn("# fail 0", run.stdout.replace("ℹ", "#"))

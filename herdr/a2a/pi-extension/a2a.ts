@@ -327,8 +327,12 @@ export function parseCommandArgs(args: string): CommandArgs {
   return { kind: "usage" };
 }
 
+/** /a2a 列边:每条边一段,"边 → 目标"一行,消息另起并缩进(模板自带的换行逐行缩进),段间空一行 */
 export function formatEdges(edges: Edge[]): string {
-  return edges.map((e) => `  ${e.edge_id} → ${e.dst}:「${e.text}」`).join("\n");
+  return edges.map((e) => {
+    const body = String(e.text).split(/\r\n|\r|\n/).map((line) => `    ${line}`).join("\n");
+    return `  ${e.edge_id} → ${e.dst}\n${body}`;
+  }).join("\n\n");
 }
 
 type Level = "info" | "warning" | "error";
@@ -426,13 +430,13 @@ export function makeSendCommand(cfg: Config, readiness: Readiness, list: () => E
       }
       if (parsed.kind === "list") {
         if (edges.length === 0) notify("[a2a] 没有可用的通信边", "warning");
-        else notify(`[a2a] 可用的边(/a2a <边> 发送):\n${formatEdges(edges)}`, "info");
+        else notify(`[a2a] 可用的边(/a2a <边> 发送):\n\n${formatEdges(edges)}`, "info");
         return;
       }
       const edge = edges.find((e) => e.edge_id === parsed.edge);
       if (!edge) {
         notify(`[a2a] 没有这条边:${parsed.edge},未发送。` + (edges.length > 0
-          ? `可用的边:\n${formatEdges(edges)}` : "当前没有可用的通信边"), "error");
+          ? `\n可用的边:\n\n${formatEdges(edges)}` : "当前没有可用的通信边"), "error");
         return;
       }
       if (!(await readiness.commandStart())) {

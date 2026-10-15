@@ -219,3 +219,37 @@
 | 清理与限制 | ✅ | 删除 `/tmp/a2a_xc_v021` 和本地临时脚本;真实 fnx 为临时工作目录创建的空 session 目录已仅用 `rmdir` 清除。测试和手验创建的 Herdr session/tmux 已清理;复查未见本轮 `a2av021` 残留。既有 `guidemo_*` tmux 与其他 Herdr session 保持原样。未触碰禁用 session,未读取密钥,未向 fnx 提交普通文本或回车,未调用模型。 |
 
 结论:命令名阶段的 `/a2a` 补全显示版本号,而参数补全保留边名;单元、Node、指定真实 fnx 集成及两处变异验证均符合预期。
+
+## 17. `/a2a` 列边分层显示(v0.2.2,2026-10-15)
+
+用户在 GUI 里看到 `/a2a` 的输出是一行 `dv_done → sw_spi:「消息全文」`,消息较长时终端自动折行且从第一列续写,边名和内容混在一起。
+
+- `formatEdges`(`pi-extension/a2a.ts`)改为:每条边一段,第一行 `  边 → 目标`,消息另起一行缩进 4 格;模板自带的换行(`\n` / `\r\n` / `\r`)逐行缩进;段与段之间空一行;去掉「」;不截断。
+- 列边提示和"没有这条边"的报错都在标题后空一行再列边。
+- 不按终端宽度手动折行(要处理中文双列宽,容易出错);超长单行仍由终端折行。
+- 只改插件显示,Python 端与工具描述(给模型看的 `a2a_send` 说明)不变。
+- 仓库根 `package.json` 版本 0.2.2;安装命令改为 `@a2a-plugin-v0.2.2`。
+
+测试:
+- 新增 `tests/js/format.test.mjs`(4 条:单条、多条空行、三种换行、空列表),Mac `node --test tests/js/*.test.mjs` 19/19 通过。
+- harness:`test_command_lists_edges_without_sending` 断言 `dv_done → sw_uart\n    uart ip 我已经完成了uvm验证。` 且没有「。
+- 真实 fnx(VM,`RealFnxCommand`):`/a2a` 后屏幕上边名单独一行、消息在下一行且缩进更深;`RealFnxCommand` + `test_pi_extension` 49 个全部通过,不调用模型。
+- VM 单元测试全套:665 个,OK(skipped=48)。
+
+Codex 复核(v0.2.2):无阻断、无将来考虑;应修 1 条——`herdr/a2a/README.md:239` 补全示例仍写 `[v0.2.1]`,已改为 `[v<版本>]`(注明如 `[v0.2.2]`),以后发版不再过期。
+
+## §18 codex-test 交叉验证(v0.2.2)
+
+环境:OrbStack VM `ubuntu` / Ubuntu 22.04.5 / Python 3.10.12 / Node v22.20.0。运行前对比 Mac 与 VM 可见工作区 10 个文件 SHA-256,全部一致:`package.json`、`herdr/a2a/README.md`、`herdr/a2a/pi-extension/a2a.ts`、`herdr/a2a/tests/js/format.test.mjs`、`herdr/a2a/tests/js/plugin_harness.mjs`、`herdr/a2a/tests/test_pi_extension.py`、`herdr/a2a/tests/test_integration_lifecycle.py`、`herdr/gui_demo/README.md`、`herdr/gui_demo/验收步骤.md`、本方案文档。VM 测试和变异在 `/tmp/a2a_xc_v022` 隔离副本中进行,原仓库及 fnx agent 安装目录/在线包未修改。
+
+| 检查 | 结果 | 命令与实测 |
+| --- | --- | --- |
+| Mac Node 全套 | ✅ 19/19,0 跳过 | `cd herdr/a2a && node --test tests/js/*.test.mjs`;`format.test.mjs` 4 项、autocomplete 6 项、readiness 9 项均通过。 |
+| VM Python 全套 | ✅ 665 项,0 失败、98 跳过 | `cd /tmp/a2a_xc_v022/herdr/a2a && env PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 PATH=$HOME/.local/lib/node-v22.20.0-linux-arm64/bin:$HOME/.local/bin:$PATH python3 -m unittest discover -s tests`;输出 `Ran 665 tests in 23.952s`、`OK (skipped=98)`。**与 §17 的 48 跳过不一致**。已核实该 PATH 下 Node 为 v22.20.0;单独运行 `tests.test_pi_extension` 为 46/46,其中 `test_node_unit_tests` 实际通过。因此本次 98 个跳过并非 Node 不在 PATH;原命令未设置 `A2A_INTEGRATION=1`,额外跳过项来自其他条件,此处保留实际数字。 |
+| VM RealFnxCommand + test_pi_extension | ✅ 49/49,0 跳过 | `cd /tmp/a2a_xc_v022/herdr/a2a && env A2A_INTEGRATION=1 A2A_INTEGRATION_FNX=1 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 PATH=$HOME/.local/lib/node-v22.20.0-linux-arm64/bin:$HOME/.local/bin:$PATH python3 -m unittest -v tests.test_integration_lifecycle.RealFnxCommand tests.test_pi_extension`;`Ran 49 tests in 42.083s`、`OK`。真实 fnx `/a2a` 测试仅提交斜杠命令,未调用模型。屏幕断言确认边名单独一行、消息紧随下一行且缩进更深。 |
+| 旧格式变异 | ✅ 三个目标均被捕获 | 先备份并设 trap,把临时副本 `formatEdges` 改回 `  ${e.edge_id} → ${e.dst}:「${e.text}」`。`node --test tests/js/format.test.mjs`:4 项中3项失败;`tests.test_pi_extension.PiExtension.test_command_lists_edges_without_sending`:1 项失败;`tests.test_integration_lifecycle.RealFnxCommand.test_slash_command_sends_without_the_model`:1 项失败。恢复后 `cmp` 成功,插件文件 SHA-256 与原副本一致。 |
+| 清理与限制 | ✅ | 删除 VM 临时副本及变异日志;RealFnx fixture 创建的临时 Herdr session/tmux 按 teardown 清理。复查 `a2a_codex_verify` 仍运行,禁用 session 未触碰;现有 `guidemo_*` tmux 未动。未读密钥、未修改 fnx agent 目录或在线包、未调用模型。 |
+
+结论:显示格式的单元、harness 与真实 fnx 断言均能识别新布局;旧单行格式变异被三层测试捕获。VM 全套跳过数如实为 98,与 §17 记录的 48 不同,不将该差异改写成通过 48 项跳过的结果。
+
+注(Claude 对比,2026-10-15):98 与 48 的差异已查明——codex-test 的 VM 副本只复制了 `herdr/a2a` 和根 `package.json`,缺 `herdr/claude/08-protocol.md`,协议文档一致性检查因此多跳过 50 个(codex-test 按原方式重跑并分组确认)。Claude 在原路径、包含整个 `herdr/` 的 `/tmp` 副本、以及 `sh -lc` + 相同 env/PATH 下均为 skipped=48(39 缺 A2A_INTEGRATION、7 缺 FNX、2 缺 A2A_INTEGRATION_FNX)。与代码无关,两边结果一致。

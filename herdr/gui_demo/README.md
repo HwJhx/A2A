@@ -49,8 +49,8 @@ GUI 建 agent 时不会安装插件。要让 agent 用 `a2a_send` 互发消息,�
 
 ```bash
 export PATH=$HOME/.local/lib/node-v22.20.0-linux-arm64/bin:$PATH   # 安装要用 npm
-~/.forenyx/fnx_dv/bin/fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.2.1
-~/.forenyx/fnx_sw/bin/fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.2.1
+~/.forenyx/fnx_dv/bin/fnx_dv install git:github.com/HwJhx/A2A@a2a-plugin-v0.2.2
+~/.forenyx/fnx_sw/bin/fnx_sw install git:github.com/HwJhx/A2A@a2a-plugin-v0.2.2
 ```
 
 ## 使用提示
